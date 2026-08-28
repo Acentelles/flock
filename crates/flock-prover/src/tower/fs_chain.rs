@@ -2,20 +2,6 @@ use super::*;
 use crate::r1cs_hashes::fs_chain::{CvSource, Link, trace_duplex_forked};
 use flock_core::transcript_record::{StreamWord, TranscriptOp as Op};
 
-// ---------------------------------------------------------------------------
-// MVP-4: the vertical slice
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// MVP-5: every level's query phase
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// The collapsed opening: wiring over ONE BLAKE3 table
-// ---------------------------------------------------------------------------
-// MVP-7: the query phase of a REAL inner proof
-// ---------------------------------------------------------------------------
-
 /// A shared-constant public: one public input PER DISTINCT VALUE, wired to
 /// every use through copy constraints — the `zw`/`ow` pattern generalized.
 /// The per-row structural words (params, zero pads) collapse from one

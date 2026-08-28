@@ -11,6 +11,7 @@ use crate::pcs::{self, Commitment};
 use crate::proof::{R1csClaim, R1csProofLigerito, ZClaim};
 use crate::r1cs::BlockR1cs;
 use crate::zerocheck;
+use std::sync::OnceLock;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FlockVerifyError {
@@ -61,7 +62,6 @@ pub enum FlockVerifyError {
 /// the one place that decision is made. Read once per process, so a single run
 /// measures a single configuration.
 fn verifier_threads() -> usize {
-    use std::sync::OnceLock;
     static N: OnceLock<usize> = OnceLock::new();
     *N.get_or_init(|| {
         std::env::var("FLOCK_VERIFY_THREADS")
@@ -73,7 +73,6 @@ fn verifier_threads() -> usize {
 }
 
 fn verifier_pool() -> &'static rayon::ThreadPool {
-    use std::sync::OnceLock;
     static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
     POOL.get_or_init(|| {
         rayon::ThreadPoolBuilder::new()

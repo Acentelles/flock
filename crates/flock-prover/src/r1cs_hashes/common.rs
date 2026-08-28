@@ -781,12 +781,11 @@ where
 }
 
 /// Partial-count variant of [`drive_witness_batch_major`] for the union's
-/// dynamic invocation counts (M4): the declared rows are `inputs`
+/// dynamic invocation counts: the declared rows are `inputs`
 /// (`inputs.len() = n_t ≤ 2^n_blocks_log`, any value — not necessarily a
 /// power of two), and every row in `[n_t, 2^n_blocks_log)` is left
-/// **identically zero** in `z`, `a`, `b`, and the lincheck stripe — the
-/// design doc's dummy-row semantics, which the union's count-derived
-/// run-lists and the lincheck's count-derived const-pin target require
+/// **identically zero** in `z`, `a`, `b`, and the lincheck stripe. The
+/// union's run lists and lincheck target require these zero rows
 /// (dummy rows carry the pin at 0; a real padding invocation would carry it
 /// at 1 and break the count binding).
 ///

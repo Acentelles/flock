@@ -1463,8 +1463,7 @@ pub fn verify_assist<C: Challenger>(
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// The batched Frobenius assist (design doc §"The batched Frobenius assist,
-// in detail"): proves the Φ-twisted jagged weight evaluation
+// The batched Frobenius assist proves the Φ-twisted jagged weight evaluation
 //   V = Ŵ(ρ) = Σ_i Σ_j c_{i,j} · f̂_t(z_row_i^(2^j), z_col_i^(2^j), ρ)
 // — an F-combination of ordinary assist statements at Frobenius-powered
 // points (Frobenius commutes with the eq-product structure at Boolean
@@ -4645,11 +4644,8 @@ mod round_test_support {
     /// tree reduction is bit-identical to the serial left fold.
     ///
     /// Iterates contiguous slice chunks with `chunks_exact(2)` rather than indexing
-    /// `a[2*x]`: eliminating the per-element bounds checks lifts the reduction from
-    /// ~2.6× to ~6× parallel scaling (hits the memory-bandwidth ceiling);
-    /// measured with the since-deleted `scaling_diag` probe (bloat ledger §E).
-    /// No longer on the production path (round 1's message is fused into
-    /// [`generate_f_and_claim`]); retained for the runtime benchmarks.
+    /// `a[2*x]`. This removes per-element bounds checks. Runtime benchmarks
+    /// use this helper; production fuses round 1 into [`generate_f_and_claim`].
     pub(super) fn round_msg_par(a: &[F128], b: &[F128]) -> (F128, F128) {
         use rayon::prelude::*;
         const C: usize = 1 << 14;
@@ -4881,8 +4877,7 @@ mod tests {
         }
     }
 
-    /// The Frobenius-twist identity behind the merged-reduction design
-    /// sketch (design doc §"Capacity-free ring-switching"): for every j,
+    /// The Frobenius-twist identity behind the merged reduction. For every j,
     /// `Σ_e eq(ρ,e) · (eq_row[row(e)]·eq_col[col(e)])^(2^j)`
     /// `  = f̂_t(z_row^(2^j), z_col^(2^j), ρ)`
     /// — Frobenius is a field automorphism and commutes with the eq-product

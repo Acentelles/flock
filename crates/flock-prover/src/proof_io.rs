@@ -48,104 +48,13 @@ const MAGIC: [u8; 5] = *b"FLOCK";
 /// verification into an unbounded allocation.
 const MAX_BUNDLE_BYTES: usize = 64 * 1024 * 1024;
 
-/// Format version. Bumped on incompatible serialization changes.
-/// v20 enables the existing non-Ligerito algebraic grinding schedules for
-/// the strict Fast and Slim profiles. No payload fields changed, but their
-/// nonce vectors and Fiat--Shamir transcript shapes are incompatible with
-/// v19 proofs made under those profiles.
-/// v19 moves Ligerito sumcheck claims and challenges to F256. Recursive
-/// commitments remain over F128 by splitting each extension word into a
-/// coordinate bit, so the transcript, recursive dimensions, final `yr`, and
-/// sumcheck-message payload are all incompatible with v18.
-/// v18 changes every Johnson/Ligerito query schedule to make the consistency
-/// term strictly 128-bit after optional query grinding. No struct changes,
-/// but v17 paths/caps and transcript shapes cannot replay under the larger
-/// public query counts.
-/// v17 adds the claim- and consistency-batching PoW nonce vectors from the
-/// Flock paper's Appendix C.3 to `LigeritoProof`.
-/// v16 changes the Johnson/Ligerito transcript: L0 batches one additional OOD
-/// evaluation before the initial sumcheck message, and every deeper level now
-/// carries two OOD evaluations. The proof structs are unchanged, but v15
-/// proof bytes cannot be replayed under the two-point transcript.
-/// v15: remaining non-Ligerito algebraic grinding. Product-GKR, dense and
-/// jagged aggregation folds, chain shift, and Merkle-path shift proofs carry
-/// transcript-ordered PoW witnesses. Opening batching now protects all
-/// ring-switched and packed-direct coefficients with one PoW and samples the
-/// coefficients in one vector squeeze; the multipoint gamma schedule is
-/// derived from its actual `K - 1` degree. These proof and transcript changes
-/// are incompatible with v14.
-/// v14: PCS-transport grinding. Ring-switch proofs carry the PoW witness for
-/// their seven-coordinate point; opening proofs carry claim-batching and
-/// merged-sumcheck witnesses; the multipoint and Frobenius-anchor proofs
-/// carry their protected challenge witnesses. Old payloads cannot be
-/// interpreted under the Secure opening policy.
-/// v13: Element/dense PIOP grinding. Both the element zerocheck and element
-/// lincheck subproofs now carry their transcript-ordered nonce vectors; the
-/// Secure profile verifies them before tau, alpha, and every protected round
-/// challenge. Old mixed payloads therefore cannot be interpreted safely.
-/// v12: Boolean lincheck grinding. `LincheckProof` carries the nonce vector
-/// for α batching, every constant-wire β, every degree-two sumcheck round,
-/// and the final φ8 skip evaluation. Secure profiles select the schedule from
-/// the public PCS profile; old payloads cannot be interpreted safely.
-/// v11: Boolean zerocheck grinding. `ZerocheckProof` carries the nonce vector
-/// for the initial eq-weighted identity challenge, the univariate-skip
-/// challenge, and every multilinear sumcheck round. The verifier selects the
-/// required schedule from the public PCS profile, so an old payload could not
-/// be interpreted safely even when its nonce vector would be empty.
-///
-/// v9: the two-product multipoint grouping — packed-direct
-/// claims collapse by shared row point into merged-column scalar groups
-/// carrying ONE untwisted dual value each
-/// (`MultipointTwistedProof.group_values`); ring-switched claims keep 128.
-/// The sumcheck becomes two products (`ā·g + b̄·eq(ρ,·)`) and the single
-/// anchor binds the whole endpoint sum via closed-form-baked coefficients.
-/// The multipoint label bumps to v1 and the values' absorb shrinks from
-/// `128·K` to `128·R + P` words. Soundness:
-/// docs/multipoint-twisted-assist.tex §"The two-product grouping".
-///
-/// v8: the multipoint-twisted assist — `MergedOpenProof.
-/// frobenius` becomes `MultipointTwistedProof` (128K claimed dual values,
-/// m product-sumcheck rounds, one untwisted anchor); the transcript gains
-/// the values' absorb + gamma squeeze and loses the per-statement assist
-/// rounds. Soundness: docs/multipoint-twisted-assist.tex.
-///
-/// v10: stratified queries (docs/stratified-queries.tex) — every level's
-/// query count decomposes into power-of-two summands, one query per
-/// depth-c subtree; the absorbed cap moves to the TOP SET BIT of the
-/// count (from ⌈log2 q⌉) and openings carry per-summand path lengths.
-/// No struct changed — the vectors are self-describing — but v9 proofs
-/// can never verify under the stratified statement, so versioning stays
-/// strict.
-/// v7: Merkle capping — `Commitment.root`, `LigeritoProof.
-/// initial_root`, and `recursive_roots` become cap-node VECTORS (the
-/// commitment is the cap layer at depth ⌈log2 q⌉; the transcript absorbs
-/// the cap itself), and the per-tree octopus multi-proofs become flat
-/// per-query capped paths. The symmetric bookend to v3, which introduced
-/// the octopus.
-/// v6 switched the Mixed flavor's payload to the MERGED
-/// jagged and ring-switch transport. [`MixedProofBundleLigerito`] carries
-/// an `R1csProofMergedLigerito`. The R1cs and Chain payloads are unchanged, but
-/// versioning is strict so v5 files are rejected.
-/// v5 added the Mixed flavor (registry id + counts vector +
-/// jagged-transport proof). v4 added `ood_values` + `fold_grinding_nonces`
-/// to `LigeritoProof` and `profile` to `PcsParams` (Johnson+OOD profiles).
-/// v3 restructured `BaseFoldProof`: per-query Merkle paths were replaced by
-/// shared octopus multi-proofs (one per Merkle tree). v2 added `HashKind`
-/// to the (since-deleted) chain-proof bundle.
-// v21 (2026-08-14): the R1cs flavor's payload became the MERGED union
-// proof — the standalone hash setups prove over the single-slot union
-// commit now (dense stack + integer lanes); the padded-commit
-// R1csProofLigerito payload is gone from this flavor.
+/// Format version for the current proof schemas and transcript rules.
 const VERSION: u8 = 21;
 
 /// Flavor discriminator (1 byte). Lets a generic reader peek what kind of
 /// bundle a file holds without parsing the payload first (see
-/// [`peek_flavor`]). Values 0/1 are reserved: they were the legacy BaseFold
-/// R1cs/Chain flavors.
+/// [`peek_flavor`]). Values 0, 1, and 3 are reserved.
 const FLAVOR_R1CS_LIGERITO: u8 = 2;
-// Flavor byte 3 was the hash-chain (shift-argument) bundle — the product was
-// retired 2026-08-14 with `chain.rs`/`chain_common.rs`; the byte stays
-// reserved and now parses as UnknownFlavor.
 const FLAVOR_MIXED_LIGERITO: u8 = 4;
 
 /// What kind of bundle a byte buffer holds. Returned by [`peek_flavor`] so

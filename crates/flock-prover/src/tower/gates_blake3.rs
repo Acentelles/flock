@@ -148,10 +148,10 @@ impl MerklePathGate {
     /// it here means a circuit cannot silently wire a challenge that the
     /// relation truncates differently than the sampler did.
     ///
-    /// Real-protocol paths are CAPPED since Merkle capping landed: they are
+    /// Protocol paths are capped. They are
     /// `d − c` deep and the index's high `c` bits select a node of the
     /// absorbed cap layer rather than folding to a root. The COLLAPSED path
-    /// models this (`emit_opening` + the boundary select in `mvp6`): the
+    /// models this with `emit_opening` and the boundary select. The
     /// select is done by the checker on published words, so no mux gadget
     /// exists in-circuit. This COMPOSITE gate stays full-depth against its
     /// synthetic trees, where the assert above IS the index-binding

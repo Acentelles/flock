@@ -1,5 +1,6 @@
-#[allow(unused_imports)] // used only under cfg(test)
 use super::*;
+use flock_core::aggregate;
+use std::sync::atomic::Ordering;
 
 /// **WALL 3: THE SPINE CONVERGES.** Eight chain segments → four FLs → a
 /// BASE node (two FLs, fresh-only) → node_2 (a fresh FL + the base) →
@@ -33,7 +34,6 @@ use super::*;
 #[ignore] // Heavy — eight chain proofs and eight outers.
 pub(super) fn chain_spine_converges() {
     let cfg = test_config();
-    use flock_core::aggregate;
 
     let env = envelope_shape();
     let n_blocks = 256usize;
@@ -389,9 +389,8 @@ pub(super) fn chain_spine_converges() {
 /// segments → two first-level nodes → one internal node; the chain-level
 /// accumulators ride the internal node as a PRIORS-ONLY LANE (their
 /// registry differs from the FL fold's, so they cannot join it), with the
-/// prior surfaces connected WIRE-TO-WIRE to the children's published
-/// accumulator claims — mvp11's recorded prediction ("a prior's surface
-/// IS what a previous outer publishes") landing. The ROOT then discharges
+/// prior surfaces connected wire-to-wire to the children's published
+/// accumulator claims. The root then discharges
 /// BOTH lanes — the chain lane against the chain b3 matrices + the chain
 /// circuit's sigma table, the FL lane against the FL mats/element
 /// types/digest — and reads the statement h_end == H^1024(h_start). Plus
@@ -401,7 +400,6 @@ pub(super) fn chain_spine_converges() {
 #[ignore] // Heavier — run with `-- --ignored`.
 pub(super) fn chain_tower_e2e_with_lane() {
     let cfg = test_config();
-    use flock_core::aggregate;
 
     let n_blocks = 256usize;
     let mut rng = Rng(0xC4A1_0007);
@@ -801,7 +799,6 @@ pub(super) fn tower_online_bench() {
     // byte-identical setup. The node arms therefore run as BLOCKS seconds
     // apart instead of the old minutes-apart interleave; box drift over
     // seconds is far below what the interleave guarded against.
-    use std::sync::atomic::Ordering;
     STEADY_OVERRIDE.store(runs, Ordering::Relaxed); // +1: iteration 0 is the shape warmup (setup tier)
 
     // ---- LEAF: nothing else is alive; the measured proof BECOMES cp0 ----

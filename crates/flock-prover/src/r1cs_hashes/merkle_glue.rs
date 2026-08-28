@@ -8,9 +8,8 @@
 //! scales with the NUMBER of boolean table types — not with rows, and not
 //! with trace size. Each [`MerkleTreeLayout`](super::merkle_r1cs::MerkleTreeLayout)
 //! shape is its own type and each one's walker stores its own copy of
-//! BLAKE3's base (21.03M nonzeros), so the four levels of the m=26 Fast
-//! ladder cost 4 × 21M on top of the FS chain's own 21M — 105.1M swept, ~91 ms
-//! of a 174 ms prove (`circuit_merkle::mvp5_all_levels_query_phase`).
+//! BLAKE3's base (21.03M nonzeros). Four levels therefore sweep about 105M
+//! nonzeros with the FS chain.
 //!
 //! Expressed as wiring, every compression is a row of ONE BLAKE3 table and the
 //! sweep is ~21M regardless of how many tree shapes there are.

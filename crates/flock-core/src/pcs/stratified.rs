@@ -242,7 +242,7 @@ mod tests {
 
     #[test]
     fn decompose_is_binary_representation() {
-        // Slim L0 shape from the design doc: q = 90 = 64 + 16 + 8 + 2, d = 19.
+        // Slim L0 shape: q = 90 = 64 + 16 + 8 + 2, d = 19.
         let s = LevelSchedule::decompose(90, 19);
         assert_eq!(s.summand_depths, vec![6, 4, 3, 1]);
         assert_eq!(s.queries(), 90);

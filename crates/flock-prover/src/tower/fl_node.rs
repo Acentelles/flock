@@ -1,4 +1,12 @@
 use super::*;
+use crate::prover::UnionElementSlotInput;
+use flock_core::aggregate;
+use flock_core::field::PHI_8_TABLE;
+use flock_core::matrix_fold::{FoldProof, MatrixClaim};
+use flock_core::transcript_record::{RecordingChallenger, TranscriptOp as Op};
+use flock_core::zerocheck::K_SKIP;
+use flock_core::zerocheck::multilinear::subspace_denominator_pair;
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// The first-level node as a BUILDER: [`build_fl_node`]'s output. `lo` is
 /// a real, RECURSABLE [`LeafOuter`] (BLAKE3 for both the FS chain and the
@@ -34,10 +42,8 @@ pub struct FlNode {
 /// has no element side), THE ADJACENCY as a wire-to-wire copy constraint
 /// per seam between the children's endpoint publics, and the combined span
 /// (first h_start, last h_end) published as the node's own application
-/// statement. The accumulator reassembles from the public segment alone
-/// and discharges both groups. Every pin stays inside the builder (the
-/// mvp9 precedent: the builder IS the test). Envelope snapping is the
-/// scale step's job — this is the m22 dev shape.
+/// statement. The accumulator reassembles from the public segment and
+/// discharges both groups.
 /// The chain layout's jagged params — the count win's per-digest table
 /// owner for the lane, rebuilt exactly as the opening verifier reads it.
 #[cfg(test)]
@@ -59,7 +65,6 @@ pub(super) fn chain_jagged_params(cp: &ChainProof) -> flock_core::pcs::jagged::J
 /// borrow-only sites; callers that STORE an R1CS (LeafOuter) still build
 /// their own.
 pub(super) fn chain_blake_r1cs(nu: usize) -> std::sync::Arc<flock_core::r1cs::BlockR1cs> {
-    use std::sync::{Arc, Mutex, OnceLock};
     type Cache = Mutex<Vec<(usize, Arc<flock_core::r1cs::BlockR1cs>)>>;
     static CACHE: OnceLock<Cache> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(Vec::new()));
@@ -80,7 +85,6 @@ pub(super) fn record_chain_child_verify(
     cp: &ChainProof,
     blake_lc: &dyn flock_core::lincheck::LincheckCircuit,
 ) {
-    use flock_core::transcript_record::RecordingChallenger;
     let inner = &cp.inner;
     let union = UnionInstance::new(
         &inner.built.shape.registry,
@@ -124,10 +128,6 @@ pub fn build_fl_node(cfg: TowerConfig, cp0: &ChainProof, cp1: &ChainProof) -> Fl
 /// split-BLAKE slot assignment (`ChildSlots::new_env` sets `b3_alt` for
 /// child 1 only) has no slots for a third child.
 pub fn build_fl_node_k(cfg: TowerConfig, cps: &[&ChainProof]) -> FlNode {
-    use flock_core::aggregate;
-    use flock_core::matrix_fold::{FoldProof, MatrixClaim};
-    use flock_core::transcript_record::{RecordingChallenger, TranscriptOp as Op};
-
     const FL_DOMAIN: &[u8] = b"flock-chain-fl-node-v0";
 
     let k_ary = cps.len();
@@ -308,8 +308,6 @@ pub fn build_fl_node_k(cfg: TowerConfig, cps: &[&ChainProof]) -> FlNode {
 
     // ---- the outer: k chain-tape regions + the fold region + adjacency ----
     {
-        use crate::prover::UnionElementSlotInput;
-
         // The transcript is FORKED (the wiring runs on its own chain);
         // `merge_chain` splices the child's rows in at the fork point and
         // hands back one linear numbering plus the four cross-link wires.
@@ -588,9 +586,6 @@ pub fn build_fl_node_k(cfg: TowerConfig, cps: &[&ChainProof]) -> FlNode {
         }
 
         // ---- the connects: fold surfaces == child-region wires ----
-        use flock_core::field::PHI_8_TABLE;
-        use flock_core::zerocheck::K_SKIP;
-        use flock_core::zerocheck::multilinear::subspace_denominator_pair;
         // The RS lows machinery (λ table + denominator + zero anchor) is
         // emitted only when an RS child consumes it; AG children take the
         // Tier-0 published surface instead (docs/ag-recursion-plan.md).

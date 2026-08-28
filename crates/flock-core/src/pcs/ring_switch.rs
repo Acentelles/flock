@@ -66,6 +66,7 @@ use crate::zerocheck::multilinear::lagrange_weights_naive;
 use crate::zerocheck::univariate_skip::build_eq;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::sync::OnceLock;
 
 use super::pack::LOG_PACKING;
 
@@ -1659,7 +1660,6 @@ fn bit_basis(t: usize) -> F128 {
 /// challenge point (see [`linearized_coefficients_are_moore_row_mles`]); a
 /// shape-time assertion pins the closed form to this same matrix.
 pub fn moore_inverse() -> &'static [F128] {
-    use std::sync::OnceLock;
     static MINV: OnceLock<Vec<F128>> = OnceLock::new();
     MINV.get_or_init(|| {
         const N: usize = 128;
@@ -1710,8 +1710,7 @@ pub fn moore_inverse() -> &'static [F128] {
 /// for every `x`. (Over `F_{2^128}` every F₂-linear map has this form
 /// uniquely; the coefficients are recovered from the map's values on the
 /// bit basis via the precomputed inverse Moore matrix.) Used by the merged
-/// jagged/ring-switch reduction (design doc §"Capacity-free
-/// ring-switching") to express the Φ-twisted weight evaluation as a
+/// jagged and ring-switch reduction to express the Φ-twisted weight as a
 /// combination of ordinary assist statements at Frobenius-powered points.
 /// `pub`: the recursion circuit's R = 2 delta derives the RS claims'
 /// coefficients from the SAME linearization — no drift.
@@ -1902,14 +1901,6 @@ pub fn build_eq_sparse(coords: &[F128]) -> SparseEqTensor {
 /// `fold_1b_rows_naive(packed_witness, build_eq(coords))`, since `build_eq`'s
 /// zero-coord halvings would otherwise contribute zero to every accumulator.
 pub fn fold_1b_rows_sparse(packed_witness: &[F128], eq: &SparseEqTensor) -> Vec<F128> {
-    // Tried: MFR fast path via `fold_1b_rows_sparse_mfr_block4` for the chain's
-    // block-of-4 / stride-128 support pattern. **Measured a regression on
-    // blake3 m=29** (~2.5 ms slower at chain proof level) and roughly break-
-    // even on keccak. The subset-sum + transpose overhead doesn't amortize
-    // over only 4 entries per group when packed_witness reads are scattered
-    // (stride 128 = 2 KB jumps defeat the prefetcher). Kept the MFR helper +
-    // detector in this module — they may be useful for future protocols with
-    // a larger block_size (≥ 16) — but the dispatch is reverted to scalar.
     fold_1b_rows_sparse_scalar(packed_witness, eq)
 }
 
@@ -1946,146 +1937,6 @@ fn fold_1b_rows_sparse_scalar(packed_witness: &[F128], eq: &SparseEqTensor) -> V
             }
             a
         })
-}
-
-/// Detect the regular block-of-N + stride pattern in a sparse support. Returns
-/// `Some((block_size, stride))` if `support` has indices `g * stride + k` for
-/// `g ∈ 0..num_groups, k ∈ 0..block_size` (ascending). Returns `None` otherwise
-/// or when the support is too small to detect meaningfully.
-///
-/// For the hash-chain claim (zeros at suffix positions `region_log−k_skip+1`
-/// through `k_log−k_skip−1`), the pattern is `block_size = 2^low_live_count`
-/// (low live bits below the zero run) and `stride = 2^(zero_run_end+1)`.
-///
-/// Currently unused — see comment in [`fold_1b_rows_sparse`] for the MFR
-/// regression rationale. Kept for future protocols with larger block sizes.
-#[allow(dead_code)]
-fn detect_block_stride(support: &[(usize, F128)]) -> Option<(usize, usize)> {
-    if support.len() < 8 {
-        return None;
-    }
-    // Block runs from index 0; count the contiguous prefix.
-    if support[0].0 != 0 {
-        return None;
-    }
-    let mut block_size = 1usize;
-    while block_size < support.len() && support[block_size].0 == block_size {
-        block_size += 1;
-    }
-    if block_size >= support.len() || !support.len().is_multiple_of(block_size) {
-        return None;
-    }
-    let stride = support[block_size].0;
-    if stride < block_size || !stride.is_power_of_two() {
-        return None;
-    }
-    // Validate every group has the same shape.
-    let num_groups = support.len() / block_size;
-    for g in 0..num_groups {
-        let base = g * stride;
-        for k in 0..block_size {
-            if support[g * block_size + k].0 != base + k {
-                return None;
-            }
-        }
-    }
-    Some((block_size, stride))
-}
-
-/// MFR sparse fold for `block_size = 4` + arbitrary power-of-two stride.
-/// Equivalent output to [`fold_1b_rows_sparse_scalar`] but uses the same
-/// subset-sum / transpose machinery as [`fold_1b_rows_1way_mfr`], skipping the
-/// zero entries between groups. Throughput per group is identical to the dense
-/// 4-wide MFR kernel.
-///
-/// Currently unused — measured slower than scalar bit-scan for the chain
-/// claim's 4-entries-per-group pattern (subset-sum table overhead doesn't
-/// amortize over only 4 entries when packed_witness reads are scattered).
-/// Kept for reference / future protocols with larger block sizes.
-#[allow(dead_code)]
-fn fold_1b_rows_sparse_mfr_block4(
-    packed_witness: &[F128],
-    support: &[(usize, F128)],
-    stride: usize,
-) -> Vec<F128> {
-    let n = 1 << LOG_PACKING;
-    debug_assert!(support.len().is_multiple_of(4));
-    let num_groups = support.len() / 4;
-
-    (0..num_groups)
-        .into_par_iter()
-        .fold(
-            || vec![F128::ZERO; n],
-            |mut acc, g| {
-                let base = g * stride;
-                let m0 = packed_witness[base];
-                let m1 = packed_witness[base + 1];
-                let m2 = packed_witness[base + 2];
-                let m3 = packed_witness[base + 3];
-                let v: [F128; 4] = [
-                    support[g * 4].1,
-                    support[g * 4 + 1].1,
-                    support[g * 4 + 2].1,
-                    support[g * 4 + 3].1,
-                ];
-                let lookup = subset_sums_4(v);
-
-                let m_bytes: [[u8; 16]; 4] = [
-                    {
-                        let mut b = [0u8; 16];
-                        b[..8].copy_from_slice(&m0.lo.to_le_bytes());
-                        b[8..].copy_from_slice(&m0.hi.to_le_bytes());
-                        b
-                    },
-                    {
-                        let mut b = [0u8; 16];
-                        b[..8].copy_from_slice(&m1.lo.to_le_bytes());
-                        b[8..].copy_from_slice(&m1.hi.to_le_bytes());
-                        b
-                    },
-                    {
-                        let mut b = [0u8; 16];
-                        b[..8].copy_from_slice(&m2.lo.to_le_bytes());
-                        b[8..].copy_from_slice(&m2.hi.to_le_bytes());
-                        b
-                    },
-                    {
-                        let mut b = [0u8; 16];
-                        b[..8].copy_from_slice(&m3.lo.to_le_bytes());
-                        b[8..].copy_from_slice(&m3.hi.to_le_bytes());
-                        b
-                    },
-                ];
-
-                for r_byte in 0..16 {
-                    let combined: u64 = (m_bytes[0][r_byte] as u64)
-                        | ((m_bytes[1][r_byte] as u64) << 8)
-                        | ((m_bytes[2][r_byte] as u64) << 16)
-                        | ((m_bytes[3][r_byte] as u64) << 24);
-                    let transposed = transpose_8x8_bits(combined);
-                    let tb = transposed.to_le_bytes();
-                    let b = r_byte * 8;
-                    acc[b] += lookup[(tb[0] & 0x0F) as usize];
-                    acc[b + 1] += lookup[(tb[1] & 0x0F) as usize];
-                    acc[b + 2] += lookup[(tb[2] & 0x0F) as usize];
-                    acc[b + 3] += lookup[(tb[3] & 0x0F) as usize];
-                    acc[b + 4] += lookup[(tb[4] & 0x0F) as usize];
-                    acc[b + 5] += lookup[(tb[5] & 0x0F) as usize];
-                    acc[b + 6] += lookup[(tb[6] & 0x0F) as usize];
-                    acc[b + 7] += lookup[(tb[7] & 0x0F) as usize];
-                }
-                acc
-            },
-        )
-        .reduce(
-            || vec![F128::ZERO; n],
-            |mut a, b| {
-                for r in 0..n {
-                    a[r] += b[r];
-                }
-                a
-            },
-        )
 }
 
 /// Sparse counterpart of [`fold_b128_elems`] returning **sparse pairs** instead

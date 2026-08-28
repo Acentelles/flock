@@ -599,8 +599,7 @@ impl<'r> UnionInstance<'r> {
     // single-type harness binding (differential tests only).
     // -----------------------------------------------------------------------
 
-    /// The multi-table statement binding (design doc §"Statement digest and
-    /// transcript"): absorb, before any challenge is squeezed and in this
+    /// The multi-table statement binding. Before any challenge, absorb in this
     /// order, the `flock-mixed-v1` domain label, the registry digest
     /// ([`Registry::digest`]), the counts vector (one u64 LE per type, in
     /// slot order, as a single byte string — its length is additionally
@@ -636,8 +635,7 @@ impl<'r> UnionInstance<'r> {
     ///
     /// Absorbed before any challenge, and in particular before the wiring
     /// GKR — which squeezes `α, β` at entry, so the multiset statement must
-    /// already be fixed (design doc §"Statement, transcript, Fiat–Shamir";
-    /// `circuit::prove_wiring`'s contract).
+    /// already be fixed before `circuit::prove_wiring` starts.
     ///
     /// **Append-only:** the existing four observations are unchanged and the
     /// circuit payload follows under its own versioned label, so a non-circuit

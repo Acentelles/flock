@@ -30,16 +30,8 @@
 //! - **No sum-bit slots**. Each ADD's 32 sum bits expand into lin_funcs at
 //!   the use site (2-op: `s[i] = X[i] ⊕ Y[i] ⊕ ⊕_{j<i} aux[j]`; fused:
 //!   `s[i] = a_i⊕b_i⊕m_i ⊕ w_{i-1}⊕m_{i-1} ⊕ ⊕_{1≤l<i} v_l`).
-//! - **No lin-id slots for ANY lane.** All 16 state lanes cascade: every
-//!   read inlines the chain of aux-product references from prior G's that
-//!   touched the lane. (Option D materialized per-G `b_new`/`d_new` lin-id
-//!   slots — 3,584 bits/compression — to break half the cascades, fearing
-//!   density blowup. Measured 2026-08-05: char-2 xor_dedup keeps the
-//!   cascade LINEAR — full drop is 48.3M nnz vs Option D's 21.0M (2.3×),
-//!   max row ~5.6k terms, while the row narrows 121 → 93 committed
-//!   word-cols (−23%). The CSC fold prices nnz at ~1 ms per 21M/prove, so
-//!   the area win dominates. Measured by the since-deleted
-//!   `tests/b3_width_audit.rs` probe, bloat ledger §E.)
+//! - **No lin-id slots for any lane.** Each read inlines the auxiliary
+//!   product references from prior G operations that touched the lane.
 //!
 //! Trade-off: the matrix template is dense (48.3M nnz), so template build
 //! and any O(nnz) pass cost more — but those are per-shape/cacheable
@@ -114,6 +106,7 @@ use flock_core::field::F128;
 use flock_core::pcs::{Commitment, PcsParams};
 use flock_core::proof::R1csClaim;
 use flock_core::r1cs::{BlockR1cs, SparseBinaryMatrix};
+use flock_core::schedule::IoWord;
 use flock_core::verifier;
 
 // ---------------------------------------------------------------------------
@@ -273,11 +266,8 @@ pub const IO_OUT_HI0: usize = 9;
 /// block consumes; `out_hi` is only meaningful for root/XOF compressions, but
 /// a schema word that goes unwired is σ-fixed and costs nothing, whereas an
 /// omitted one would be unconstrained.
-///
-/// The 128-bit alignment this depends on landed in `f95dfbb`
-/// ([`CV_BASE`] = 0, [`OUT_LO_BASE`] = 256, [`M_BASE`] = 512).
+/// The word ranges use 128-bit alignment.
 pub fn io_schema() -> Vec<flock_core::schedule::IoWord> {
-    use flock_core::schedule::IoWord;
     let w = |bit_base: usize| bit_base / 128;
     vec![
         IoWord::input(w(CV_BASE)),          // cv[0..4]
@@ -1460,7 +1450,6 @@ pub fn generate_witness_with_ab_packed(
     Vec<flock_core::field::F128>,
     Vec<flock_core::field::F128>,
 ) {
-    use flock_core::field::F128;
     let n_total = 1usize << n_blocks_log;
     let n_blocks = blocks.len();
     assert!(
@@ -1551,9 +1540,7 @@ pub fn generate_witness_with_ab_packed_and_lincheck(
 
 /// Bundles the monolithic BLAKE3 compression R1CS, its single-slot union
 /// registry, and dense/integer-lane PCS params for `n_blocks` compressions.
-/// Proving goes through the UNION commit — dense stack + integer lanes;
-/// the padded-commit prove path was retired 2026-08-14 with the rest of
-/// the legacy standalone machinery.
+/// Proving uses the union commit with dense storage and integer lane counts.
 #[derive(Debug)]
 pub struct Blake3Setup {
     pub n_blocks: usize,

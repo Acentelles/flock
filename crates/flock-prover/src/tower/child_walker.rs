@@ -1,10 +1,14 @@
 use super::*;
+use flock_core::pcs::ring_switch as rs;
+use flock_core::transcript_record::{RecordingChallenger, TranscriptOp as Op};
+use flock_core::zerocheck::univariate_skip::build_eq;
+use flock_core::zerocheck::univariate_skip_optimized::{
+    medium_challenges_ghash, small_challenges_ghash,
+};
 
 /// One recorded child verification, parsed: the tape pinned op-for-op, every
 /// region located, and every native replica the emitter and checker consume.
-/// This is mvp10's step-1 parsing as a reusable unit — `new` runs the
-/// RECORDING verify itself, so instantiating a child region for the mvp11
-/// merge node re-asserts the whole map on that child's tape.
+/// `new` records the verification and checks the map for that tape.
 pub(super) struct ChildTape<'p> {
     pub(super) inner: &'p MixedInner,
     // the recorded tape
@@ -130,8 +134,6 @@ pub(super) enum ZskipTapeRec {
 
 impl<'p> ChildTape<'p> {
     pub(super) fn new(inner: &'p MixedInner, domain: &'static [u8]) -> Self {
-        use flock_core::transcript_record::{RecordingChallenger, TranscriptOp as Op};
-
         let built = &inner.built;
         let proof = &inner.proof;
         let union = UnionInstance::new(&built.shape.registry, built.shape.counts.clone());
@@ -840,8 +842,6 @@ impl<'p> ChildTape<'p> {
 
         // ---- the merged intake's natives (target, running, boundary) ----
         let (native_target, native_running) = {
-            use flock_core::pcs::ring_switch as rs;
-            use flock_core::zerocheck::univariate_skip::build_eq;
             let gs: Vec<F128> = (0..2).map(|k| chals[rs_gam_ch + k]).collect();
             let mut target = F128::ZERO;
             let mut coeffs: Vec<Vec<F128>> = Vec::new();
@@ -975,9 +975,7 @@ impl<'p> ChildTape<'p> {
         );
         assert_eq!(w_rounds.len(), m_mp2, "merged rho spans the dense domain");
         let n_log_i = union.n_log();
-        // ROUND 4: the recombination + f == g, replayed from located words
-        // (the emitter binds these; until it landed they rode only this
-        // constructor's scaffolding verify).
+        // Recompute the recombination and f == g from located words.
         let n_pub_slots_c = pin_recombination(
             inner.built.shape.circuit.cells(),
             n_log_i,
@@ -1170,11 +1168,10 @@ impl<'p> ChildTape<'p> {
         // indices, not layout assumptions. The mlv rounds follow the
         // BATCH-MAJOR packing [k_skip | dim6 | rows | high col vars]:
         // round 0 binds x_inner_rest[0] (the dim-6 var), rounds 1..1+ν bind
-        // x_outer (the rows — what mvp10's RS-point composition uses), and
+        // x_outer (the rows used by the RS-point composition), and
         // the remaining rounds bind x_inner_rest[1..]. rr is the lc rounds
         // REVERSED; z_skip is the located squeeze; z_partial the located
-        // slice. (Two wrong layout guesses died on these asserts before
-        // this mapping — the method-note discipline earning its keep.)
+        // slice.
         {
             let inner_b = bool_assert.x_inner_rest.len();
             assert_eq!(
@@ -1609,9 +1606,8 @@ impl<'p> ChildTape<'p> {
     }
 }
 
-/// The gate slots a child-tape region emits into. Created ONCE by the outer
-/// test and shared by every region in the builder — the mvp11 merge outer
-/// instantiates two child regions (and the fold region) over shared slots.
+/// The gate slots a child-tape region emits into. The builder shares these
+/// slots across all child regions.
 /// The recursion envelope and strict Fast nodes place the two independent
 /// child BLAKE workloads in identical slots; the other families still add
 /// rows, not columns. The `le`/`resid` caches fill on demand during emission;
@@ -1783,8 +1779,7 @@ pub(super) enum ZskipWires {
 }
 
 /// What one emitted child region hands back: where its public block starts,
-/// the walk counts the checker needs, and the assertion-emission wires the
-/// mvp11 merge node CONNECTS the fold region's claim words to.
+/// the walk counts the checker needs, and the assertion-emission wires.
 pub(super) struct ChildRegion {
     pub(super) pub_base: usize,
     pub(super) n_query_pub: usize,
@@ -1825,9 +1820,7 @@ pub(super) struct ChildRegion {
 /// Emit ONE child's complete deferred-verifier region — chain, query phase,
 /// wiring GKR, element PIOP, multipoint intake + anchor expect, W-rounds,
 /// spine, residual, sigma emission — into `sb`, publishing exactly what
-/// [`check_child_region`] walks. This is mvp10's assembly (steps 1-8),
-/// extracted verbatim; the tape supplies every located ordinal and native
-/// replica.
+/// [`check_child_region`] walks. The tape supplies each ordinal and native value.
 pub(super) fn emit_child_region(
     sb: &mut ShapeBuilder,
     cs: &mut ChildSlots,
@@ -2352,9 +2345,6 @@ pub(super) fn emit_child_region(
     // (baked constants are free in-circuit either way).
     let t_vals_b: Vec<F128> = match &ct.zskip {
         ZskipTapeRec::Rs { .. } => {
-            use flock_core::zerocheck::univariate_skip_optimized::{
-                medium_challenges_ghash, small_challenges_ghash,
-            };
             let mut v: Vec<F128> = Vec::new();
             v.extend_from_slice(&small_challenges_ghash());
             v.extend_from_slice(&medium_challenges_ghash());
@@ -2754,8 +2744,8 @@ pub(super) fn emit_child_region(
     );
 
     // Everything publishes HERE, after every public input is declared
-    // (`built.public` lists entries in DECLARATION order — the recorded
-    // MVP-7 gotcha). Tail order: [query phase (alphas), accs | ga, mg |
+    // (`built.public` lists entries in declaration order). Tail order:
+    // [query phase (alphas), accs | ga, mg |
     // gkr deltas | el deltas, el zc end, el lc end | mp_delta, anc,
     // t_final, tgt, runw | resid | inner | s_sigma | rho... | sqrt deltas |
     // anchor delta].
@@ -2853,7 +2843,7 @@ pub(super) fn emit_child_region(
 }
 
 /// Walk one emitted child region's public block and hold every published
-/// value against the tape's native replicas — mvp10's checker, extracted.
+/// value against the tape's native replicas.
 /// Returns the number of public entries consumed (the region's publish
 /// tail), so a multi-region caller can walk region after region.
 pub(super) fn check_child_region(public: &[F128], ct: &ChildTape<'_>, r: &ChildRegion) -> usize {
@@ -3022,9 +3012,7 @@ pub(super) fn check_child_region(public: &[F128], ct: &ChildTape<'_>, r: &ChildR
 /// This is the shape a MIXED CIRCUIT union produces: it commits `num_lanes`
 /// ACTIVE lanes, `dense_words.div_ceil(2^log_dim)`, an arbitrary integer
 /// (the top lanes are definitionally zero and never encoded — see
-/// `ligerito`'s "high-bit-lane commit"). MVP-7 and MVP-9 never met it
-/// because their inners' lane counts were powers of two by luck of
-/// `dense_words`; MVP-10's realistic mixed inner opens 61-word rows.
+/// `ligerito`'s high-bit-lane commit).
 ///
 /// BLAKE3 hashes 61 words = 976 bytes as one chunk of 16 blocks whose last
 /// carries `b = 16`, and the compression's `b` is a free input to the gate,

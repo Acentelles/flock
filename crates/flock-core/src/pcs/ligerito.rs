@@ -3936,17 +3936,13 @@ pub type BasisWindowFn<'a> = &'a (dyn Fn(&mut [F128], usize) + Sync);
 /// [`fold_and_msg_blocked`] with the basis supplied JUST-IN-TIME. Identical
 /// arithmetic and identical output; the only difference is that each task
 /// fills two small L1-resident windows of `b` rather than streaming them from
-/// a `2^m` array — which at `m = 30` removes both the 134 MB materialization
-/// and the 134 MB read of it, and measures FASTER than the read (measured
-/// by the since-deleted `tests/jit_fold.rs` probe, bloat ledger §E).
+/// a `2^m` array. At `m = 30`, this removes a 134 MB allocation and its read.
 ///
 /// `d = 1` is the ordinary adjacent/LSB pairing; `d > 1` is the blocked
 /// pairing used by a lane-major L0 fold.  The same task decomposition covers
 /// both cases: at `d = 1`, one task folds four adjacent input entries into
 /// two output entries and accumulates exactly one next-round message pair.
-// Test-only since the F128 `SumcheckProver::fold_blocked_jit` wrapper was
-// deleted (bloat ledger §A): the production JIT fold is the F256 one in
-// `extension`; the in-file jit-equivalence test keeps this as its oracle.
+// This F128 implementation is a test oracle for the F256 implementation.
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn fold_and_msg_blocked_jit(

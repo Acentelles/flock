@@ -43,8 +43,8 @@
 //! ## Why a permutation proves the copy constraints
 //!
 //! Wires are equivalence classes of cells; σ rotates each class cyclically and
-//! fixes everything else. By tag rigidity (design doc, Lemma "Tag rigidity")
-//! the multiset identity `{(w_x, x)} = {(w_x, σ(x))}` holds iff `w` is constant
+//! fixes everything else. The multiset identity
+//! `{(w_x, x)} = {(w_x, σ(x))}` holds iff `w` is constant
 //! on σ's orbits — i.e. iff every wire's cells agree. [`crate::product_gkr`]
 //! proves exactly that identity as a grand product, at `f = g = w`, with no
 //! committed oracle. Direction never enters: σ neither knows nor cares which
@@ -789,8 +789,7 @@ pub fn prove_wiring_with_grinding<C: Challenger>(
     }
 
     // ---- The gather: one eq-weighted row fold per gate cell-slot, O(2^ν)
-    // each, landing on the packed-direct claim shape (design doc, Lemma
-    // "Gather factorization").
+    // each, producing packed-direct claims.
     let t = std::time::Instant::now();
     let eq_row = build_eq(&claim.rho[..nu]);
     let mut gather = Vec::with_capacity(cells.num_gate_slots());
@@ -817,7 +816,7 @@ pub fn prove_wiring_with_grinding<C: Challenger>(
             // DEFERRED: the merged open (the only transport) never reads
             // `eq_ind` — it derives its identity-fold weights from
             // `point`/`value` alone — so the `2^nu`-entry tensor per gate
-            // slot (~32 MiB at MVP-6's ~120 slots) is never built. A claim
+            // slot is never built. A claim
             // that DID need a materialized tensor would trip the combine's
             // "EqPoint claims are only supported alone" assert rather than
             // silently dropping the contribution.
@@ -1186,7 +1185,7 @@ fn verify_wiring_core<C: Challenger>(
     }
     .map_err(WiringError::Gkr)?;
 
-    // ---- Recombination (design doc, Lemma "Gather factorization"):
+    // ---- Recombination:
     // ŵ(ρ) = Σ_{gate ι} eq(ρ_ι, ι)·v_ι + Σ_{public ι} eq(ρ_ι, ι)·v̂_ι(ρ_row).
     // Dummy cell-slots contribute nothing (w = 0 there).
     let eq_row = build_eq(&claim.rho[..nu]);

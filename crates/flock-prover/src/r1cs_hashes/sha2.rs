@@ -174,15 +174,8 @@ pub const SC_MAJ1: usize = 0;
 pub const SC_MAJ2: usize = CARRIES_PER_ADD; // 31
 pub const SC_RIP: usize = 2 * CARRIES_PER_ADD; // 62
 
-// Lin-id discipline (measured 2026-08-14 with the since-deleted
-// `sha2_linid_drop_sim` probe, bloat ledger §E): W is
-// never materialized (the schedule cascade stays shallow — 19.7M nnz),
-// and E_NEW/A_NEW materialize only every OTHER round (`EA_PERIOD` = 2):
-// an inlined round's state expressions are cut one round later, bounding
-// the σ/Σ fan-out at 47.4M template nnz / max row ~8.9k — the same
-// density envelope blake3's Option-E full cascade already lives in. The
-// zk.golf record's FULL inlining measures 184M nnz here and does not
-// price in against the CSC fold + cached-template costs.
+// W is not materialized. E_NEW and A_NEW are materialized every other round
+// to limit expression growth.
 pub const EA_PERIOD: usize = 2;
 /// Rounds whose E_NEW/A_NEW are materialized (r % EA_PERIOD == 1).
 pub const N_EA_SLOTS: usize = N_ROUNDS / EA_PERIOD; // 32

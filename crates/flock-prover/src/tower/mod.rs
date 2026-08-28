@@ -39,32 +39,10 @@ use flock_core::pcs::PcsParams;
 use flock_core::pcs::ligerito::LigeritoProfile;
 use flock_core::verifier;
 
-// Module map (split from the former single-file tower.rs, 2026-08-27 —
-// pure code motion; item visibilities widened to pub(super) where the old
-// file-wide scope crossed the new file boundaries):
-//   config       TowerConfig, env knobs, fold grinding
-//   envelope     envelope shape, slots, padding
-//   online       per-stage timing + proof census (test-gated)
-//   gates_blake3 BLAKE3 consts/gate, MerklePathGate + Tree (test-gated), Rng
-//   gates_leaf   leaf arithmetic gates, F128 + F256
-//   fs_chain     transcript helpers, FS-chain emit, merged chain + replay
-//   gates_spine  spine/residual/prefix/MAC/assist/zc gates (F128 + F256)
-//   tape         recorded-op tape structs, parse_open_levels
-//   gates_glue   swap/spread/pow/family-transpose gate wrappers
-//   geometry     level geometry, cap wires, publics hash
-//   query        query phase, residual region + checker, pow checks, opening,
-//                LeafOuter
-//   real_walker  RealTape/RealRegion — the outer (envelope) walker
-//   chain        MixedProof, chain leaf shape, ChainProof + builder
-//   fl_node      FlNode + build_fl_node_k (2 chains -> first-level node)
-//   gkr          GKR recs, eq/reported/AG-binding emitters, recombination
-//   child_walker ChildTape/ChildSlots/ChildRegion — the child walker
-//   fold_region  sigma fold + jagged fold regions (uniform + jagged twins)
-//   node         SpineIn/NodeOut/ChainLane + build_node_outer_app (2 -> 1)
-//   e2e_tests    the ignored e2e suite incl. the m32 headline + online bench
 mod chain;
 mod child_walker;
 mod config;
+#[cfg(test)]
 mod e2e_tests;
 mod envelope;
 mod fl_node;

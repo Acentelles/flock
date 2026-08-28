@@ -17,6 +17,10 @@
 //! Workspace-wide Clippy `allow`s for the hand-tuned numeric kernels are
 //! declared in `[workspace.lints.clippy]` at the repo root.
 
+#[cfg(target_os = "linux")]
+use std::collections::HashSet;
+use std::sync::OnceLock;
+
 pub mod aggregate;
 pub mod bits;
 pub mod challenger;
@@ -92,7 +96,6 @@ pub fn init_perf_thread_pool() -> Option<usize> {
 /// Built lazily on first use. Respects `RAYON_NUM_THREADS` (so single-thread
 /// parity tests and ST bench conventions stay single-threaded).
 pub fn all_core_pool() -> &'static rayon::ThreadPool {
-    use std::sync::OnceLock;
     static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
     POOL.get_or_init(|| {
         let n = std::env::var("RAYON_NUM_THREADS")
@@ -280,7 +283,6 @@ pub fn alloc_zeroed_vec<T: Zeroable>(n: usize) -> Vec<T> {
 /// memoizes it so hot paths can cheaply ask "is the current rayon pool the
 /// homogeneous P-core pool?" (i.e. `current_num_threads() <= this`).
 pub(crate) fn perf_core_count_cached() -> usize {
-    use std::sync::OnceLock;
     static N: OnceLock<usize> = OnceLock::new();
     *N.get_or_init(perf_core_count)
 }
@@ -329,7 +331,6 @@ fn perf_core_count() -> usize {
 /// `None` if the topology can't be read (caller falls back to logical count).
 #[cfg(target_os = "linux")]
 fn linux_physical_cores() -> Option<usize> {
-    use std::collections::HashSet;
     let mut cores: HashSet<(String, String)> = HashSet::new();
     for entry in std::fs::read_dir("/sys/devices/system/cpu").ok()? {
         let Ok(entry) = entry else {
@@ -389,7 +390,6 @@ fn efficiency_core_count() -> usize {
 /// of topology (for re-measurement on new machines; pair against the sites'
 /// `*_PCORES_ONLY` switches for A/B).
 pub(crate) fn ecore_rich_topology() -> bool {
-    use std::sync::OnceLock;
     static B: OnceLock<bool> = OnceLock::new();
     *B.get_or_init(|| {
         std::env::var("FLOCK_ALLCORE").is_ok()

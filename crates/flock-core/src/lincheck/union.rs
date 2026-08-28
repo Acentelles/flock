@@ -1,8 +1,8 @@
-//! Union-column lincheck — multi-table Phase 2, milestone M2.
+//! Union-column lincheck for multi-table proofs.
 //!
 //! Generalizes the single-table lincheck (`super`) from one slot to the `T`
-//! aligned slot subcubes of a registry instance (design doc §"Lincheck over
-//! the union"): ONE product sumcheck over the **union column domain** — the
+//! aligned slot subcubes of a registry instance. One product sumcheck over
+//! the **union column domain** — the
 //! seven in-word coordinates plus every chunk-and-prefix coordinate, i.e.
 //! everything except the shared row block `R` — proves the α-batched claim
 //! `α·â(r) + b̂(r)` left by the union zerocheck.

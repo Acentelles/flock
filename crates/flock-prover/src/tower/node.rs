@@ -1,4 +1,12 @@
 use super::*;
+use crate::prover::UnionElementSlotInput;
+use flock_core::aggregate;
+use flock_core::field::PHI_8_TABLE;
+use flock_core::matrix_fold::FoldProof;
+use flock_core::transcript_record::{RecordingChallenger, TranscriptOp as Op};
+use flock_core::zerocheck::K_SKIP;
+use flock_core::zerocheck::multilinear::subspace_denominator_pair;
+use rayon::prelude::*;
 
 /// The PRODUCTION per-proof tape cost of one child: the recorded deferred
 /// verify alone — the tape (op sequence + values + challenges) and the
@@ -8,7 +16,6 @@ use super::*;
 /// copies on top of this. Union + lcs construction is included
 /// (conservative — a node would cache both).
 pub(super) fn record_child_verify(lo: &LeafOuter, domain: &'static [u8]) {
-    use flock_core::transcript_record::RecordingChallenger;
     let union_i = outer_union(&lo.shape.registry, lo.shape.counts.clone());
     let lcs = leaf_boolean_lcs(lo);
     let mut rec = RecordingChallenger::new(FsChallenger::with_chained_blake3(domain));
@@ -181,10 +188,6 @@ pub fn build_node_outer_app(
     lane: Option<ChainLane<'_>>,
     spine: Option<SpineIn<'_>>,
 ) -> NodeOut {
-    use flock_core::aggregate;
-    use flock_core::matrix_fold::FoldProof;
-    use flock_core::transcript_record::{RecordingChallenger, TranscriptOp as Op};
-
     const M11_NODE_DOMAIN: &[u8] = b"flock-mvp11-two-to-one-v0";
 
     // ARITY IS A KNOB: the node folds `k = los.len()` children in one
@@ -197,12 +200,11 @@ pub fn build_node_outer_app(
     assert!(n_kids >= 2, "a node folds at least two children");
     let forge_match = spine.as_ref().is_some_and(|sp| sp.forge);
     let lo0 = los[0];
-    // MIXED DIGESTS ARE THE SPINE (wall 3): a steady node's children are a
-    // FRESH FL and the PREVIOUS NODE, which are different circuits. They
-    // still share the registry, the publics length and the lane count (the
-    // wall-2 envelope), which is what makes ONE child region walk either —
-    // only the fold KEYS differ, one slot per child. Without a spine the
-    // old rule stands: one key, so one digest.
+    // A steady node has one fresh FL child and one prior node child.
+    // These children use different circuits. They share the registry, public
+    // length, and lane count. One child region
+    // can therefore walk either child. Only the fold keys differ.
+    // Without a spine, each child uses one circuit digest.
     if spine.is_none() {
         for lo in los {
             assert_eq!(
@@ -229,10 +231,7 @@ pub fn build_node_outer_app(
     let t_tapes = std::time::Instant::now();
     // The children's tapes are independent statement work — build them
     // concurrently (each is a recording verify + the region pins).
-    let rts: Vec<RealTape> = {
-        use rayon::prelude::*;
-        los.par_iter().map(|lo| RealTape::new(lo, DOMAIN)).collect()
-    };
+    let rts: Vec<RealTape> = { los.par_iter().map(|lo| RealTape::new(lo, DOMAIN)).collect() };
     let tape_setup_ms = t_tapes.elapsed().as_secs_f64() * 1e3;
     for i in 1..n_kids {
         assert_ne!(
@@ -725,8 +724,6 @@ pub fn build_node_outer_app(
     // ---- ONE outer: two REAL child regions + the fold region ----
 
     {
-        use crate::prover::UnionElementSlotInput;
-
         // The transcript is FORKED (the wiring runs on its own chain);
         // `merge_chain` splices the child's rows in at the fork point and
         // hands back one linear numbering plus the four cross-link wires.
@@ -1206,9 +1203,6 @@ pub fn build_node_outer_app(
         // nodes and the subspace denominator inverse — statement constants
         // the checker validates below (the ONE public surface the
         // in-circuit derivation adds).
-        use flock_core::field::PHI_8_TABLE;
-        use flock_core::zerocheck::K_SKIP;
-        use flock_core::zerocheck::multilinear::subspace_denominator_pair;
         // The RS lows machinery is emitted only when an RS child consumes
         // it; AG children take the Tier-0 published surface instead.
         let any_rs = rts
@@ -2090,7 +2084,6 @@ pub fn build_node_outer_app(
             let tapes_ms = {
                 let t = std::time::Instant::now();
                 {
-                    use rayon::prelude::*;
                     los.par_iter()
                         .for_each(|lo| record_child_verify(lo, DOMAIN));
                 }

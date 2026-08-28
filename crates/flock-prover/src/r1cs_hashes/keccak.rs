@@ -64,6 +64,7 @@
 
 use rayon::prelude::*;
 
+use flock_core::bits::transpose_8_u64s_to_64_bytes;
 use flock_core::challenger::Challenger;
 use flock_core::field::F128;
 use flock_core::lincheck::LincheckCircuit;
@@ -1099,8 +1100,6 @@ unsafe fn build_group_batch_major(
     b: *mut u64,
     stripe: *mut u8,
 ) {
-    use flock_core::bits::transpose_8_u64s_to_64_bytes;
-
     let mut wz = RowWriter::new(z, o0, n_log);
     let mut wa = RowWriter::new(a, o0, n_log);
     let mut wb = RowWriter::new(b, o0, n_log);

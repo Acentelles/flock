@@ -34,6 +34,7 @@
 //! `current_claim = (1+r_now)·G(0) + r_now·G(1)`.
 
 use rayon::prelude::*;
+use std::sync::OnceLock;
 
 #[cfg(all(
     target_arch = "x86_64",
@@ -115,7 +116,6 @@ fn round2_pair_skip(run: &crate::zerocheck::PaddingRun, k_skip: usize) -> (usize
 /// as a statement constant and must name the SAME value the native weights
 /// use (verifier-exported references over formulas-written-twice).
 pub fn subspace_denominator_pair(dim: usize) -> (F128, F128) {
-    use std::sync::OnceLock;
     static CACHE: OnceLock<[(F128, F128); 9]> = OnceLock::new();
     let table = CACHE.get_or_init(|| {
         std::array::from_fn(|d| {

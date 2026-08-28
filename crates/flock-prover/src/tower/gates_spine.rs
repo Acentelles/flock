@@ -970,9 +970,7 @@ pub(super) fn emit_mac256(
     [out[0], out[1]]
 }
 
-/// One layer of the multipoint anchor's 4-state boundary DP (MVP-8 step 3;
-/// oracle-tested standalone in `circuit_assist.rs` — this is the same gate,
-/// both sourcing the transition table from `flock_core::pcs::jagged`).
+/// One layer of the multipoint anchor's four-state boundary computation.
 pub(super) struct AssistLayerGate {
     pub(super) ty: std::sync::Arc<flock_core::element_r1cs::ElementTableType>,
 }

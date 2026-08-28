@@ -19,7 +19,7 @@
 
 use rayon::prelude::*;
 
-use crate::field::F128;
+use crate::field::{F128, F256};
 use std::sync::Mutex;
 
 static POOL: Mutex<Vec<Vec<F128>>> = Mutex::new(Vec::new());
@@ -160,7 +160,6 @@ pub fn give_f128(v: Vec<F128>) {
 ///
 /// Same write-before-read contract as [`take_f128`].
 pub fn take_f256(n: usize) -> Vec<crate::field::F256> {
-    use crate::field::F256;
     if let Some(v) = try_take_f128(2 * n) {
         // Reinterpreting requires an even F128 capacity so the F256 vec's
         // drop layout (`Layout::array::<F256>(cap/2)`) matches the

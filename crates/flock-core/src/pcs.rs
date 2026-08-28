@@ -35,7 +35,8 @@ pub use pack::{LOG_PACKING, pack_witness};
 pub use ring_switch::{RingSwitchProof, SparseEqTensor};
 
 use crate::challenger::Challenger;
-use crate::field::{F128, F256};
+use crate::field::{F128, F256, F256Unreduced};
+use crate::matrix_fold::{JaggedClaim, JaggedRowWeight, JaggedTable};
 use crate::zerocheck::PaddingSpec;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -616,7 +617,6 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         // gathering (+4 unreduced muls per quad on a pass that already runs;
         // it buys the ladder a full fold-0 pass). Needs `l ≥ 4·blk`
         // (initial_k ≥ 2), which every shipped ladder satisfies.
-        use crate::field::F256Unreduced;
         assert!(blk.is_power_of_two() && l.is_multiple_of(4 * blk));
         let quad = |q: usize, acc: &mut [F256Unreduced; 8]| {
             let i0 = 4 * q * blk;
@@ -743,7 +743,6 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
     let la_ref = &mut round1_lookahead;
     let mut combine = || {
         if use_fast {
-            use crate::field::F256Unreduced;
             let b = rs_deferred[0].0.len(); // eq_lo.len(); shared across claims (same split)
             debug_assert!(b >= 2 && b.is_multiple_of(2));
             debug_assert!(rs_deferred.iter().all(|d| d.0.len() == b));
@@ -1338,11 +1337,8 @@ fn rotate_lane_point(point: &[F128], k: usize) -> Vec<F128> {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// The MERGED jagged/ring-switch opening (design doc §"Capacity-free
-// ring-switching: a merged reduction") — THE transport since wire v6 (the
-// unmerged jagged transport was removed): ONE sumcheck over the DENSE
-// domain replaces the padded-domain virtual-opening sumcheck AND the
-// jagged transport — the weight `W[d] = Σ_i Φ_i(eq_row·eq_col at the
+// The merged jagged and ring-switch opening uses one sumcheck over the dense
+// domain. The weight `W[d] = Σ_i Φ_i(eq_row·eq_col at the
 // unrank of d)` is simultaneously the ring-switch weight and the
 // dense/virtual translation, so the prover's Φ-pass is count-proportional
 // (capacity-free). The verifier's twisted-weight evaluation `Ŵ(ρ)` is
@@ -1383,7 +1379,7 @@ pub struct MergedOpenProof {
 /// γ-contribution is a single scatter — the gather claims' column parts are
 /// exactly this (`bits(word_col) ‖ bits(slot_prefix)`), and building a
 /// `2^k_cols` table per claim is `k_cols`-exponential waste (~2^20 per
-/// claim at MVP-5's composite registry). Random column points (the element
+/// claim in a large composite registry). Random column points (the element
 /// claims) keep the dense build. Value-identical either way.
 fn scalar_claim_groups<'a>(
     points: impl Iterator<Item = &'a [F128]>,
@@ -1828,7 +1824,6 @@ fn assemble_jagged_assertion(
     n_log: usize,
     mp: &jagged::MultipointDefer,
 ) -> crate::matrix_fold::JaggedAssertion {
-    use crate::matrix_fold::{JaggedClaim, JaggedRowWeight, JaggedTable};
     let table = JaggedTable::from_params(params);
 
     // RS claims: raw eq(z_col) at σ, claim order.

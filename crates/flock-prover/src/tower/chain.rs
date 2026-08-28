@@ -1,18 +1,8 @@
 use super::*;
-
-// ---------------------------------------------------------------------------
-// The minimal mixed inner and its reusable child-region machinery
-// (mvp10's assembly, extracted so the mvp11 merge node can instantiate a
-// child-tape region per child — the build_leaf_outer precedent)
-// ---------------------------------------------------------------------------
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// A circuit-union proof by boolean-zerocheck FLAVOR — parallel arms so
-/// the RS deprecation endgame is arm-deletion, not surgery
-/// (docs/ag-recursion-plan.md). Carried by the chain leaf ([`MixedInner`])
-/// AND the envelope outers ([`LeafOuter`]). The element region, the wiring
-/// argument, and the merged open are shape-identical across flavors, so
-/// shared consumers read them through the accessors; only the zerocheck
-/// walk and its z_skip surface match on the arm.
+/// the chain leaf and envelope outers. Both forms share all other regions.
 #[derive(serde::Serialize)]
 pub(super) enum MixedProof {
     Rs(flock_core::proof::R1csProofCircuitMerged),
@@ -101,13 +91,7 @@ impl MixedProof {
     }
 }
 
-/// A minimal MIXED circuit inner — a blake3 chain feeding MacGate rows across
-/// the class boundary, ends published — proven over the circuit path and
-/// verified DEFERRED. The shape mvp10 pins at `(256, 32)` and the mvp11 merge
-/// children instantiate at `(128, 16)`. The seed varies only the witness
-/// (message words), so same-parameter instances share the CIRCUIT — and its
-/// digest, the key the accumulator folds sigma under — while their claims
-/// land at unrelated FS points, which is what a merge node actually sees.
+/// A mixed circuit proof and its deferred verification data.
 pub(super) struct MixedInner {
     pub(super) nu: usize,
     pub(super) built: flock_core::circuit::builder::BuiltCircuit,
@@ -118,17 +102,7 @@ pub(super) struct MixedInner {
     pub(super) sigma: flock_core::circuit::SigmaAssertion,
 }
 
-/// **Chain-PoC step 0: a SINGLE-SLOT BOOLEAN union takes wiring.** The
-/// hash-chain application's leaf is one b3 slot whose rows chain
-/// cv_out(i) → cv_in(i+1) by copy constraints — no element slot anywhere.
-/// mvp10's minimal wired inner carried a MacGate, leaving open whether the
-/// circuit transport NEEDS an element presence; `sha256_binary_tree_circuit`
-/// (circuit_wiring.rs) already answers "no" for the PLAIN verify. This probe
-/// pins the recursion-relevant remainder on the chain shape itself:
-/// blake3/blake3 (the recursable config), the DEFERRED verify — boolean
-/// matrix work + sigma assertion out, element work `None` — both discharging
-/// natively, and the chain-link tamper dying on the wiring product rather
-/// than anything softer.
+/// Check a single-slot Boolean union whose rows form a BLAKE3 hash chain.
 #[test]
 #[ignore] // Heavier — run with `-- --ignored`.
 pub(super) fn chain_probe_boolean_only_wired_union() {
@@ -292,7 +266,6 @@ pub(super) struct ChainShape {
 /// memcpy, ~an order of magnitude cheaper) instead of re-emitting it.
 /// `build_chain_proof`'s setup_ms honestly reflects whichever it paid.
 pub(super) fn chain_shape_cached(n_blocks: usize) -> std::sync::Arc<ChainShape> {
-    use std::sync::{Arc, Mutex, OnceLock};
     type Cache = Mutex<Vec<(usize, Arc<ChainShape>)>>;
     static CACHE: OnceLock<Cache> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(Vec::new()));

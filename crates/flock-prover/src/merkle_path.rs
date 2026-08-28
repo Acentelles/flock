@@ -35,6 +35,7 @@ use flock_core::field::F128;
 use flock_core::lincheck::build_eq_table;
 use flock_core::zerocheck::multilinear::eq_eval;
 use serde::{Deserialize, Serialize};
+use std::sync::OnceLock;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -221,7 +222,6 @@ fn lagrange_eval_degree3(
 /// (ω·(ω+1))⁻¹ — the shared Lagrange denominator over {0, 1, ω, ω+1} in char 2.
 #[inline]
 fn lagrange_inv_denom() -> F128 {
-    use std::sync::OnceLock;
     static INV: OnceLock<F128> = OnceLock::new();
     *INV.get_or_init(|| (OMEGA * omega_plus_1()).inv())
 }

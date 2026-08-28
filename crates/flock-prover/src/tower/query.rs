@@ -11,21 +11,17 @@ use flock_core::transcript_record::TranscriptOp as Op;
 /// columns), and folds the opened rows against the fold challenges into one
 /// accumulator per level.
 ///
-/// **ROUND 1 — the cap is hashed, not selected.** Per level, `2^c − 1`
+/// Per level, `2^c − 1`
 /// PARENT rows fold the ABSORBED cap wires (`cap_w`, from [`cap_wires`])
 /// to one root in fixed positional order — no swaps, the cap layer IS the
 /// tree's depth-`c` slice — and every opening runs FULL depth (path
 /// siblings from the proof, cap-internal siblings recomputed natively from
-/// the cap) and CONNECTS to that root. The absorbed cap is bound to the
-/// openings by copy constraint; the per-query boundary select — 3 publics
-/// per query and its checker tier — is gone. MVP-7, MVP-9 and MVP-10 all
-/// need exactly this, so it lives here once rather than three times.
+/// the cap) and CONNECTS to that root. A copy constraint binds the cap to
+/// each opening.
 ///
 /// Appends the sibling `hints` and the public `vals` in declaration order;
 /// returns the per-level alpha wires to publish AFTER every input is
-/// declared — publishing inside the loop would interleave with the next
-/// level's inputs and misindex the public segment (the recorded MVP-7
-/// gotcha) — and the accumulators.
+/// declared, and the accumulators.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn emit_query_phase(
     sb: &mut ShapeBuilder,
@@ -209,23 +205,20 @@ pub(super) fn emit_query_phase(
 /// boundary-bound q_field, a prefix over the LATER levels' fold wires,
 /// suffix subset products over the `2^yr` residual positions); the
 /// close-out then assembles `eval_b` from gamma' and the W-round wires
-/// through ONE `pl_full`-wide prefix slot (shorter calls pad their (a, b)
-/// blocks with zero pairs — each padded factor is 1 + 0 + 0 = 1, so the wide
-/// gate is exact), folds in each OOD claim and each level's beta-weighted
-/// accumulators, and dots the absorbed `yr` words into the residual-side
-/// `inner`. MVP-7, MVP-9 and MVP-10 all need exactly this, so it lives here
-/// once rather than three times.
+/// through ONE `pl_full`-wide prefix slot. Shorter calls pad their `(a, b)`
+/// blocks with zero pairs. It folds each OOD claim and each level accumulator.
+/// It then dots the absorbed `yr` words into the residual-side `inner`.
 ///
 /// Appends public `vals` in declaration order; the caller publishes the
-/// returned accumulators and `inner` AFTER all inputs are declared (the
-/// recorded MVP-7 gotcha). Also returns the prefix slot AND ITS WIDTH
+/// returned accumulators and `inner` after all inputs are declared. It also
+/// returns the prefix slot and its width,
 /// `min(pl_full, 8)`, which the anchor-expect machinery reuses for its
 /// chunked products — longer factor lists seed-chain across rows. (The
 /// cap keeps the schema at 19 IO words instead of 2·pl_full + 3; every
 /// gate cell-slot is also a wiring gather claim, so schema words are the
 /// μ AND claim-count budget.)
 ///
-/// **CHUNKING.** The accumulator gate has eight positions (`chunk_log=3`)
+/// The accumulator gate has eight positions (`chunk_log=3`)
 /// at kappa 6 regardless of the proof's residual size. The real inner's
 /// yr = 32 would otherwise push its schema to kappa 7-8. A yr > 8 region
 /// runs as `2^(yr_log-3)` chunks of 8:
@@ -381,7 +374,7 @@ pub(super) fn emit_residual_region(
         )
         .collect();
     // ROUND 3: the close-out's suffix/combine/dot arithmetic rides the
-    // shared 4-word MacGate (cache key 600, the mvp8 convention) plus the
+    // shared 4-word MacGate (cache key 600) plus the
     // prefix slot — the SuffixGate/PartialCombineGate/FinalDotGate types
     // are DISSOLVED: 51 schema words (each a cell slot AND a gather claim)
     // bought ~30 rows of work; as mac/prefix rows the same work is ~250
@@ -569,8 +562,7 @@ pub(super) fn emit_residual_region(
 }
 
 /// Check the residual region's published wires against a NATIVE replica:
-/// `induce_sumcheck_evaluate_at_residual` per level (sks replicated via
-/// `sk_at_vks` — the mvp7 discipline), then the close-out's gamma-weighted
+/// `induce_sumcheck_evaluate_at_residual` per level, then the close-out's gamma-weighted
 /// char-2 eq products and the yr dot. Walks `public` from `at` (the first
 /// accumulator, `levels × 2^yr` entries, then the inner), asserting each.
 /// Returns the native inner — the residual-side t_r — so the caller asserts

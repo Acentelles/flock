@@ -323,10 +323,8 @@ fn derived_m() -> &'static [u64; 160] {
     })
 }
 
-/// Direct bitsliced encode `out = M · inp`: one XOR per set bit of each row of
-/// `M`. Code-instance-agnostic (works for the derived `M`); replaced the legacy
-/// bench Paar SLP, which was hardwired to the since-deleted `M_MASK`. The
-/// optimized SLP for `derived_m` is the generated `super::slp_derived`.
+/// Direct bitsliced encode `out = M · inp`: one XOR per set bit of each row.
+/// The generated `super::slp_derived` provides the optimized form.
 #[inline]
 unsafe fn encode_direct(m: &[u64; 160], inp: &[uint8x16_t; 64], out: &mut [uint8x16_t; 160]) {
     unsafe {

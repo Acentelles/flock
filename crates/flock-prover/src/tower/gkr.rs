@@ -1,4 +1,9 @@
 use super::*;
+use crate::r1cs_hashes::blake3 as b3m;
+use flock_core::circuit::CellSlot;
+use flock_core::field::PHI_8_TABLE;
+use flock_core::zerocheck::K_SKIP;
+use flock_core::zerocheck::univariate_skip::build_eq;
 
 /// One wiring-GKR layer, located on the tape (the assembly's wire map).
 pub(super) struct GkrLayerRec {
@@ -41,8 +46,6 @@ pub(super) fn pin_recombination(
     r_pt: &[F128],
     fgs_v: usize,
 ) -> usize {
-    use flock_core::circuit::CellSlot;
-    use flock_core::zerocheck::univariate_skip::build_eq;
     let (nu_c, c_bits) = (cells.nu(), cells.c_bits());
     assert_eq!(nu_c, n_log_i, "the cell space's row vars are the union's");
     assert_eq!(r_pt.len(), nu_c + c_bits, "ρ spans the cell space");
@@ -263,8 +266,6 @@ pub(super) fn emit_boolean_reported_check(
     zw: Wire,
     ow: Wire,
 ) {
-    use flock_core::zerocheck::K_SKIP;
-
     assert_eq!(eval_w.len(), registry.num_boolean(), "Boolean eval count");
     assert_eq!(beta_w.len(), registry.num_boolean(), "Boolean beta count");
     assert_eq!(z_partial_w.len(), 1usize << K_SKIP, "Boolean low weight");
@@ -404,7 +405,6 @@ pub(super) fn emit_ag_point_binding(
     zw: Wire,
     ow: Wire,
 ) {
-    use crate::r1cs_hashes::blake3 as b3m;
     let flags = CHUNK_START | CHUNK_END | ROOT;
     // ---- native replicas of the decode chain the rows must reproduce ----
     let seed_bytes = ag_seed_bytes(seed_n[0], seed_n[1]);
@@ -653,7 +653,6 @@ pub(super) fn emit_lagrange_lows(
     ow: Wire,
     zassert: Wire,
 ) -> Vec<Wire> {
-    use flock_core::field::PHI_8_TABLE;
     let ell = lam_w.len();
     let mut t_w = Vec::with_capacity(ell);
     let mut z_acc = ow;

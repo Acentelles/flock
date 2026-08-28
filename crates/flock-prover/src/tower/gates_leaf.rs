@@ -2,10 +2,6 @@ use super::*;
 use flock_core::element_r1cs::ElementTableBuilder;
 use flock_core::schedule::IoWord;
 
-// ---------------------------------------------------------------------------
-// MVP-3b: the leaf arithmetic
-// ---------------------------------------------------------------------------
-
 /// What the verifier actually computes from the opened leaves, at one level:
 ///
 /// ```text

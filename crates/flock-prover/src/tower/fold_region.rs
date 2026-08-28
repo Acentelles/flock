@@ -2,10 +2,6 @@ use super::*;
 use flock_core::matrix_fold::{JaggedRowWeight, MatrixClaim, Weight};
 use flock_core::transcript_record::TranscriptOp as Op;
 
-// ---------------------------------------------------------------------------
-// MVP-11: the merge node — step 1, the sigma fold
-// ---------------------------------------------------------------------------
-
 /// One absorbed claim's stream ordinals on a fold tape: the four weight
 /// slices and the value, in absorb order.
 pub(super) struct ClaimLoc {
@@ -718,10 +714,7 @@ pub(super) fn check_fold_publics(
 }
 
 // ---------------------------------------------------------------------------
-// The JAGGED fold groups on the merge tape (the count win) — the five
-// helpers' siblings for the layout-table folds, which ride the SAME
-// aggregate challenger AFTER the uniform folds (option a, Ron's call).
-// mvp11_jagged_fold_tape is the standalone template these extract.
+// The jagged fold groups use the aggregate challenger after the uniform folds.
 // ---------------------------------------------------------------------------
 
 /// One absorbed JAGGED claim's stream ordinals: the tagged row weight and
@@ -1102,7 +1095,7 @@ pub(super) fn replay_jagged_fold_endpoints(
 }
 
 /// Emit the jagged fold groups in-circuit — [`emit_fold_region`]'s sibling
-/// (mvp11_jagged_fold_tape's replay, extracted): MergedRoundGate rounds,
+/// with MergedRoundGate rounds,
 /// PrefixGate eq products for the weight evals (a Combo row's ADDRESS bits
 /// bake as ow/zw — registry constants, count-independent — with its
 /// coefficients as absorbed stream wires), both endpoints as COPY

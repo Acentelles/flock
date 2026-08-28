@@ -48,6 +48,7 @@
 
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
+use std::sync::OnceLock;
 
 pub type Hash = [u8; 32];
 
@@ -284,7 +285,6 @@ const BLAKE3_PARENT: u8 = 4;
 /// Cached SIMD platform. `Platform::detect()` is cheap but not free, and the
 /// tree build reaches the batched path once per [`BLAKE3_BATCH`] nodes.
 fn blake3_platform() -> blake3::platform::Platform {
-    use std::sync::OnceLock;
     static PLATFORM: OnceLock<blake3::platform::Platform> = OnceLock::new();
     *PLATFORM.get_or_init(blake3::platform::Platform::detect)
 }

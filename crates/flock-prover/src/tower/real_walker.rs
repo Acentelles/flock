@@ -1,29 +1,14 @@
 use super::*;
-
-// **THE SWAP, step 1 — mvp9's outer becomes the inner.** The leaf-outer
-// circuit proof (the first real recursion node, BLAKE3/BLAKE3 from the
-// shared builder) is natively verified under a RecordingChallenger and its
-// tape walked by the SAME machinery mvp10's assembly consumes:
-// parse_open_levels, the region label map, level_geometry (native capped
-// paths + enforced-sum replicas per level), and the R=2 + P multipoint
-// schedule replayed to the anchor's claimed v — pinned before any
-// assembly, the step-1 pattern every phase ran. What it establishes about
-// the REAL inner's shape: the element PIOP parses at multi-slot scale, the
-// packed-direct claims are the element (c, lc) pair plus every wiring
-// gather, the R=2 + P>0 schedule holds, and the committed lane count is
-// once more an arbitrary integer.
-// ---------------------------------------------------------------------------
-// The REAL child: the leaf outer's deferred verifier as a reusable region
-// (the swap test's assembly, extracted so the 2→1 merge node can
-// instantiate a real child-tape region per child — the emit_child_region
-// precedent at leaf-outer scale)
-// ---------------------------------------------------------------------------
+use flock_core::pcs::ring_switch as rsw;
+use flock_core::transcript_record::{RecordingChallenger, TranscriptOp as Op};
+use flock_core::zerocheck::univariate_skip::build_eq;
+use flock_core::zerocheck::univariate_skip_optimized::{
+    medium_challenges_ghash, small_challenges_ghash,
+};
+use std::sync::OnceLock;
 
 /// One recorded REAL-child verification (the leaf outer as inner), parsed:
-/// the tape pinned op-for-op, every region located, and every native
-/// replica the emitter and checker consume — the swap test's step-1 walk as
-/// a reusable unit. `new` runs the RECORDING verify itself, so every
-/// instantiation re-asserts the whole map on that child's tape.
+/// the tape, each region, and the native values used by the checker.
 pub(super) struct RealTape<'p> {
     pub(super) lo: &'p LeafOuter,
     // the recorded tape
@@ -64,8 +49,6 @@ pub(super) struct RealTape<'p> {
     // the boolean PIOP's round ordinals ((ch, fin) pairs) + surfaces
     pub(super) zc_rounds_b: Vec<(usize, usize)>,
     pub(super) outer_b: (usize, usize),
-    #[allow(dead_code)] // The r_outer slice length — wall-4 shape data.
-    outer_len: usize,
     pub(super) bl_alpha: (usize, usize),
     /// The const-pin beta squeezes: (ch, fin) per pinned boolean type.
     pub(super) betas_b: Vec<(usize, usize)>,
@@ -121,8 +104,6 @@ pub(super) struct RealTape<'p> {
 
 impl<'p> RealTape<'p> {
     pub(super) fn new(lo: &'p LeafOuter, domain: &'static [u8]) -> Self {
-        use flock_core::transcript_record::{RecordingChallenger, TranscriptOp as Op};
-
         let union_i = outer_union(&lo.shape.registry, lo.shape.counts.clone());
         let lcs = leaf_boolean_lcs(lo);
         // ONE recorded DEFERRED verify serves both needs: it is
@@ -317,7 +298,7 @@ impl<'p> RealTape<'p> {
             "T0 folds to the anchor's claimed v"
         );
 
-        // ---- the wiring GKR walk (the mvp10 walker, real-inner layers) ----
+        // ---- the wiring GKR walk ----
         // Records every ordinal the transcription wires against and replays
         // the whole layer recursion natively in lockstep, input checks
         // included — the rhs consuming the DEFERRED s_sigma from the proof.
@@ -568,7 +549,7 @@ impl<'p> RealTape<'p> {
             pub_payloads[p] = false;
         }
 
-        // The PoW grinding ops, located (the mvp7 machinery).
+        // Locate the PoW operations.
         let pows: Vec<(usize, usize, u32)> = {
             let mut out = Vec::new();
             let (mut fin, mut pay) = (0usize, 0usize);
@@ -641,8 +622,6 @@ impl<'p> RealTape<'p> {
         // recursive circuit independently computes the RS, packed-direct,
         // and group parts below; these values no longer discharge soundness.
         let (native_target, native_running) = {
-            use flock_core::pcs::ring_switch as rsw;
-            use flock_core::zerocheck::univariate_skip::build_eq;
             let gs: Vec<F128> = rs_gam_ch2.iter().map(|&ch| chals[ch]).collect();
             let mut rs_half = F128::ZERO;
             let mut coeffs: Vec<Vec<F128>> = Vec::new();
@@ -816,9 +795,7 @@ impl<'p> RealTape<'p> {
             m_mp2,
         );
         let k_cols_i = params_i.k;
-        // ROUND 4: the recombination + f == g, replayed from located words
-        // (the emitter binds these; until it landed they rode only this
-        // constructor's scaffolding verify).
+        // Recompute the recombination and f == g from located words.
         let n_pub_slots_c = pin_recombination(
             lo.shape.circuit.cells(),
             n_log_i,
@@ -862,7 +839,7 @@ impl<'p> RealTape<'p> {
         let (
             zc_rounds_b,
             zskip,
-            (outer_ch_b, outer_fin_b, outer_len),
+            (outer_ch_b, outer_fin_b, _outer_len),
             bl_alpha,
             betas_b,
             zc_finals_v,
@@ -1408,7 +1385,6 @@ impl<'p> RealTape<'p> {
             n_pub_slots_c,
             zc_rounds_b,
             outer_b: (outer_ch_b, outer_fin_b),
-            outer_len,
             bl_alpha,
             betas_b,
             zc_finals_v,
@@ -1505,7 +1481,6 @@ pub(super) struct RealRegion {
 /// Moore row with one prefix product and seven MACs instead of wiring a
 /// 128-word constant row.
 pub(super) fn family_h_dual_decomposition() -> (F128, F128, [F128; 7]) {
-    use std::sync::OnceLock;
     static DECOMP: OnceLock<(F128, F128, [F128; 7])> = OnceLock::new();
     *DECOMP.get_or_init(|| {
         let minv = flock_core::pcs::ring_switch::moore_inverse();
@@ -2308,9 +2283,6 @@ pub(super) fn emit_real_child_region(
     // challenges — the RS ghash set or the AG set, by the tape's flavor.
     let t_vals_b: Vec<F128> = match &rt.zskip {
         ZskipTapeRec::Rs { .. } => {
-            use flock_core::zerocheck::univariate_skip_optimized::{
-                medium_challenges_ghash, small_challenges_ghash,
-            };
             let mut v: Vec<F128> = Vec::new();
             v.extend_from_slice(&small_challenges_ghash());
             v.extend_from_slice(&medium_challenges_ghash());

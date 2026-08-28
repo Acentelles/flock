@@ -6,10 +6,8 @@
 //! per-level compressions. Here the whole path lives in ONE witness block,
 //! so the level-to-level dataflow is expressed as ordinary R1CS rows. That
 //! is what makes a Merkle path a legal **table type** for the multi-table
-//! union (`flock_core::schedule::TableType`): the union model forbids
-//! constraints between rows (design doc §3, "no constraints connecting
-//! different rows, neither within a table nor across tables"), so one row
-//! must be one self-contained path.
+//! union (`flock_core::schedule::TableType`). The union model forbids
+//! constraints between rows, so one row must contain one complete path.
 //!
 //! ## Statement
 //!
@@ -101,9 +99,8 @@
 //! Public-input binding, exactly as in the per-hash encoders: the leaf, the
 //! index bits and the root are free witness columns at fixed offsets
 //! ([`MerkleTreeLayout::leaf_bit`], [`MerkleTreeLayout::index_bit`],
-//! [`MerkleTreeLayout::root_bit`]). Binding them to public values is the job
-//! of the claim-level glue (or the planned lookup/bus layer — design doc
-//! §8, §11).
+//! [`MerkleTreeLayout::root_bit`]). The claim-level glue binds them to
+//! public values.
 
 use flock_core::field::F128;
 use flock_core::r1cs::{BlockR1cs, SparseBinaryMatrix, WitnessLayout};

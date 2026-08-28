@@ -35,6 +35,7 @@ use flock_core::proof::R1csProofLigeritoAg;
 use flock_core::proof::{R1csClaim, R1csProofLigerito, ZClaim, bind_statement};
 use flock_core::r1cs::BlockR1cs;
 use flock_core::zerocheck;
+use std::time::Instant;
 
 /// Construct a multilinear `x_outer_full` of length `m − k_skip` from a
 /// QuirkyPoint: concatenate `x_inner_rest` and `x_outer`. This is the format
@@ -1862,7 +1863,6 @@ pub fn prove_fast_ligerito_timed<Ch: Challenger>(
     prefaulted_codeword: Option<Vec<F128>>,
     challenger: &mut Ch,
 ) -> (R1csProofLigerito, Commitment, R1csClaim, ProvePhaseTimings) {
-    use std::time::Instant;
     let mut t = ProvePhaseTimings::default();
 
     let lig_config = pcs_params
