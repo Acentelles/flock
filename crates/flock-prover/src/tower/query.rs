@@ -1,4 +1,6 @@
 use super::*;
+use flock_core::lincheck::build_eq_table;
+use flock_core::transcript_record::TranscriptOp as Op;
 
 /// Emit the whole QUERY PHASE — every level's Merkle openings against the
 /// absorbed caps, plus the leaf-eval accumulators — as circuit rows.
@@ -41,7 +43,6 @@ pub(super) fn emit_query_phase(
     consts: &mut Vec<(F128, Wire)>,
     hints: &mut Vec<[u32; SLOT_WORDS]>,
 ) -> (Vec<Vec<Wire>>, Vec<[Wire; 2]>, Vec<Vec<Wire>>) {
-    use flock_core::lincheck::build_eq_table;
     let mut to_publish: Vec<Vec<Wire>> = Vec::new();
     let mut level_accs: Vec<[Wire; 2]> = Vec::new();
     let mut query_positions: Vec<Vec<Wire>> = Vec::new();
@@ -585,7 +586,6 @@ pub(super) fn check_residual_publics(
     yr_vals: &[F256],
     chals: &[F128],
 ) -> F256 {
-    use flock_core::lincheck::build_eq_table;
     let yr_len = yr_vals.len();
     assert!(yr_len.is_power_of_two());
     let yr_log = yr_len.trailing_zeros() as usize;
@@ -824,7 +824,6 @@ pub(super) fn emit_recorded_pow_checks(
     vals: &mut Vec<F128>,
     consts: &mut Vec<(F128, Wire)>,
 ) {
-    use flock_core::transcript_record::TranscriptOp as Op;
     let (mut fin, mut pay) = (0usize, 0usize);
     let mut pows = Vec::new();
     for op in ops {

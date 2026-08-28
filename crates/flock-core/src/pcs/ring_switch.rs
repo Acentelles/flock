@@ -60,6 +60,7 @@
 use crate::bits::transpose_8x8_bits;
 use crate::challenger::Challenger;
 use crate::field::F128;
+use crate::pcs::tensor_algebra::{TensorAlgebra, TensorAlgebra256};
 use crate::zerocheck::PaddingSpec;
 use crate::zerocheck::multilinear::lagrange_weights_naive;
 use crate::zerocheck::univariate_skip::build_eq;
@@ -2976,8 +2977,6 @@ pub fn verify_succinct_with_grinding<Ch: Challenger>(
 ///
 /// [DP24]: <https://eprint.iacr.org/2024/504>
 pub fn eval_rs_eq(z_vals: &[F128], query: &[F128], eq_r_dprime: &[F128]) -> F128 {
-    use crate::pcs::tensor_algebra::TensorAlgebra;
-
     assert_eq!(
         z_vals.len(),
         query.len(),
@@ -3010,7 +3009,6 @@ pub fn eval_rs_eq_prefix(
     z_vals: &[F128],
     query_prefix: &[F128],
 ) -> crate::pcs::tensor_algebra::TensorAlgebra {
-    use crate::pcs::tensor_algebra::TensorAlgebra;
     assert!(query_prefix.len() <= z_vals.len());
     let mut eval = TensorAlgebra::from_vertical(F128::ONE);
     for (&z_i, &q_i) in z_vals.iter().zip(query_prefix.iter()) {
@@ -3089,7 +3087,6 @@ pub fn eval_rs_eq_prefix_f256(
     z_vals: &[F128],
     query_prefix: &[crate::field::F256],
 ) -> crate::pcs::tensor_algebra::TensorAlgebra256 {
-    use crate::pcs::tensor_algebra::TensorAlgebra256;
     assert!(query_prefix.len() <= z_vals.len());
     let mut eval = TensorAlgebra256::one();
     for (&z, &q) in z_vals.iter().zip(query_prefix) {

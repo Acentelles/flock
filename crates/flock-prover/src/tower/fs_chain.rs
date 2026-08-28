@@ -1,4 +1,6 @@
 use super::*;
+use crate::r1cs_hashes::fs_chain::{CvSource, Link, trace_duplex_forked};
+use flock_core::transcript_record::{StreamWord, TranscriptOp as Op};
 
 // ---------------------------------------------------------------------------
 // MVP-4: the vertical slice
@@ -42,7 +44,6 @@ pub(super) fn cw(
 /// nothing else. PoW nonces share the payload counter but remain private
 /// witnesses constrained by the fused BLAKE3 and bit-spread rows.
 pub(super) fn bytes_payload_mask(ops: &[flock_core::transcript_record::TranscriptOp]) -> Vec<bool> {
-    use flock_core::transcript_record::TranscriptOp as Op;
     let mut v = Vec::new();
     for op in ops {
         match op {
@@ -156,8 +157,6 @@ pub(super) fn emit_fs_chain_partitioned(
     pub_payloads: &[bool],
     cross: &[Option<(usize, usize)>],
 ) -> (Vec<Vec<Wire>>, Vec<Option<Wire>>) {
-    use crate::r1cs_hashes::fs_chain::CvSource;
-    use flock_core::transcript_record::StreamWord;
     let mut word_wire: Vec<Option<Wire>> = vec![None; stream.words.len()];
     let mut outs: Vec<Vec<Wire>> = Vec::with_capacity(trace.rows.len());
     let mut gate_in: Vec<[Wire; 7]> = Vec::with_capacity(trace.rows.len());
@@ -291,7 +290,6 @@ pub(super) fn emit_fs_chain_partitioned(
 pub(super) fn flatten_ops(
     ops: &[flock_core::transcript_record::TranscriptOp],
 ) -> Vec<flock_core::transcript_record::TranscriptOp> {
-    use flock_core::transcript_record::TranscriptOp as Op;
     let mut out = Vec::with_capacity(ops.len());
     for op in ops {
         match op {
@@ -337,8 +335,6 @@ pub(super) fn merge_chain(
     values: &[F128],
     payloads: &[Vec<u8>],
 ) -> MergedChain {
-    use crate::r1cs_hashes::fs_chain::{CvSource, Link, trace_duplex_forked};
-    use flock_core::transcript_record::StreamWord;
     let chains = trace_duplex_forked(ops, stream, values, payloads);
     let parent_bytes = stream.to_bytes(values, payloads);
     if chains.children.is_empty() {
@@ -566,7 +562,6 @@ pub(super) fn assert_chain_replays(
     trace: &crate::r1cs_hashes::fs_chain::FsChainTrace,
     chals: &[F128],
 ) {
-    use flock_core::transcript_record::TranscriptOp as Op;
     let (mut fin, mut ch, mut checked) = (0usize, 0usize, 0usize);
     for op in ops {
         let n = match op {
@@ -614,8 +609,6 @@ pub(super) fn duplex_row_count_model(
     ops: &[flock_core::transcript_record::TranscriptOp],
     stream: &flock_core::transcript_record::Stream,
 ) -> usize {
-    use flock_core::transcript_record::TranscriptOp as Op;
-
     let mut pending_pow = None;
     let mut finals: Vec<(&Op, Option<u32>)> = Vec::new();
     for op in ops {

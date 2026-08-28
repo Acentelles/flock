@@ -1,4 +1,6 @@
 use super::*;
+use flock_core::matrix_fold::{JaggedRowWeight, MatrixClaim, Weight};
+use flock_core::transcript_record::TranscriptOp as Op;
 
 // ---------------------------------------------------------------------------
 // MVP-11: the merge node — step 1, the sigma fold
@@ -60,7 +62,6 @@ pub(super) fn fold_region_ops(
     cfg: TowerConfig,
     fold_claims: &[Vec<flock_core::matrix_fold::MatrixClaim>],
 ) -> Vec<flock_core::transcript_record::TranscriptOp> {
-    use flock_core::transcript_record::TranscriptOp as Op;
     let mut want: Vec<Op> = Vec::new();
     let grinding = tower_fold_grinding(cfg);
     for cs in fold_claims {
@@ -231,7 +232,6 @@ pub(super) fn locate_and_pin_folds(
 pub(super) fn challenge_word_locs(
     ops: &[flock_core::transcript_record::TranscriptOp],
 ) -> Vec<(usize, usize)> {
-    use flock_core::transcript_record::TranscriptOp as Op;
     let mut out = Vec::new();
     let mut fin = 0usize;
     for op in ops {
@@ -256,7 +256,6 @@ pub(super) fn replay_fold_endpoints(
     vals_rec: &[F128],
     chals: &[F128],
 ) -> Vec<flock_core::matrix_fold::MatrixClaim> {
-    use flock_core::matrix_fold::{MatrixClaim, Weight};
     let replay_rounds = |target: F128, base: usize, ch0: usize, n: usize| -> (F128, Vec<F128>) {
         let mut run = target;
         let mut rho = Vec::with_capacity(n);
@@ -542,7 +541,6 @@ pub(super) fn read_acc_entry(
     k_col: usize,
     k_row: usize,
 ) -> ([F128; 2], flock_core::matrix_fold::MatrixClaim) {
-    use flock_core::matrix_fold::{MatrixClaim, Weight};
     let key = if keyed {
         *p += 2;
         [public[*p - 2], public[*p - 1]]
@@ -682,7 +680,6 @@ pub(super) fn check_fold_publics(
     Vec<[F128; 2]>,
     usize,
 ) {
-    use flock_core::matrix_fold::MatrixClaim;
     let width = |i: usize, l: &FoldLoc| 2 + l.k_col + l.k_row + if i >= keyed_from { 2 } else { 0 };
     let mut p = tail0;
     let mut rebuilt: Vec<MatrixClaim> = Vec::new();
@@ -767,8 +764,6 @@ pub(super) fn jagged_fold_region_ops(
     cfg: TowerConfig,
     keys: &[([u8; 32], Vec<flock_core::matrix_fold::JaggedClaim>)],
 ) -> Vec<flock_core::transcript_record::TranscriptOp> {
-    use flock_core::matrix_fold::JaggedRowWeight;
-    use flock_core::transcript_record::TranscriptOp as Op;
     let mut want: Vec<Op> = Vec::new();
     let grinding = tower_fold_grinding(cfg);
     for (_, cs) in keys {
@@ -845,7 +840,6 @@ pub(super) fn labeled_bytes_payloads(
     ops: &[flock_core::transcript_record::TranscriptOp],
     label: &[u8],
 ) -> Vec<usize> {
-    use flock_core::transcript_record::TranscriptOp as Op;
     let mut out = Vec::new();
     let mut payload = 0usize;
     for (i, op) in ops.iter().enumerate() {
@@ -882,7 +876,6 @@ pub(super) fn locate_and_pin_jagged_folds(
     mut vcur: usize,
     mut ccur: usize,
 ) -> Vec<JaggedFoldLoc> {
-    use flock_core::matrix_fold::JaggedRowWeight;
     assert_eq!(keys.len(), fps.len(), "one fold per jagged key");
     assert_eq!(
         keys.len(),
@@ -1030,7 +1023,6 @@ pub(super) fn replay_jagged_fold_endpoints(
     vals_rec: &[F128],
     chals: &[F128],
 ) -> Vec<flock_core::matrix_fold::MatrixClaim> {
-    use flock_core::matrix_fold::{MatrixClaim, Weight};
     let replay_rounds = |target: F128, base: usize, ch0: usize, n: usize| -> (F128, Vec<F128>) {
         let mut run = target;
         let mut rho = Vec::with_capacity(n);

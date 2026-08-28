@@ -1,4 +1,6 @@
 use super::*;
+use flock_core::lincheck::build_eq_table;
+use flock_core::transcript_record::StreamWord;
 
 /// The three slots a collapsed opening writes into, plus the fused PoW mask
 /// slot the grinding checks ride: one 4-word [`PowMaskTable`] row carries a
@@ -237,7 +239,6 @@ pub(super) fn level_geometry(
     hash: HashKind,
     scheds: &[flock_core::pcs::stratified::LevelSchedule],
 ) -> (Vec<Lvl>, Vec<F256>) {
-    use flock_core::lincheck::build_eq_table;
     assert_eq!(scheds.len(), levels.len(), "one schedule per open level");
     let mut geo: Vec<Lvl> = Vec::new();
     let mut native_sums: Vec<F256> = Vec::new();
@@ -389,7 +390,6 @@ pub(super) fn observed_f256(values: &[F128], start: usize, len: usize) -> Vec<F2
 
 /// Stream-word indices per `observe_bytes` payload, in payload-word order.
 pub(super) fn payload_words(stream: &flock_core::transcript_record::Stream) -> Vec<Vec<usize>> {
-    use flock_core::transcript_record::StreamWord;
     let mut pay_words: Vec<Vec<usize>> = Vec::new();
     for (wi, w) in stream.words.iter().enumerate() {
         if let StreamWord::Bytes { payload, word } = *w {

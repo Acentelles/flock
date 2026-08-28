@@ -43,14 +43,14 @@ pub(super) struct RealTape<'p> {
     pub(super) spread_w: usize,
     // located regions
     pub(super) gkr: GkrRec,
-    pub(super) piop_i: PiopRec,
-    pub(super) start_v_i: usize,
-    pub(super) gammas_i: Vec<PdRec>,
+    piop_i: PiopRec,
+    start_v_i: usize,
+    gammas_i: Vec<PdRec>,
     pub(super) w_rounds: Vec<RoundRec>,
     pub(super) w_resid: Vec<RoundRec>,
-    pub(super) mp_i: MpRec,
-    pub(super) inner_pd_i: InnerPd,
-    pub(super) yr_v_i: usize,
+    mp_i: MpRec,
+    inner_pd_i: InnerPd,
+    yr_v_i: usize,
     pub(super) yr_len: usize,
     pub(super) levels: Vec<OpenLevel>,
     pub(super) lvl_src: Vec<(&'p [[u8; 32]], &'p Vec<Vec<F128>>, &'p Vec<[u8; 32]>)>,
@@ -58,14 +58,14 @@ pub(super) struct RealTape<'p> {
     pub(super) native_sums: Vec<F256>,
     /// The grinding ops: (fin ordinal, payload ordinal, bits).
     pub(super) pows: Vec<(usize, usize, u32)>,
-    pub(super) n_gather: usize,
+    n_gather: usize,
     /// The child cell space's public-slot count — the recombination's tail.
     pub(super) n_pub_slots_c: usize,
     // the boolean PIOP's round ordinals ((ch, fin) pairs) + surfaces
     pub(super) zc_rounds_b: Vec<(usize, usize)>,
     pub(super) outer_b: (usize, usize),
     #[allow(dead_code)] // The r_outer slice length — wall-4 shape data.
-    pub(super) outer_len: usize,
+    outer_len: usize,
     pub(super) bl_alpha: (usize, usize),
     /// The const-pin beta squeezes: (ch, fin) per pinned boolean type.
     pub(super) betas_b: Vec<(usize, usize)>,
@@ -1453,8 +1453,8 @@ pub(super) struct RealRegion {
     pub(super) pub_base: usize,
     pub(super) n_query_pub: usize,
     pub(super) n_tail: usize,
-    pub(super) n_mat_pub: usize,
-    pub(super) n_ela_pub: usize,
+    n_mat_pub: usize,
+    n_ela_pub: usize,
     /// Labeled `public_len` checkpoints through the emission — the publics
     /// census (`PUB_CENSUS=1` on the node test prints the block sizes).
     pub(super) census: Vec<(&'static str, usize, usize)>,
