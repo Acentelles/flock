@@ -2410,3 +2410,15 @@ First bench session read 2.26/2.32/2.28 s across the board — rerun
 gave 1.85/1.07/0.970 s: the slow session was machine state (788K
 pageouts; back-to-back 8.5 GB bench sessions), not the PR. PARITY,
 best 970 ms.
+
+### Merge step 6: PR #37 bloat-phase1 (86d5fd5+61cff5f) — 2026-08-28
+
+Two trivial merkle.rs hunks (kept main's MERKLE_PCORES_ONLY knob).
+Main's own purge: -13,121 lines over 66 files, INCLUDING the legacy
+direct-path prover (prove_fast_timed / prove_fast_ligerito_timed) —
+the bench's timed breakdown block is gone with it; per-phase
+attribution is now PCS_TRACE=1 only, matching main's bench. This also
+retires the "direct path zc 1.56 s" open item (the path no longer
+exists) and re-scopes re-graft targets to the UNION driver only.
+Suites green (core 545 — count reflects deleted legacy tests, prover
+124). Bench: 1.92 / 1.72 / 0.919 s, best 919 ms — parity.

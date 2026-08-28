@@ -216,13 +216,6 @@ impl PcsParams {
     pub fn codeword_len_f128(&self) -> usize {
         self.n_positions() * self.num_ntts()
     }
-    /// `log_2` of the F_{2^128} count per **initial** Merkle leaf
-    /// (= `log_batch_size`; just the row-batch lanes per position). Meaningful
-    /// only on the power-of-two path; the integer-lane leaf width is
-    /// `num_ntts()` (see [`Self::leaf_size_bytes`]).
-    pub fn log_leaf_f128_count(&self) -> usize {
-        self.log_batch_size
-    }
     /// Number of initial-tree Merkle leaves = per-lane codeword length
     /// `2^k_code` (= `n_positions()`). UNCHANGED by the integer-lane commit —
     /// only the leaf WIDTH shrinks, not the leaf count.
@@ -265,24 +258,11 @@ impl PcsParams {
         Ok(cfg)
     }
 
-    /// The L0 query count these params imply — the exact rule every opener
-    /// uses to pick its config: the embedded security config when one exists
-    /// for `(log_msg_len, log_batch_size, profile)` (the flock-prover
-    /// paths), else `udr_queries(log_inv_rate)` (the `default_config` paths:
-    /// the standalone element proof and the permutation check, whose
-    /// `queries[0]` IS `udr_queries`). Commit-time cap sizing MUST agree
-    /// with the opener's config — this is that single source of truth.
-    pub fn l0_queries(&self) -> usize {
-        match self.ligerito_prover_config() {
-            Ok(cfg) => cfg.queries[0],
-            Err(_) => crate::pcs::ligerito::udr_queries(self.log_inv_rate),
-        }
-    }
-
     /// Cap depth of the L0 commitment tree — the opener config's own rule
     /// ([`ligerito::ProverConfig::l0_cap_depth`]): the stratified schedule's
     /// cap when the config opts in, else the legacy `min(⌈log2 q₀⌉,
-    /// k_code)`. The `udr_queries` fallback mirrors [`Self::l0_queries`].
+    /// k_code)`. The `udr_queries` fallback mirrors the opener's config
+    /// fallback, so commit-time cap sizing always agrees with the opener.
     pub fn l0_cap_depth(&self) -> usize {
         match self.ligerito_prover_config() {
             Ok(cfg) => cfg.l0_cap_depth(),
@@ -1382,115 +1362,6 @@ mod tests {
                 assert_eq!(pd_ref.merkle_tree, pd_grid.merkle_tree, "tree diverged");
             }
         }
-    }
-
-    /// Savings measurement (Oracle 6): at m30-representative sizes
-    /// (log_dim=17, rate 1/2, k_code=18 → 256 MB padded codeword), measure the
-    /// interleaved NTT + Merkle for the integer-lane t=46 vs the padded 64.
-    /// Reports the ratios; asserts the non-pow2 parallel NTT is NOT slower per
-    /// lane (efficiency ≈ t/64, i.e. total time ≲ 0.9× the pow2 time — a
-    /// generous ceiling that still fails if the remainder path regresses).
-    /// Run: `cargo test -p flock-core --release measure_integer_lane_savings
-    /// -- --ignored --nocapture`.
-    #[test]
-    #[ignore]
-    fn measure_integer_lane_savings() {
-        use crate::ntt::AdditiveNttF128;
-        use std::time::Instant;
-
-        let log_dim = 17usize;
-        let log_inv_rate = 1usize;
-        let k_code = log_dim + log_inv_rate; // 18
-        let n_positions = 1usize << k_code;
-        let ntt = AdditiveNttF128::standard(k_code);
-
-        let mut rng = Rng::new(0x5A71_2026);
-
-        let bench = |num_ntts: usize, rng: &mut Rng| -> (f64, f64) {
-            let codeword_len = n_positions * num_ntts;
-            // Random message replicated (as commit does), then timed NTT.
-            let msg = rng.f128_vec((1usize << log_dim) * num_ntts);
-            let n_runs = 5usize;
-            let mut best_ntt = f64::INFINITY;
-            let mut buf = vec![F128::ZERO; codeword_len];
-            for _ in 0..n_runs {
-                replicate_message_fill(&mut buf, &msg);
-                let t = Instant::now();
-                ntt.forward_transform_interleaved_from_layer(&mut buf, num_ntts, log_inv_rate);
-                best_ntt = best_ntt.min(t.elapsed().as_secs_f64() * 1e3);
-            }
-            // Merkle over the (encoded) codeword: n_positions leaves, each
-            // num_ntts F128 wide. Timed under the default hash (SHA-256) — this
-            // probe compares lane counts, not hashes, and has no `PcsParams` in
-            // scope; use `HashKind::Blake3` here to re-measure the other one.
-            let bytes: &[u8] =
-                unsafe { core::slice::from_raw_parts(buf.as_ptr() as *const u8, buf.len() * 16) };
-            let mut best_merkle = f64::INFINITY;
-            for _ in 0..n_runs {
-                let t = Instant::now();
-                let tree = merkle::merkle_tree(bytes, n_positions, HashKind::default());
-                best_merkle = best_merkle.min(t.elapsed().as_secs_f64() * 1e3);
-                std::hint::black_box(tree.last());
-            }
-            (best_ntt, best_merkle)
-        };
-
-        // Pure per-lane arithmetic ratio (scalar, no cache-blocking / rayon).
-        let bench_scalar = |num_ntts: usize, rng: &mut Rng| -> f64 {
-            let codeword_len = n_positions * num_ntts;
-            let msg = rng.f128_vec((1usize << log_dim) * num_ntts);
-            let mut buf = vec![F128::ZERO; codeword_len];
-            let mut best = f64::INFINITY;
-            for _ in 0..3 {
-                replicate_message_fill(&mut buf, &msg);
-                let t = Instant::now();
-                ntt.forward_transform_interleaved_scalar_from_layer(
-                    &mut buf,
-                    num_ntts,
-                    log_inv_rate,
-                );
-                best = best.min(t.elapsed().as_secs_f64() * 1e3);
-            }
-            best
-        };
-        let sc64 = bench_scalar(64, &mut rng);
-        let sc46 = bench_scalar(46, &mut rng);
-        eprintln!(
-            "[savings]   NTT scalar (per-lane work): t=64 {sc64:7.2} ms  t=46 {sc46:7.2} ms  ratio {:.3}",
-            sc46 / sc64
-        );
-
-        let (ntt64, mrk64) = bench(64, &mut rng);
-        let (ntt46, mrk46) = bench(46, &mut rng);
-
-        let ntt_ratio = ntt46 / ntt64;
-        let mrk_ratio = mrk46 / mrk64;
-        let commit_ratio = (ntt46 + mrk46) / (ntt64 + mrk64);
-        eprintln!("[savings] m30-scale (log_dim={log_dim}, k_code={k_code}, 256 MB padded)");
-        eprintln!(
-            "[savings]   NTT:    t=64 {ntt64:7.2} ms   t=46 {ntt46:7.2} ms   ratio {ntt_ratio:.3}  (ideal 0.719)"
-        );
-        eprintln!(
-            "[savings]   Merkle: t=64 {mrk64:7.2} ms   t=46 {mrk46:7.2} ms   ratio {mrk_ratio:.3}  (ideal 0.719)"
-        );
-        eprintln!(
-            "[savings]   NTT+Merkle commit: ratio {commit_ratio:.3}  (=> {:.1}% reduction)",
-            (1.0 - commit_ratio) * 100.0
-        );
-        // The non-pow2 parallel NTT must be at least as efficient per lane as
-        // the pow2 path (no remainder-path regression). Ideal 46/64 = 0.719;
-        // measured warm ~0.80–0.86 (some fixed rayon/bandwidth overhead on the
-        // top-layer sweeps). Fail hard only if the saving is essentially erased
-        // (ratio → 1.0) — a generous ceiling that tolerates a loaded machine.
-        assert!(
-            ntt_ratio < 0.95,
-            "non-pow2 t=46 NTT is inefficient (ratio {ntt_ratio:.3} ≥ 0.95) — the \
-             remainder path erases the saving"
-        );
-        assert!(
-            commit_ratio < 0.95,
-            "integer-lane commit did not reduce NTT+Merkle time (ratio {commit_ratio:.3})"
-        );
     }
 
     #[test]

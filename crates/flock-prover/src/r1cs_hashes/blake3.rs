@@ -38,7 +38,8 @@
 //!   cascade LINEAR — full drop is 48.3M nnz vs Option D's 21.0M (2.3×),
 //!   max row ~5.6k terms, while the row narrows 121 → 93 committed
 //!   word-cols (−23%). The CSC fold prices nnz at ~1 ms per 21M/prove, so
-//!   the area win dominates. See `tests/b3_width_audit.rs`.)
+//!   the area win dominates. Measured by the since-deleted
+//!   `tests/b3_width_audit.rs` probe, bloat ledger §E.)
 //!
 //! Trade-off: the matrix template is dense (48.3M nnz), so template build
 //! and any O(nnz) pass cost more — but those are per-shape/cacheable
@@ -252,13 +253,10 @@ pub const USEFUL_BITS: usize = Z_CONST_POS + 1; // 11,707
 /// Cell-slot indices into [`io_schema`] — the schema's order IS the
 /// enumeration order, so these are the `ι` a circuit wires against.
 pub const IO_CV0: usize = 0;
-pub const IO_CV1: usize = 1;
 pub const IO_M0: usize = 2;
 pub const IO_PARAMS: usize = 6;
 pub const IO_OUT_LO0: usize = 7;
-pub const IO_OUT_LO1: usize = 8;
 pub const IO_OUT_HI0: usize = 9;
-pub const IO_OUT_HI1: usize = 10;
 
 /// The wireable words of one compression, in 128-bit words of the row.
 ///
@@ -1566,6 +1564,9 @@ pub struct Blake3Setup {
 
 impl Blake3Setup {
     /// Fast-path witness generation dispatched on the r1cs's witness layout.
+    /// Its only caller is [`Self::prove_fast_ag`], so it carries the same
+    /// aarch64 gate (the x86_64 lint leg runs with `-D warnings`).
+    #[cfg(target_arch = "aarch64")]
     fn generate_witness_ab(
         &self,
         blocks: &[Compression],
@@ -1659,17 +1660,6 @@ impl Blake3Setup {
     }
     pub fn n_block_slots(&self) -> usize {
         1usize << self.n_blocks_log()
-    }
-
-    pub fn generate_witness(&self, blocks: &[Compression]) -> Vec<bool> {
-        assert_eq!(
-            blocks.len(),
-            self.n_blocks,
-            "expected {} blocks, got {}",
-            self.n_blocks,
-            blocks.len()
-        );
-        generate_witness(blocks, self.n_blocks_log())
     }
 
     /// Prove `n_blocks` compressions over the single-slot UNION commit
@@ -1815,79 +1805,6 @@ impl Blake3Setup {
             codeword,
             challenger,
         )
-    }
-
-    /// [`Self::prove_fast`] with a per-phase timing breakdown of the real
-    /// Ligerito prover (witness gen + commit + zerocheck + lincheck + recursive
-    /// open). Benchmark-only.
-    pub fn prove_fast_timed<Ch: Challenger>(
-        &self,
-        blocks: &[Compression],
-        challenger: &mut Ch,
-    ) -> (
-        flock_core::proof::R1csProofLigerito,
-        Commitment,
-        R1csClaim,
-        crate::prover::ProvePhaseTimings,
-    ) {
-        assert_eq!(blocks.len(), self.n_blocks);
-        let t0 = std::time::Instant::now();
-        let (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck) =
-            self.generate_witness_ab(blocks);
-        let witness_s = t0.elapsed().as_secs_f64();
-        let lc_circuit = self.r1cs.csc_lincheck_circuit();
-        let pcs_params = self.direct_pcs_params();
-        let (proof, commitment, claim, mut timings) = crate::prover::prove_fast_ligerito_timed(
-            &self.r1cs,
-            &pcs_params,
-            z_packed,
-            a_packed_f128,
-            b_packed_f128,
-            z_packed_lincheck,
-            lc_circuit,
-            None,
-            challenger,
-        );
-        timings.witness_s = witness_s;
-        (proof, commitment, claim, timings)
-    }
-
-    /// AG-skip mirror of [`Self::prove_fast_timed`]: per-phase prove
-    /// breakdown (witness / commit / AG zerocheck / lincheck / open).
-    /// Benchmark-only; aarch64.
-    #[cfg(target_arch = "aarch64")]
-    pub fn prove_fast_ag_timed<Ch: Challenger>(
-        &self,
-        blocks: &[Compression],
-        challenger: &mut Ch,
-    ) -> (
-        flock_core::proof::R1csProofLigeritoAg,
-        Commitment,
-        R1csClaim,
-        crate::prover::ProvePhaseTimings,
-    ) {
-        assert_eq!(blocks.len(), self.n_blocks);
-        let t0 = std::time::Instant::now();
-        let (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck) =
-            self.generate_witness_ab(blocks);
-        let witness_s = t0.elapsed().as_secs_f64();
-        let lc_circuit = self.r1cs.csc_lincheck_circuit();
-        // The DIRECT commit shape, like `prove_fast_ag`/`verify_ag` — the
-        // union-shaped `self.pcs_params` fails the commit length assert.
-        let pcs_params = self.direct_pcs_params();
-        let (proof, commitment, claim, mut timings) = crate::prover::prove_fast_ligerito_ag_timed(
-            &self.r1cs,
-            &pcs_params,
-            z_packed,
-            a_packed_f128,
-            b_packed_f128,
-            z_packed_lincheck,
-            lc_circuit,
-            None,
-            challenger,
-        );
-        timings.witness_s = witness_s;
-        (proof, commitment, claim, timings)
     }
 
     /// AG-skip mirror of [`Self::verify`].

@@ -21,7 +21,12 @@
 //! coords, so its contents are invisible to the sumcheck but participate in
 //! the multilinear extension over the slot-selector dimensions.
 
-use crate::merkle_path::{MerklePathShiftProof, SlotLayout};
+/// The Merkle-path shift protocol's public types. The `merkle_path` module
+/// itself is crate-private; these are the parts of it that this module's
+/// public signatures expose, so downstream code can name them.
+pub use crate::merkle_path::{
+    MerklePathClaims, MerklePathError, MerklePathShiftProof, RoundMsg, SlotLayout,
+};
 use flock_core::challenger::Challenger;
 use flock_core::field::F128;
 use flock_core::lincheck::build_eq_table;
@@ -232,7 +237,7 @@ pub fn assemble_merkle_path_claim(
     layout: &MerkleLayout,
     wl: flock_core::r1cs::WitnessLayout,
     fold: &MerklePathFold,
-    claims: &crate::merkle_path::MerklePathClaims,
+    claims: &MerklePathClaims,
 ) -> PackedDirectClaim {
     let point = build_merkle_claim_point(layout, wl, fold, claims);
     let sparse_eq = flock_core::pcs::ring_switch::build_eq_sparse(&point);
@@ -253,7 +258,7 @@ fn build_merkle_claim_point(
     layout: &MerkleLayout,
     wl: flock_core::r1cs::WitnessLayout,
     fold: &MerklePathFold,
-    claims: &crate::merkle_path::MerklePathClaims,
+    claims: &MerklePathClaims,
 ) -> Vec<F128> {
     let high = layout.high_zeros();
     let point_len = fold.tau_pos.len() + 2 + high + claims.instance_point.len();
@@ -295,7 +300,7 @@ pub enum MerklePathVerifyError {
     /// Base R1CS replay failed.
     R1cs(flock_core::verifier::VerifyError),
     /// Merkle-path shift sumcheck check failed.
-    Shift(crate::merkle_path::MerklePathError),
+    Shift(MerklePathError),
     /// The batched PCS opening failed.
     Pcs(flock_core::pcs::VerifyError),
 }
@@ -512,12 +517,12 @@ pub fn verify_merkle_paths_ligerito_generic<Ch: Challenger>(
                 layout.tau_pos_len(),
             )
             .ok_or(MerklePathVerifyError::Shift(
-                crate::merkle_path::MerklePathError::InvalidGrinding,
+                MerklePathError::InvalidGrinding,
             ))?
     } else {
         if proof.tau_pos_grinding_nonce != 0 {
             return Err(MerklePathVerifyError::Shift(
-                crate::merkle_path::MerklePathError::InvalidGrinding,
+                MerklePathError::InvalidGrinding,
             ));
         }
         challenger.sample_f128_vec(layout.tau_pos_len())

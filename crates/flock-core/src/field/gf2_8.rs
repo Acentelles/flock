@@ -23,16 +23,6 @@ impl F8 {
     pub const ZERO: Self = Self(0);
     pub const ONE: Self = Self(1);
 
-    #[inline]
-    pub const fn new(v: u8) -> Self {
-        Self(v)
-    }
-
-    #[inline]
-    pub const fn is_zero(self) -> bool {
-        self.0 == 0
-    }
-
     /// Multiplicative inverse via Fermat: x^254 = x^{-1} in F_{2^8}.
     /// Exponent bit pattern 0xFE = 0b11111110 — 7 squarings + 6 multiplies.
     pub fn inv(self) -> Self {

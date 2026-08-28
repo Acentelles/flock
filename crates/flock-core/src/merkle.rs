@@ -637,7 +637,6 @@ pub fn merkle_root(data: &[u8], num_leaves: usize, kind: HashKind) -> Hash {
     tree[tree.len() - 1]
 }
 
-
 /// Data-size threshold for the all-core hop. Below this the tree builds in
 /// well under a millisecond and the pool switch + E-core straggle risk at the
 /// per-level barriers isn't worth it; above it the leaf level dominates
@@ -646,8 +645,12 @@ pub fn merkle_root(data: &[u8], num_leaves: usize, kind: HashKind) -> Hash {
 /// crypto extensions too.
 const MERKLE_ALLCORE_MIN_BYTES: usize = 8 << 20;
 
+// `MERKLE_PCORES_ONLY=1` in the environment keeps [`merkle_tree`] on the
+// caller's (P-core) pool even for large trees (production kill-switch). Pool
+// choice cannot change output bits — every node is written deterministically.
 fn merkle_use_all_cores(data_len: usize) -> bool {
     data_len >= MERKLE_ALLCORE_MIN_BYTES
+        && std::env::var("MERKLE_PCORES_ONLY").is_err()
         && crate::all_core_pool().current_num_threads() > rayon::current_num_threads()
 }
 

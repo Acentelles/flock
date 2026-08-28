@@ -202,43 +202,9 @@ fn bench_one(n_blocks: usize, n_runs: usize) {
         black_box(&bundle);
     }
 
-    // Per-phase breakdown NOTE: `prove_fast` now runs the UNION prover, whose
-    // own breakdown prints under `PCS_TRACE=1`; `prove_fast_timed` decomposes
-    // the legacy direct-path prover — a DIFFERENT prover from the headline.
-    // The timed breakdown below is kept for the phase TSV consumers but is
-    // labeled as the direct path. Uses the warm-up block set.
-    let blocks = &block_sets[0];
-    println!("  [prove_fast_timed breakdown — direct path, NOT the union headline]");
-    let mut ch = fs();
-    let (proof, _commitment, _claim, tm) = setup.prove_fast_timed(blocks, &mut ch);
-    println!(
-        "    {:32} {}",
-        "gen_witness_ab + lincheck",
-        fmt_ms(tm.witness_s)
-    );
-    println!("    {:32} {}", "pcs::commit", fmt_ms(tm.commit_s));
-    println!(
-        "    {:32} {}",
-        "zerocheck::prove_packed",
-        fmt_ms(tm.zerocheck_s)
-    );
-    println!("    {:32} {}", "lincheck::prove", fmt_ms(tm.lincheck_s));
-    println!("    {:32} {}", "pcs::open (ligerito)", fmt_ms(tm.open_s));
-    // Full-precision machine-readable mirror of the rows above, for
-    // benchmarks/breakdown_phases.sh: `fmt_ms` rounds seconds to 2 decimals,
-    // which is +/-5 ms on a ~1 s phase and too coarse to attribute small wins.
-    if std::env::var_os("FLOCK_PHASE_TSV").is_some() {
-        for (name, secs) in [
-            ("witness", tm.witness_s),
-            ("commit", tm.commit_s),
-            ("zerocheck", tm.zerocheck_s),
-            ("lincheck", tm.lincheck_s),
-            ("open", tm.open_s),
-        ] {
-            println!("PHASE\t{n_blocks}\t{name}\t{secs:.9}");
-        }
-    }
-    black_box(&proof);
+    // Per-phase breakdown: the union prover prints one under `PCS_TRACE=1`
+    // (witgen / compact / commit / zerocheck+lincheck / open).
+    println!("  (per-phase breakdown: rerun with PCS_TRACE=1)");
 }
 
 fn main() {

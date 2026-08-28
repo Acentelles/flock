@@ -813,8 +813,9 @@ pub fn verify_union_deferred_with_grinding<Ch: Challenger>(
     //    split of this function into "comb phase" and "everything after".
     //    Deferral removed the comb phase from here entirely, so the
     //    instrumentation had nothing left to time and is not carried over.
-    //    The measurement it existed for still lives in [`verify_union_timed`],
-    //    which builds combs inline on purpose.
+    //    The measurement it existed for lived in `verify_union_timed` (which
+    //    built combs inline on purpose) until that probe was deleted in the
+    //    bloat sweep (ledger §E).
 
     // 2b. Constant-wire pins (mirror of prove): β_t sampled after α in slot
     //     order, the comb gains +β_t at the pin, and the target gains the
@@ -942,27 +943,6 @@ pub fn verify_union_deferred_with_grinding<Ch: Challenger>(
         },
         assertion,
     ))
-}
-
-/// [`verify_union`] with the two halves timed separately — benchmark-only.
-/// Returns the claim plus the wall-clock seconds spent discharging the
-/// [`MatrixAssertion`], i.e. the `O(Σ_t nnz_t)` matrix work. The remainder
-/// of the caller's lincheck time is the succinct verifier — the part a
-/// recursion circuit has to replay.
-pub fn verify_union_timed<Ch: Challenger>(
-    union: &UnionInstance<'_>,
-    circuits: &[&dyn LincheckCircuit],
-    x_ab: &QuirkyPoint,
-    v_a: F128,
-    v_b: F128,
-    proof: &LincheckProof,
-    challenger: &mut Ch,
-) -> Result<(LincheckClaim, f64), VerifyError> {
-    let (claim, assertion) =
-        verify_union_deferred(union, circuits, x_ab, v_a, v_b, proof, challenger)?;
-    let t = std::time::Instant::now();
-    assertion.check(union, circuits)?;
-    Ok((claim, t.elapsed().as_secs_f64()))
 }
 
 #[cfg(test)]

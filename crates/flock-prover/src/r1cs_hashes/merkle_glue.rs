@@ -226,12 +226,6 @@ pub(crate) fn scatter_zab_into(
 /// ```
 pub struct SwapTable;
 
-/// Cell-slot indices into [`SwapTable::io_schema`].
-pub const SWAP_IO_BIT: usize = 0;
-pub const SWAP_IO_PREV0: usize = 1;
-pub const SWAP_IO_LEFT0: usize = 3;
-pub const SWAP_IO_RIGHT0: usize = 5;
-
 impl SwapTable {
     pub const K_LOG: usize = 11;
     pub const BIT: usize = 0;
