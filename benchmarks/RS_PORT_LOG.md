@@ -2391,3 +2391,13 @@ union verifier work, 128-bit grinding audit doc). Suites green (core
 572, prover 118). m=32 grind-free blake3 cold-start: 1.66 / 1.12 /
 1.79 s, best 1.12 — parity (run-3 spike looks environmental); proof
 size unchanged.
+
+### Merge step 4: PR #10 lagrange-const-denom (via abe3df1 fmt tip) — 2026-08-28
+
+3ff5d29 was already in ancestry (absorbed by the cross-merged
+branches); this merge added only the fmt commit's merkle_path.rs delta
+(+52/-19). Suites green (core 572, prover 120). Bench cold-start:
+2.27 / 2.15 / 0.948 s — best 948 ms, parity; first-two-run spikes look
+like memory-pressure churn from back-to-back 8.5 GB bench sessions
+(the certified comparison comes after the re-grafts, with proper
+alternation).
