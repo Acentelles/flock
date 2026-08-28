@@ -1,12 +1,13 @@
 //! Bit-packing and R1CS-row helpers shared by the monolithic hash R1CS
 //! modules (`sha2`, `blake3`, `keccak`). The shared `prove_fast`
-//! orchestration lives in [`crate::prover::prove_fast_from_witness`].
+//! orchestration lives in [`crate::prover::prove_fast_ligerito_union`].
 
 use std::sync::OnceLock;
 
 use flock_core::bits::transpose_8_u64s_to_64_bytes;
 use flock_core::field::F128;
 use flock_core::r1cs::{BlockR1cs, SparseBinaryMatrix, WitnessLayout};
+use flock_core::union::SlotWitnessDest;
 
 /// OR the low 32 bits of `val` into `buf` starting at bit-offset `bit_off`.
 /// Handles u64 straddling when `bit_off % 64 > 32`.
@@ -65,6 +66,20 @@ impl<const NW: usize> BitRecord<NW> {
         }
     }
 
+    /// OR a (pre-masked) value into record bits `[pos, pos + width)` at a
+    /// runtime position — for the few record shapes whose field offsets vary
+    /// per instance (BLAKE3's first-round column G's).
+    #[inline(always)]
+    pub(crate) fn push_at(&mut self, pos: usize, val: u32) {
+        let v = val as u64;
+        let idx = pos >> 6;
+        let s = pos & 63;
+        self.w[idx] |= v << s;
+        if s > 32 {
+            self.w[idx + 1] |= v >> (64 - s);
+        }
+    }
+
     /// OR the record into `buf` starting at bit `base_bit`.
     #[inline(always)]
     pub(crate) fn flush(&self, buf: &mut [u64], base_bit: usize) {
@@ -92,6 +107,113 @@ pub(crate) fn add_carry_parts(x: u32, y: u32) -> (u32, u32, u32, u32) {
     let right = (y ^ cin) & MASK_LO31;
     let carry_aux = left & right;
     (sum, left, right, carry_aux)
+}
+
+/// One fused 3-operand ADD's witness parts (`x + y + m` mod 2³², carry-save,
+/// 61 product rows — one fewer than two chained 2-operand ADDs; the zk.golf
+/// BLAKE3 record's `Add3Canon` construction).
+///
+/// * Layer 1, bits 0..30: majority products `w_i = (x_i⊕m_i)(y_i⊕m_i)`; the
+///   true majority is `w_i ⊕ m_i` (affine in char 2), and `maj_31` carries
+///   weight 2³² so it is dropped.
+/// * Layer 2, bits 1..30: ripple products `v_j = (p_j⊕g_j)(bw_j⊕g_j)` of the
+///   partial sum `p = x⊕y⊕m` against the shifted majority word
+///   `bw = (w⊕m) << 1`, with carries `g_{j+1} = v_j ⊕ g_j`. `bw_0 = 0` makes
+///   bit 0's product structurally zero — no row.
+///
+/// Returns `(sum, [maj_left, maj_right, maj_prod], [rip_left, rip_right,
+/// rip_prod])`: the majority triple masked to the low 31 bits, the ripple
+/// triple holding row bits 1..30 shifted down to the low 30 bits.
+#[inline(always)]
+pub(crate) fn fused_add3_parts(x: u32, y: u32, m: u32) -> (u32, [u32; 3], [u32; 3]) {
+    const MASK_LO31: u32 = 0x7FFF_FFFF;
+    const MASK_LO30: u32 = 0x3FFF_FFFF;
+    let xm = x ^ m;
+    let ym = y ^ m;
+    let w = xm & ym;
+    let p = x ^ y ^ m;
+    let bw = (w ^ m) << 1;
+    let sum = p.wrapping_add(bw);
+    let cin = sum ^ p ^ bw;
+    let rip_left = p ^ cin;
+    let rip_right = bw ^ cin;
+    (
+        sum,
+        [xm & MASK_LO31, ym & MASK_LO31, w & MASK_LO31],
+        [
+            (rip_left >> 1) & MASK_LO30,
+            (rip_right >> 1) & MASK_LO30,
+            ((rip_left & rip_right) >> 1) & MASK_LO30,
+        ],
+    )
+}
+
+/// One fused 4-operand ADD's witness parts (`x + y + z + w` mod 2³²,
+/// two carry-save layers + ripple, 92 product rows — one fewer than three
+/// chained 2-operand ADDs; the zk.golf SHA-256 record's tree shape).
+///
+/// * Layer 1, bits 0..30: `w1_i = (x_i⊕z_i)(y_i⊕z_i)`, majority `w1 ⊕ z`.
+/// * Layer 2, bits 0..30: the partial sum `p1 = x⊕y⊕z` and shifted majority
+///   `b1 = (w1⊕z) << 1` reduce against `w`: `w2_i = (p1_i⊕w_i)(b1_i⊕w_i)`,
+///   majority `w2 ⊕ w`.
+/// * Ripple, bits 1..30: `p2 = p1⊕b1⊕w` against `b2 = (w2⊕w) << 1` (zero
+///   low bit — bit 0's product row vanishes).
+///
+/// Returns `(sum, maj1, maj2, rip)` triples as `[left, right, prod]`,
+/// majorities masked to the low 31 bits, ripple shifted to the low 30.
+#[inline(always)]
+#[allow(clippy::type_complexity)]
+pub(crate) fn fused_add4_parts(
+    x: u32,
+    y: u32,
+    z: u32,
+    w: u32,
+) -> (u32, [u32; 3], [u32; 3], [u32; 3]) {
+    const MASK_LO31: u32 = 0x7FFF_FFFF;
+    const MASK_LO30: u32 = 0x3FFF_FFFF;
+    let xz = x ^ z;
+    let yz = y ^ z;
+    let w1 = xz & yz;
+    let p1 = x ^ y ^ z;
+    let b1 = (w1 ^ z) << 1;
+    let pw = p1 ^ w;
+    let bw = b1 ^ w;
+    let w2 = pw & bw;
+    let p2 = p1 ^ b1 ^ w;
+    let b2 = (w2 ^ w) << 1;
+    let sum = p2.wrapping_add(b2);
+    let cin = sum ^ p2 ^ b2;
+    let rip_left = p2 ^ cin;
+    let rip_right = b2 ^ cin;
+    (
+        sum,
+        [xz & MASK_LO31, yz & MASK_LO31, w1 & MASK_LO31],
+        [pw & MASK_LO31, bw & MASK_LO31, w2 & MASK_LO31],
+        [
+            (rip_left >> 1) & MASK_LO30,
+            (rip_right >> 1) & MASK_LO30,
+            ((rip_left & rip_right) >> 1) & MASK_LO30,
+        ],
+    )
+}
+
+/// Constant-operand ADD parts for `k + y`: the aux products for bits
+/// `t..30` only (t = trailing_zeros(k) + 1 — the carries below the
+/// constant's lowest set bit are zero, and the carry into bit `t` is the
+/// affine seed `y_{t-1}`), shifted down to the low `31 − t` bits.
+/// Returns `(sum, left, right, prod)`.
+#[inline(always)]
+pub(crate) fn const_add_parts(k: u32, y: u32) -> (u32, u32, u32, u32) {
+    debug_assert!(k != 0);
+    let t = k.trailing_zeros() + 1;
+    let (sum, left, right, carry) = add_carry_parts(k, y);
+    let mask = (1u32 << (31 - t)) - 1;
+    (
+        sum,
+        (left >> t) & mask,
+        (right >> t) & mask,
+        (carry >> t) & mask,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -636,6 +758,29 @@ pub(crate) fn add_carry_parts_v(
     (sum, left, right, carry)
 }
 
+/// V-wide [`fused_add3_parts`]: `(sum, [maj_left, maj_right, maj_prod],
+/// [rip_left, rip_right, rip_prod])` lanes.
+#[inline(always)]
+#[allow(clippy::type_complexity)]
+pub(crate) fn fused_add3_parts_v(
+    x: &[u32; BM_V],
+    y: &[u32; BM_V],
+    m: &[u32; BM_V],
+) -> ([u32; BM_V], [[u32; BM_V]; 3], [[u32; BM_V]; 3]) {
+    let mut sum = [0u32; BM_V];
+    let mut maj = [[0u32; BM_V]; 3];
+    let mut rip = [[0u32; BM_V]; 3];
+    for j in 0..BM_V {
+        let (s, mj, rp) = fused_add3_parts(x[j], y[j], m[j]);
+        sum[j] = s;
+        for t in 0..3 {
+            maj[t][j] = mj[t];
+            rip[t][j] = rp[t];
+        }
+    }
+    (sum, maj, rip)
+}
+
 /// Shared driver for the interleaved-row batch-major producers (sha2,
 /// blake3 — the bit-packed encoders): parallel over V-instance groups, each
 /// group builds its rows via `per_group(group_inputs, rows)` then NT-flushes
@@ -644,6 +789,10 @@ pub(crate) fn add_carry_parts_v(
 ///
 /// Returns `(z, a, b, stripe)`; z/a/b come from the scratch pool with the
 /// padding suffix zeroed (the producers fully write the useful prefix).
+///
+/// Thin allocating wrapper over [`drive_witness_batch_major_into`] — the
+/// union path calls that directly with a destination inside the padded union
+/// buffers, which is what makes its assembly copy-free.
 pub(crate) fn drive_witness_batch_major<S: Sync, F>(
     inputs: &[S],
     padding: &S,
@@ -652,6 +801,47 @@ pub(crate) fn drive_witness_batch_major<S: Sync, F>(
     useful_bits: usize,
     per_group: F,
 ) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>)
+where
+    F: Fn([&S; BM_V], &mut [BmRow], &mut [BmRow], &mut [BmRow]) + Sync + Send,
+{
+    let total_f128 = 1usize << (n_blocks_log + k_log - 7);
+    let mut z = flock_core::scratch::take_f128(total_f128);
+    let mut a = flock_core::scratch::take_f128(total_f128);
+    let mut b = flock_core::scratch::take_f128(total_f128);
+    let stripe = drive_witness_batch_major_into(
+        inputs,
+        padding,
+        n_blocks_log,
+        k_log,
+        useful_bits,
+        SlotWitnessDest {
+            z: &mut z,
+            a: &mut a,
+            b: &mut b,
+            elide_padding_writes: false,
+        },
+        per_group,
+    );
+    (z, a, b, stripe)
+}
+
+/// [`drive_witness_batch_major`] writing into a caller-supplied destination —
+/// the slot's `2^{m_t−7}`-word block of the padded union buffers
+/// ([`flock_core::union::UnionInstance::slot_dests`]) — instead of its own
+/// allocations. Returns the lincheck stripe (the drivers' fourth output).
+///
+/// The destination may be dirty on entry: every word is written here (the
+/// producers cover the useful chunk-column prefix, the suffix is zeroed
+/// below), which is what [`SlotWitnessDest`]'s contract promises.
+pub(crate) fn drive_witness_batch_major_into<S: Sync, F>(
+    inputs: &[S],
+    padding: &S,
+    n_blocks_log: usize,
+    k_log: usize,
+    useful_bits: usize,
+    dst: SlotWitnessDest<'_>,
+    per_group: F,
+) -> Vec<u8>
 where
     F: Fn([&S; BM_V], &mut [BmRow], &mut [BmRow], &mut [BmRow]) + Sync + Send,
 {
@@ -665,14 +855,27 @@ where
     let useful_words = useful_bits.div_ceil(64);
     let total_f128 = n_total * (u64_per_block / 2);
 
-    let mut z = flock_core::scratch::take_f128(total_f128);
-    let mut a = flock_core::scratch::take_f128(total_f128);
-    let mut b = flock_core::scratch::take_f128(total_f128);
-    let stripe = vec![0u8; n_total * u64_per_block * 8];
+    let SlotWitnessDest {
+        z,
+        a,
+        b,
+        elide_padding_writes: _,
+    } = dst;
+    for buf in [&*z, &*a, &*b] {
+        assert_eq!(buf.len(), total_f128, "witness destination length");
+    }
+    // Pooled (resident) stripe: `stripe_from_rows` writes rows
+    // `[0, useful_words)` of every group — including fully-dummy groups, which
+    // flush zeros — so only each group's TAIL rows need clearing, a few percent
+    // of the buffer instead of faulting in all of it.
+    let mut stripe = flock_core::scratch::take_u8(n_total * u64_per_block * 8);
+    stripe
+        .par_chunks_mut(u64_per_block * 64)
+        .for_each(|g| g[useful_words * 64..].fill(0));
     // Zero the padding suffix (contiguous chunk-columns >= useful_chunks);
     // the producers fully rewrite the useful prefix every call.
     let tail = useful_chunks << n_blocks_log;
-    for buf in [&mut z, &mut a, &mut b] {
+    for buf in [&mut *z, &mut *a, &mut *b] {
         buf[tail..]
             .par_chunks_mut(1 << 16)
             .for_each(|c| c.fill(F128::ZERO));
@@ -712,5 +915,183 @@ where
         },
     );
 
+    stripe
+}
+
+/// Partial-count variant of [`drive_witness_batch_major`] for the union's
+/// dynamic invocation counts (M4): the declared rows are `inputs`
+/// (`inputs.len() = n_t ≤ 2^n_blocks_log`, any value — not necessarily a
+/// power of two), and every row in `[n_t, 2^n_blocks_log)` is left
+/// **identically zero** in `z`, `a`, `b`, and the lincheck stripe — the
+/// design doc's dummy-row semantics, which the union's count-derived
+/// run-lists and the lincheck's count-derived const-pin target require
+/// (dummy rows carry the pin at 0; a real padding invocation would carry it
+/// at 1 and break the count binding).
+///
+/// Interleaved-group mechanics: groups fully below `n_t` build exactly as
+/// the full driver; a partial final group builds all `BM_V` lanes (dead
+/// lanes fed the group's first real input as a placeholder) and then zeroes
+/// the dead lanes in the row buffers before the NT flush + stripe
+/// transpose; groups fully past `n_t` skip the builder and flush the
+/// pre-zeroed rows (the destination buffers come from the dirty scratch
+/// pool, so the dummy region must be written — it is committed at capacity
+/// height by the dense-stack transport and read by the kernels' dense
+/// paths).
+///
+/// Thin allocating wrapper over [`drive_witness_batch_major_partial_into`] —
+/// see [`drive_witness_batch_major`] for the same split.
+pub(crate) fn drive_witness_batch_major_partial<S: Sync, F>(
+    inputs: &[S],
+    n_blocks_log: usize,
+    k_log: usize,
+    useful_bits: usize,
+    per_group: F,
+) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>)
+where
+    F: Fn([&S; BM_V], &mut [BmRow], &mut [BmRow], &mut [BmRow]) + Sync + Send,
+{
+    let total_f128 = 1usize << (n_blocks_log + k_log - 7);
+    let mut z = flock_core::scratch::take_f128(total_f128);
+    let mut a = flock_core::scratch::take_f128(total_f128);
+    let mut b = flock_core::scratch::take_f128(total_f128);
+    let stripe = drive_witness_batch_major_partial_into(
+        inputs,
+        n_blocks_log,
+        k_log,
+        useful_bits,
+        SlotWitnessDest {
+            z: &mut z,
+            a: &mut a,
+            b: &mut b,
+            elide_padding_writes: false,
+        },
+        per_group,
+    );
     (z, a, b, stripe)
+}
+
+/// [`drive_witness_batch_major_partial`] writing into a caller-supplied
+/// destination — the union counterpart, see
+/// [`drive_witness_batch_major_into`].
+pub(crate) fn drive_witness_batch_major_partial_into<S: Sync, F>(
+    inputs: &[S],
+    n_blocks_log: usize,
+    k_log: usize,
+    useful_bits: usize,
+    dst: SlotWitnessDest<'_>,
+    per_group: F,
+) -> Vec<u8>
+where
+    F: Fn([&S; BM_V], &mut [BmRow], &mut [BmRow], &mut [BmRow]) + Sync + Send,
+{
+    use rayon::prelude::*;
+
+    let n_total = 1usize << n_blocks_log;
+    let n_declared = inputs.len();
+    assert!(n_declared <= n_total);
+    assert!(n_total >= BM_V);
+    let u64_per_block = (1usize << k_log) / 64;
+    let useful_chunks = useful_bits.div_ceil(128);
+    let useful_words = useful_bits.div_ceil(64);
+    let total_f128 = n_total * (u64_per_block / 2);
+
+    let SlotWitnessDest {
+        z,
+        a,
+        b,
+        elide_padding_writes,
+    } = dst;
+    for buf in [&*z, &*a, &*b] {
+        assert_eq!(buf.len(), total_f128, "witness destination length");
+    }
+    // Pooled (resident) stripe. `stripe_from_rows` writes rows
+    // `[0, useful_words)` of the groups it visits, so each visited group's
+    // TAIL rows need clearing — a few percent of the buffer. When padding
+    // writes are elided, only the live groups are visited (dummy stripe
+    // regions are never read downstream: the union lincheck's row folds
+    // are count-proportional), and the padding suffix of z/a/b is skipped
+    // outright (already zero, or dirty-but-unread, per the mode).
+    let live_groups = inputs.len().div_ceil(BM_V);
+    let mut stripe = flock_core::scratch::take_u8(n_total * u64_per_block * 8);
+    let tail_groups = if elide_padding_writes {
+        live_groups
+    } else {
+        n_total / BM_V
+    };
+    stripe
+        .par_chunks_mut(u64_per_block * 64)
+        .take(tail_groups)
+        .for_each(|g| g[useful_words * 64..].fill(0));
+    if !elide_padding_writes {
+        // Zero the padding suffix (contiguous chunk-columns >=
+        // useful_chunks); the group loop fully writes the useful prefix —
+        // declared rows from the builders, dummy rows as zero flushes.
+        let tail = useful_chunks << n_blocks_log;
+        for buf in [&mut *z, &mut *a, &mut *b] {
+            buf[tail..]
+                .par_chunks_mut(1 << 16)
+                .for_each(|c| c.fill(F128::ZERO));
+        }
+    }
+
+    let (zp, ap, bp) = (
+        SendPtr(z.as_mut_ptr() as *mut u64),
+        SendPtr(a.as_mut_ptr() as *mut u64),
+        SendPtr(b.as_mut_ptr() as *mut u64),
+    );
+    let sp = SendPtr(stripe.as_ptr() as *mut u64);
+    let inputs_ref = inputs;
+
+    // Elided-padding destinations skip all-dummy groups outright (their
+    // region is zero or never read); the trailing partial group still
+    // zero-flushes its dead lanes.
+    let n_groups = if elide_padding_writes {
+        n_declared.div_ceil(BM_V)
+    } else {
+        n_total / BM_V
+    };
+    (0..n_groups).into_par_iter().for_each_init(
+        || {
+            (
+                vec![[0u64; BM_V]; u64_per_block],
+                vec![[0u64; BM_V]; u64_per_block],
+                vec![[0u64; BM_V]; u64_per_block],
+            )
+        },
+        move |(rz, ra, rb), g| {
+            rz[..useful_words].fill([0u64; BM_V]);
+            ra[..useful_words].fill([0u64; BM_V]);
+            rb[..useful_words].fill([0u64; BM_V]);
+            let o0 = g * BM_V;
+            let live = n_declared.saturating_sub(o0).min(BM_V);
+            if live > 0 {
+                // Dead lanes get the group's first real input as a
+                // placeholder — their rows are zeroed below, so the
+                // placeholder's data never reaches the buffers.
+                let group: [&S; BM_V] =
+                    std::array::from_fn(|j| inputs_ref.get(o0 + j).unwrap_or(&inputs_ref[o0]));
+                per_group(group, rz, ra, rb);
+                if live < BM_V {
+                    for rows in [&mut *rz, &mut *ra, &mut *rb] {
+                        for row in rows[..useful_words].iter_mut() {
+                            for lane in row[live..].iter_mut() {
+                                *lane = 0;
+                            }
+                        }
+                    }
+                }
+            }
+            // Fully-dummy groups (live == 0) flush the pre-zeroed rows:
+            // the dummy region must be written, not skipped — see above.
+            // SAFETY: disjoint instance ranges per group; suffix pre-zeroed.
+            unsafe {
+                flush_rows_nt(rz, zp.get(), o0, n_blocks_log, useful_chunks);
+                flush_rows_nt(ra, ap.get(), o0, n_blocks_log, useful_chunks);
+                flush_rows_nt(rb, bp.get(), o0, n_blocks_log, useful_chunks);
+                stripe_from_rows(rz, sp.get() as *mut u8, o0, u64_per_block, useful_words);
+            }
+        },
+    );
+
+    stripe
 }

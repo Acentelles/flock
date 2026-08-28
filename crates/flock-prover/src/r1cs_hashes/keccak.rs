@@ -60,9 +60,8 @@
 //! [`KeccakLincheckCircuit`], and witness gen emits `a`, `b` values
 //! directly from the running keccak_f simulation. `r1cs.satisfies(z)` and
 //! the slow `prove` path will report "everything satisfied vacuously" for
-//! this encoding — only use `prove_fast`/`prove_chain`.
+//! this encoding — only use `prove_fast`.
 
-use crate::r1cs_hashes::chain_common::{ChainLayout, ChainVerifyError};
 use flock_core::challenger::Challenger;
 use flock_core::field::F128;
 use flock_core::lincheck::LincheckCircuit;
@@ -649,8 +648,6 @@ pub fn generate_witness_with_ab_packed_and_lincheck(
 ) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>) {
     // Constant-wire pin (docs/const-wire-pin.md): fill padding blocks with a
     // valid keccak_f(0) computation so the constant cell is 1 in every block.
-    // (The chain forbids padding — `prove_chain` asserts no padding — so this is
-    // a no-op there and only affects the standalone batch setup.)
     let padding: State = [false; STATE_BITS];
     super::common::drive_witness_packed_and_lincheck(
         initial_states,
@@ -830,39 +827,19 @@ impl LincheckCircuit for KeccakLincheckCircuit {
 }
 
 // ---------------------------------------------------------------------------
-// CHAIN_LAYOUT
-// ---------------------------------------------------------------------------
-
-/// I/O geometry for the generic chain core: `state_0` in aligned slot 0,
-/// `state_24` in slot 1, each in a 2048-bit (`region_log = 11`) window
-/// holding a 1600-bit Keccak state.
-pub const CHAIN_LAYOUT: ChainLayout = ChainLayout {
-    k_log: K_LOG,
-    k_skip: K_SKIP,
-    region_log: 11,
-    region_bits: STATE_BITS,
-    input_byte_off: STATE0_BIT_BASE / 8,   // 0
-    output_byte_off: STATE24_BIT_BASE / 8, // 256
-};
-
-/// Convert a public state (logical FIPS bit order) to the region's physical
-/// within-slot bit order. Used for the public-endpoint fold in verify_chain.
-pub fn state_to_phys_bits(x: &State) -> Vec<bool> {
-    let mut phys = vec![false; STATE_BITS];
-    for j in 0..STATE_BITS {
-        phys[within_lane_contiguous(j)] = x[j];
-    }
-    phys
-}
-
-// ---------------------------------------------------------------------------
 // Setup
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Debug)]
+/// The Keccak-f[1600] R1CS + its single-slot union registry. Proving goes
+/// through the UNION commit (dense stack + integer lanes); the constraint
+/// definition stays on the walker lincheck circuit. Counts are always the
+/// full capacity — padding slots run `keccak_f(0)` (the walker's constant
+/// pin needs them).
+#[derive(Debug)]
 pub struct KeccakSetup {
     pub n_keccaks: usize,
     pub r1cs: BlockR1cs,
+    pub registry: crate::schedule::Registry,
     pub pcs_params: PcsParams,
 }
 
@@ -897,47 +874,37 @@ impl KeccakSetup {
     ) -> Self {
         assert!(n_keccaks >= 1);
         let n_log = min_n_keccaks_log(n_keccaks);
-        let r1cs = build_block_r1cs(n_log);
+        let mut r1cs = build_block_r1cs(n_log);
+        r1cs.layout = flock_core::r1cs::WitnessLayout::BatchMajor;
         // Pre-fault the prove-cycle scratch buffers — see scratch::prewarm_prover.
         flock_core::scratch::prewarm_prover(r1cs.m);
-        let pcs_params = PcsParams {
-            m: r1cs.m,
-            log_inv_rate,
-            log_batch_size: 6,
-            profile,
-            merkle_hash: Default::default(),
+        let registry = {
+            // The empty-stub r1cs carries no const_pin (the walker owns it);
+            // the union lincheck asserts the registry type agrees with the
+            // slot circuit, so copy the walker's pin onto the type.
+            let mut ty = crate::schedule::TableType::from_block_r1cs(&r1cs);
+            ty.const_pin = Some(Z_CONST);
+            crate::schedule::Registry::new(vec![ty], n_log)
+        };
+        let n_slots = 1usize << n_log;
+        let pcs_params = {
+            let union = flock_core::union::UnionInstance::new(&registry, vec![n_slots]);
+            let m = union.dense_m();
+            let batch = flock_core::pcs::ligerito::embedded_initial_k_or_default(m, profile);
+            PcsParams {
+                m,
+                log_inv_rate,
+                log_batch_size: batch,
+                profile,
+                num_lanes: union.commit_lanes(batch),
+                merkle_hash: Default::default(),
+            }
         };
         Self {
             n_keccaks,
             r1cs,
+            registry,
             pcs_params,
-        }
-    }
-
-    /// [`Self::new`] with the **batch-major** witness layout (see
-    /// [`flock_core::r1cs::WitnessLayout`]): fold-log_n-first variable
-    /// order, contiguous padding suffix, direct-write witness producer.
-    /// Chain wrappers preserve the selected witness layout.
-    pub fn new_batch_major(n_keccaks: usize) -> Self {
-        let mut s = Self::new(n_keccaks);
-        // Safe to set post-construction: the digest/csc caches are lazy and
-        // untouched by `new`.
-        s.r1cs.layout = flock_core::r1cs::WitnessLayout::BatchMajor;
-        s
-    }
-
-    /// Witness generation dispatched on the r1cs's witness layout.
-    fn generate_witness(
-        &self,
-        initial_states: &[State],
-    ) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>) {
-        match self.r1cs.layout {
-            flock_core::r1cs::WitnessLayout::RowMajor => {
-                generate_witness_with_ab_packed_and_lincheck(initial_states, self.n_keccaks_log())
-            }
-            flock_core::r1cs::WitnessLayout::BatchMajor => {
-                generate_witness_batch_major(initial_states, self.n_keccaks_log())
-            }
         }
     }
 
@@ -951,98 +918,41 @@ impl KeccakSetup {
         1usize << self.n_keccaks_log()
     }
 
-    /// Build a base R1CS proof (without the chain shift sumcheck).
-    /// Requires `m ≥ ~21` (Ligerito recursion floor).
+    /// Prove over the single-slot UNION commit. Requires `m ≥ ~21`.
     pub fn prove_fast<Ch: Challenger>(
         &self,
         initial_states: &[State],
         challenger: &mut Ch,
-    ) -> (flock_core::proof::R1csProofLigerito, Commitment, R1csClaim) {
+    ) -> (
+        flock_core::proof::R1csProofMergedLigerito,
+        Commitment,
+        R1csClaim,
+    ) {
         assert_eq!(initial_states.len(), self.n_keccaks);
-        let (codeword, (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck)) =
-            flock_core::pcs::prefault_codeword_during(&self.pcs_params, || {
-                self.generate_witness(initial_states)
-            });
-        crate::prover::prove_fast_ligerito_from_witness(
-            &self.r1cs,
-            &self.pcs_params,
-            z_packed,
-            a_packed_f128,
-            b_packed_f128,
-            z_packed_lincheck,
+        let n_slots = self.n_keccak_slots();
+        let union = flock_core::union::UnionInstance::new(&self.registry, vec![n_slots]);
+        let slot = crate::prover::UnionSlotProverInput::new(
+            generate_witness_batch_major(initial_states, self.n_keccaks_log()),
             &KeccakLincheckCircuit,
-            codeword,
-            challenger,
-        )
+        );
+        crate::prover::prove_fast_ligerito_union(&union, &self.pcs_params, vec![slot], challenger)
     }
 
-    /// Verify a [`Self::prove_fast`] (Ligerito) proof.
+    /// Verify a [`Self::prove_fast`] proof.
     pub fn verify<Ch: Challenger>(
         &self,
         commitment: &Commitment,
-        proof: &flock_core::proof::R1csProofLigerito,
+        proof: &flock_core::proof::R1csProofMergedLigerito,
         challenger: &mut Ch,
     ) -> Result<R1csClaim, verifier::VerifyError> {
-        verifier::verify_ligerito(
-            &self.r1cs,
+        let n_slots = self.n_keccak_slots();
+        let union = flock_core::union::UnionInstance::new(&self.registry, vec![n_slots]);
+        let circs: [&dyn flock_core::lincheck::LincheckCircuit; 1] = [&KeccakLincheckCircuit];
+        verifier::verify_ligerito_union(
+            &union,
+            &circs,
             commitment,
             proof,
-            &KeccakLincheckCircuit,
-            &self.pcs_params,
-            challenger,
-        )
-    }
-
-    /// Prove that `initial_states` form a sequential chain: for the committed
-    /// witness, `state_24` of instance `i` equals `state_0` of instance `i+1`,
-    /// with public endpoints `x_0 = state_0[0]` and `x_last = state_24[N-1]`.
-    /// **Ligerito backend.** Requires m ≥ ~21.
-    pub fn prove_chain<Ch: Challenger>(
-        &self,
-        initial_states: &[State],
-        challenger: &mut Ch,
-    ) -> (
-        crate::r1cs_hashes::chain_common::ChainProofLigerito,
-        Commitment,
-    ) {
-        assert_eq!(initial_states.len(), self.n_keccaks);
-        assert_eq!(self.n_keccaks, self.n_keccak_slots());
-        let (z_packed, a_packed, b_packed, z_lincheck) = self.generate_witness(initial_states);
-        crate::r1cs_hashes::chain_common::prove_chain_ligerito_generic(
-            &self.r1cs,
-            &self.pcs_params,
-            &CHAIN_LAYOUT,
-            z_packed,
-            a_packed,
-            b_packed,
-            z_lincheck,
-            &KeccakLincheckCircuit,
-            challenger,
-        )
-    }
-
-    /// Verify a [`Self::prove_chain`] (Ligerito) proof.
-    pub fn verify_chain<Ch: Challenger>(
-        &self,
-        commitment: &Commitment,
-        proof: &crate::r1cs_hashes::chain_common::ChainProofLigerito,
-        x_0: &State,
-        x_last: &State,
-        challenger: &mut Ch,
-    ) -> Result<(), ChainVerifyError> {
-        assert_eq!(self.n_keccaks, self.n_keccak_slots());
-        let n_log = self.n_keccaks_log();
-        let x0_phys = state_to_phys_bits(x_0);
-        let xlast_phys = state_to_phys_bits(x_last);
-        crate::r1cs_hashes::chain_common::verify_chain_ligerito_generic(
-            &self.r1cs,
-            &CHAIN_LAYOUT,
-            commitment,
-            proof,
-            n_log,
-            &x0_phys,
-            &xlast_phys,
-            &KeccakLincheckCircuit,
             &self.pcs_params,
             challenger,
         )
@@ -1720,7 +1630,7 @@ mod tests {
     fn batch_major_prove_fast_roundtrip() {
         use flock_core::challenger::FsChallenger;
 
-        let setup = KeccakSetup::new_batch_major(64);
+        let setup = KeccakSetup::new(64);
         let mut rng = Rng::new(0xBA7C_2170);
         let inputs: Vec<State> = (0..64).map(|_| random_state(&mut rng)).collect();
         let mut ch_p = FsChallenger::new(b"flock-lig-keccak-v0");
@@ -1755,24 +1665,22 @@ mod tests {
             .unwrap_or_else(|e| panic!("honest padded proof rejected: {e:?}"));
         assert_eq!(claim_p, claim_v);
 
-        // (2) All-zero witness must be rejected by the pin.
+        // (2) All-zero witness must be rejected by the pin (union path).
         let zeros: Vec<State> = vec![[false; STATE_BITS]; n];
         let (mut z, mut a, mut b, mut zlc) =
-            generate_witness_with_ab_packed_and_lincheck(&zeros, setup.n_keccaks_log());
+            generate_witness_batch_major(&zeros, setup.n_keccaks_log());
         z.iter_mut().for_each(|v| *v = F128::ZERO);
         a.iter_mut().for_each(|v| *v = F128::ZERO);
         b.iter_mut().for_each(|v| *v = F128::ZERO);
         zlc.iter_mut().for_each(|v| *v = 0);
+        let n_slots = setup.n_keccak_slots();
+        let union = flock_core::union::UnionInstance::new(&setup.registry, vec![n_slots]);
+        let slot = crate::prover::UnionSlotProverInput::new((z, a, b, zlc), &KeccakLincheckCircuit);
         let mut ch_p = FsChallenger::new(b"poc");
-        let (proof, commitment, _) = crate::prover::prove_fast_ligerito_from_witness(
-            &setup.r1cs,
+        let (proof, commitment, _) = crate::prover::prove_fast_ligerito_union(
+            &union,
             &setup.pcs_params,
-            z,
-            a,
-            b,
-            zlc,
-            &KeccakLincheckCircuit,
-            None,
+            vec![slot],
             &mut ch_p,
         );
         let mut ch_v = FsChallenger::new(b"poc");
@@ -1781,90 +1689,5 @@ mod tests {
             matches!(res, Err(flock_core::verifier::VerifyError::Lincheck(_))),
             "all-zero witness must be rejected by the constant-wire pin; got {res:?}"
         );
-    }
-
-    /// Batch-major chain: the packed-pos fold must produce IDENTICAL In/Out
-    /// vectors from the batch-major and row-major witnesses (same semantic
-    /// content, different addressing), pinning `fold_in_out`'s batch-major
-    /// word addressing.
-    #[test]
-    fn batch_major_chain_fold_matches_row_major() {
-        use crate::r1cs_hashes::chain_common::{ChainFold, fold_in_out};
-        let n_log = 3;
-        let mut rng = Rng::new(0xF01D_BA7C);
-        let inputs: Vec<State> = (0..8).map(|_| random_state(&mut rng)).collect();
-        let (z_r, _, _, _) = generate_witness_with_ab_packed_and_lincheck(&inputs, n_log);
-        let (z_b, _, _, _) = generate_witness_batch_major(&inputs, n_log);
-
-        let tau_pos: Vec<F128> = (0..CHAIN_LAYOUT.tau_pos_len())
-            .map(|i| F128 {
-                lo: rng.next_u64() ^ i as u64,
-                hi: rng.next_u64(),
-            })
-            .collect();
-        let fold = ChainFold::new(&CHAIN_LAYOUT, tau_pos);
-        let (in_r, out_r) = fold_in_out(
-            &CHAIN_LAYOUT,
-            flock_core::r1cs::WitnessLayout::RowMajor,
-            &z_r,
-            &fold,
-        );
-        let (in_b, out_b) = fold_in_out(
-            &CHAIN_LAYOUT,
-            flock_core::r1cs::WitnessLayout::BatchMajor,
-            &z_b,
-            &fold,
-        );
-        assert_eq!(in_b, in_r, "In fold diverged across layouts");
-        assert_eq!(out_b, out_r, "Out fold diverged across layouts");
-    }
-
-    /// Batch-major chain roundtrip on the Ligerito backend (K=64, m=22) —
-    /// covers the mixed open (2 ring-switched + 1 packed-direct claim) with
-    /// the batch-major point ordering. Ignored like the row-major variant.
-    #[test]
-    #[ignore]
-    fn batch_major_prove_chain_ligerito_roundtrip() {
-        use flock_core::challenger::RandomChallenger;
-        let setup = KeccakSetup::new_batch_major(64);
-        let mut rng = Rng::new(0xBA7C_11C7);
-        let x0 = random_state(&mut rng);
-        let mut inputs = Vec::with_capacity(64);
-        let mut cur = x0;
-        for _ in 0..64 {
-            inputs.push(cur);
-            keccak_f(&mut cur);
-        }
-        let x_last = cur;
-        let mut chp = RandomChallenger::new(0xCA2);
-        let (proof, comm) = setup.prove_chain(&inputs, &mut chp);
-        let mut chv = RandomChallenger::new(0xCA2);
-        setup
-            .verify_chain(&comm, &proof, &x0, &x_last, &mut chv)
-            .expect("batch-major ligerito chain must verify");
-    }
-
-    /// Chain prove → verify roundtrip (Ligerito default). K=64 → m=22.
-    #[test]
-    #[ignore]
-    fn prove_chain_roundtrip() {
-        use flock_core::challenger::RandomChallenger;
-        let setup = KeccakSetup::new(64);
-        let n_inst = setup.n_keccak_slots();
-        let mut rng = Rng::new(0xC0DE_5170);
-        let x0 = random_state(&mut rng);
-        let mut inputs = Vec::with_capacity(n_inst);
-        let mut cur = x0;
-        for _ in 0..n_inst {
-            inputs.push(cur);
-            keccak_f(&mut cur);
-        }
-        let x_last = cur;
-        let mut chp = RandomChallenger::new(0xCA1);
-        let (proof, comm) = setup.prove_chain(&inputs, &mut chp);
-        let mut chv = RandomChallenger::new(0xCA1);
-        setup
-            .verify_chain(&comm, &proof, &x0, &x_last, &mut chv)
-            .expect("chain must verify");
     }
 }

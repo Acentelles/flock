@@ -5,6 +5,7 @@
 //! `flock_core::verifier`'s in-crate test module when the crates were split.
 
 use flock_prover::challenger::FsChallenger;
+use flock_prover::pcs::ligerito::LigeritoProfile;
 use flock_prover::pcs::{self, PcsParams};
 use flock_prover::prover::prove_ligerito;
 use flock_prover::r1cs::{BlockR1cs, SparseBinaryMatrix, WitnessLayout};
@@ -73,6 +74,7 @@ fn r1cs_prove_verify_roundtrip_ligerito() {
         log_inv_rate: 1,
         log_batch_size: 6,
         profile: Default::default(),
+        num_lanes: None,
         merkle_hash: Default::default(),
     };
     let mut ch_p = FsChallenger::new(b"flock-lig-r1cs-v0");
@@ -113,6 +115,89 @@ fn r1cs_prove_verify_roundtrip_ligerito() {
     }
 }
 
+/// End-to-end check for strict Fast-profile Boolean zerocheck and lincheck
+/// grinding. The default strict PCS profile selects both schedules;
+/// this test deliberately remains ignored because its Ligerito opening is the
+/// same heavyweight m22 workload as the ordinary end-to-end roundtrip above.
+#[test]
+#[ignore] // Run with `cargo test -p flock-prover --test verifier_roundtrip strict_fast_profile_grinds_boolean_piops -- --ignored`.
+fn strict_fast_profile_grinds_boolean_piops() {
+    let m = 22;
+    let r1cs = identity_r1cs(m, 6, 6, 1 << 6);
+    let mut rng = Rng::new(0x1280_0001);
+    let z = rng.bits(r1cs.n());
+    assert!(r1cs.satisfies(&z));
+    let pcs_params = PcsParams {
+        m,
+        log_inv_rate: 1,
+        log_batch_size: 6,
+        profile: LigeritoProfile::Fast,
+        num_lanes: None,
+        merkle_hash: Default::default(),
+    };
+
+    let mut ch_p = FsChallenger::new(b"flock-strict-zc-grinding-v0");
+    let (proof, commitment, claim_p) =
+        prove_ligerito(&r1cs, pcs::pack_witness(&z, r1cs.m), &pcs_params, &mut ch_p);
+    assert_eq!(
+        proof.zerocheck.grinding_nonces.len(),
+        2 + m - flock_prover::zerocheck::K_SKIP,
+        "initial + skip + every tail-round nonce"
+    );
+    assert_eq!(
+        proof.lincheck.grinding_nonces.len(),
+        2,
+        "alpha plus the final k_skip=6 evaluation (there are no inner rounds)"
+    );
+
+    let lc_circuit = r1cs.sparse_lincheck_circuit();
+    let mut ch_v = FsChallenger::new(b"flock-strict-zc-grinding-v0");
+    let claim_v = verifier::verify_ligerito(
+        &r1cs,
+        &commitment,
+        &proof,
+        &lc_circuit,
+        &pcs_params,
+        &mut ch_v,
+    )
+    .expect("the grinded proof verifies end to end");
+    assert_eq!(claim_p, claim_v);
+
+    let mut missing_nonce = proof.clone();
+    missing_nonce.zerocheck.grinding_nonces.pop();
+    let mut ch_bad = FsChallenger::new(b"flock-strict-zc-grinding-v0");
+    assert!(matches!(
+        verifier::verify_ligerito(
+            &r1cs,
+            &commitment,
+            &missing_nonce,
+            &lc_circuit,
+            &pcs_params,
+            &mut ch_bad,
+        ),
+        Err(VerifyError::Zerocheck(
+            flock_prover::zerocheck::VerifyError::BadGrindingNonceCount { .. }
+        ))
+    ));
+
+    let mut missing_lincheck_nonce = proof.clone();
+    missing_lincheck_nonce.lincheck.grinding_nonces.pop();
+    let mut ch_bad = FsChallenger::new(b"flock-strict-zc-grinding-v0");
+    assert!(matches!(
+        verifier::verify_ligerito(
+            &r1cs,
+            &commitment,
+            &missing_lincheck_nonce,
+            &lc_circuit,
+            &pcs_params,
+            &mut ch_bad,
+        ),
+        Err(VerifyError::Lincheck(
+            flock_prover::lincheck::VerifyError::BadGrindingNonceCount { .. }
+        ))
+    ));
+}
+
 /// AG-skip mirror of the Ligerito roundtrip: prove_ligerito_ag →
 /// verify_ligerito_ag, plus tamper-rejection on the AG round messages, the
 /// c-eval, and the ring-switch s_hat_v (which the AG path claim-checks with
@@ -140,6 +225,7 @@ fn r1cs_prove_verify_roundtrip_ligerito_ag() {
         log_inv_rate: 1,
         log_batch_size: 6,
         profile: Default::default(),
+        num_lanes: None,
         merkle_hash: Default::default(),
     };
     let z_packed = pcs::pack_witness(&z, r1cs.m);

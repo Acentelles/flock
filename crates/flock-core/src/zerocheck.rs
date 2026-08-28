@@ -33,30 +33,10 @@ pub mod univariate_skip_deg4_optimized;
 pub mod univariate_skip_optimized;
 
 use multilinear::{
-    UniSkipFoldTable, fold_and_compute_round_pair_into, fold_in_place_pair,
-    eval_deferred_round_msg, fold1_lookahead_into, fold2_compact_round45_into,
-    fold2_lookahead_into, interpolate_at_z_combined,
-    interpolate_at_z_on_lambda, lookahead_msg_first, lookahead_msg_second, round_pair_naive,
-    uni_skip_fold_round23_compact_padded,
+    UniSkipFoldTable, fold_and_compute_round_pair_into, fold_and_round_pair_sparse_into,
+    fold_in_place_pair, interpolate_at_z_combined, interpolate_at_z_on_lambda, round_pair_naive,
     uni_skip_fold_and_round_pair_optimized_packed_padded,
 };
-
-/// A/B kill switch for the RS cascade tail (integrated round-2 lookahead +
-/// 4→1 tail passes; see [`prove_packed_padded_inner`]), DEFAULT ON. With
-/// the one-weight-per-group product form the cascade certifies at both
-/// shapes (m=32: tail −20 with r2 +12, zc net −8..13, sign 3/4; m=30: net
-/// −1.0, 2/2). Certified default-on;
-/// the AtomicBool exists for paired within-process A/B. The transcript is
-/// identical either way — the lookahead messages are the same polynomial
-/// values, derived without the intermediate data pass (pinned by
-/// `lookahead_tail_transcript_identical_to_classic`).
-/// Test-only toggle: the compact variant-K transcript tests set this to
-/// run the incumbent route as their oracle arm. Never set in production.
-pub static ZC_COMPACT_K_DISABLE: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-pub static RS_TAIL_LOOKAHEAD_DISABLE: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
 use univariate_skip_optimized::{
     c_s_f128, medium_challenges_ghash, round1_shift_reduce_extract_c_packed_padded,
     small_challenges_ghash,
@@ -67,29 +47,264 @@ use univariate_skip_optimized::{
 /// vectors of F128.
 pub const K_SKIP: usize = 6;
 
-/// Witness padding descriptor for URM work-skipping.
+/// Fiat--Shamir grinding policy for this zerocheck.
 ///
-/// The witness is a sequence of `2^(m - k_log)` blocks of `2^k_log` bits each;
-/// inside each block, bits `[0, useful_bits_per_block)` carry real data and
-/// bits `[useful_bits_per_block, 2^k_log)` are zero padding. URM contributions
-/// from a chunk of all-zero bits are themselves zero, so we can skip those
-/// chunks and produce byte-identical output.
+/// Zerocheck has three independently sampled challenge families:
 ///
-/// Use [`PaddingSpec::dense`] when the witness has no padding holes.
-#[derive(Clone, Copy, Debug)]
-pub struct PaddingSpec {
+/// 1. the initial point used to turn a Boolean-cube identity into an
+///    eq-weighted claim;
+/// 2. the univariate-skip point `z`; and
+/// 3. one challenge for every quadratic multilinear sumcheck round.
+///
+/// [`Self::per_challenge_128`] chooses enough leading-zero PoW bits that an
+/// error term of the form `degree / |F_{2^128}|`, after a prover's trial and
+/// error over the challenge, is *strictly* below `2^-128`.  In particular,
+/// `degree = 2` needs two bits, not one: `2 / 2 = 1` would only meet the
+/// bound, not beat it.
+///
+/// The policy is intentionally local to zerocheck. Other sumcheck families
+/// have different degrees and proof formats, so they define separate
+/// schedules.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ZerocheckGrinding {
+    enabled: bool,
+}
+
+impl ZerocheckGrinding {
+    /// Legacy/default behaviour: no PoW operations and no nonce payload in
+    /// the transcript.
+    pub const fn disabled() -> Self {
+        Self { enabled: false }
+    }
+
+    /// Grind every zerocheck challenge whose soundness is being used.
+    pub const fn per_challenge_128() -> Self {
+        Self { enabled: true }
+    }
+
+    /// Whether this policy inserts PoW operations into the transcript.
+    pub const fn is_enabled(self) -> bool {
+        self.enabled
+    }
+
+    /// Number of leading-zero bits which strictly turns
+    /// `numerator / 2^128` into a value below `2^-128`.
+    ///
+    /// Equivalently this is `floor(log2(numerator)) + 1`.  Keeping the
+    /// strict inequality explicit prevents an accidental one-bit
+    /// under-provisioning at powers of two.
+    const fn bits_for_numerator(numerator: usize) -> u32 {
+        debug_assert!(numerator > 0);
+        usize::BITS - numerator.leading_zeros()
+    }
+
+    /// PoW before sampling the initial eq-weighted identity point.  A
+    /// nonzero multilinear polynomial in `m` variables has total degree at
+    /// most `m`, so Schwartz--Zippel contributes at most `m / |F|` here.
+    pub const fn initial_bits(self, m: usize) -> Option<u32> {
+        if self.enabled {
+            Some(Self::bits_for_numerator(m))
+        } else {
+            None
+        }
+    }
+
+    /// PoW before sampling the univariate-skip point.  The combined round-1
+    /// polynomial has degree `< 2^(K_SKIP + 1)`, hence degree at most
+    /// `2^(K_SKIP + 1) - 1`.
+    pub const fn skip_bits(self) -> Option<u32> {
+        if self.enabled {
+            Some(Self::bits_for_numerator((1usize << (K_SKIP + 1)) - 1))
+        } else {
+            None
+        }
+    }
+
+    /// PoW before a standard degree-two tail-round challenge.
+    pub const fn multilinear_round_bits(self) -> Option<u32> {
+        if self.enabled {
+            Some(Self::bits_for_numerator(2))
+        } else {
+            None
+        }
+    }
+
+    /// Number of nonce words carried by one proof at domain dimension `m`.
+    pub const fn nonce_count(self, m: usize) -> usize {
+        if self.enabled {
+            // initial point, skip point, and one nonce per tail round
+            2 + m - K_SKIP
+        } else {
+            0
+        }
+    }
+}
+
+/// Sparse-support gate for round 2 and the tail: the support-proportional
+/// kernels engage while `live · SPARSE_TAIL_GATE ≤ n`. Set to 16 when the
+/// sparse tail was a sequential scalar walk; after its parallelization
+/// (dense-kernel structure) the crossover moved — measured on the capacity
+/// sweeps at both the small and the real-m30 load, the sparse path runs at
+/// per-element parity with the dense fold (25% utilization matches the
+/// full-utilization zerocheck), so the gate engages at half utilization.
+/// Full utilization itself stays dense (live · 2 > n): it is the anchor
+/// configuration and the dense kernels are the calibrated choice there.
+pub const SPARSE_TAIL_GATE: usize = 1;
+
+/// [`SPARSE_TAIL_GATE`] with an env override (`FLOCK_SPARSE_GATE`) — a
+/// tuning knob for A/B experiments; the constant above is the default.
+/// Value-identical either way (the sparse kernels drop only zero terms).
+fn sparse_tail_gate() -> usize {
+    static GATE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| {
+        std::env::var("FLOCK_SPARSE_GATE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(SPARSE_TAIL_GATE)
+    })
+}
+
+/// One run of identically-shaped blocks inside a [`PaddingSpec`] run-list.
+///
+/// A run is `n_blocks` consecutive blocks of `2^k_log` bits each; inside each
+/// block, bits `[0, useful_bits_per_block)` carry real data and bits
+/// `[useful_bits_per_block, 2^k_log)` are zero padding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PaddingRun {
     pub k_log: usize,
     pub useful_bits_per_block: usize,
+    pub n_blocks: usize,
+}
+
+impl PaddingRun {
+    /// Address-space extent of the run in bits (= `n_blocks · 2^k_log`).
+    pub fn extent_bits(&self) -> usize {
+        self.n_blocks << self.k_log
+    }
+}
+
+/// Witness padding descriptor for URM / fold work-skipping.
+///
+/// The witness is described by an ordered **run-list**: the [`PaddingRun`]s
+/// are laid out back-to-back from address 0, and everything after the last
+/// run (up to the instance's `2^m` domain) is an implicit all-zero gap.
+/// URM/fold contributions from a chunk of all-zero bits are themselves zero,
+/// so kernels may skip any chunk the spec marks as padding or gap and produce
+/// byte-identical output — provided those bits are honestly zero.
+///
+/// Single-table callers build **single-run** specs (one run tiling the whole
+/// domain: [`PaddingSpec::dense`], [`PaddingSpec::uniform`], and
+/// `BlockR1cs::padding_spec`); the hot kernels detect that case via
+/// [`PaddingSpec::as_single_run`] and take exactly the pre-run-list code
+/// path. Multi-run specs — the count-derived slot schedules of the
+/// multi-table design (`docs/multi-table-design.tex` §5.2, the union prove
+/// path) — go through general run-list paths that, since M6, skip dead
+/// regions with cost proportional to the declared support
+/// ([`Self::useful_block_intervals`] drives the interval-based kernels).
+///
+/// Use [`PaddingSpec::dense`] when the witness has no padding holes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PaddingSpec {
+    runs: Vec<PaddingRun>,
 }
 
 impl PaddingSpec {
     /// "No padding": every bit of the witness is treated as useful. Equivalent
     /// to the legacy URM path with no skipping.
     pub fn dense(m: usize) -> Self {
-        Self {
-            k_log: m,
-            useful_bits_per_block: 1usize << m,
+        Self::uniform(m, 1usize << m, 1)
+    }
+
+    /// Single-run spec: `n_blocks` blocks of `2^k_log` bits, each with a
+    /// `useful_bits_per_block` useful prefix. With `n_blocks = 2^(m − k_log)`
+    /// this is exactly the pre-run-list `PaddingSpec`.
+    pub fn uniform(k_log: usize, useful_bits_per_block: usize, n_blocks: usize) -> Self {
+        Self::from_runs(vec![PaddingRun {
+            k_log,
+            useful_bits_per_block,
+            n_blocks,
+        }])
+    }
+
+    /// General run-list constructor. Runs with `n_blocks = 0` cover no address
+    /// space and are dropped (canonical form, so `as_single_run` is reliable).
+    pub fn from_runs(runs: Vec<PaddingRun>) -> Self {
+        for run in &runs {
+            assert!(
+                run.useful_bits_per_block <= 1usize << run.k_log,
+                "useful_bits_per_block {} exceeds block size 2^{}",
+                run.useful_bits_per_block,
+                run.k_log
+            );
         }
+        Self {
+            runs: runs.into_iter().filter(|r| r.n_blocks > 0).collect(),
+        }
+    }
+
+    /// The runs, in address order.
+    pub fn runs(&self) -> &[PaddingRun] {
+        &self.runs
+    }
+
+    /// The single run when the list has exactly one — the hot kernels' fast
+    /// path. The fast path treats the run as tiling the entire domain
+    /// periodically (it ignores `n_blocks`), which matches the pre-run-list
+    /// kernels bit-for-bit; a single run with a trailing gap is still handled
+    /// correctly because the gap must be honestly zero, like all padding.
+    pub fn as_single_run(&self) -> Option<PaddingRun> {
+        match self.runs.as_slice() {
+            [run] => Some(*run),
+            _ => None,
+        }
+    }
+
+    /// Total extent covered by the runs, in bits. The instance domain `2^m`
+    /// may be larger; the difference is the implicit trailing zero gap.
+    pub fn covered_bits(&self) -> usize {
+        self.runs.iter().map(|r| r.extent_bits()).sum()
+    }
+
+    /// [`Self::useful_intervals`] coarsened to `2^log2_block`-bit blocks and
+    /// merged: block `x` is listed iff bits `[x·2^log2_block,
+    /// (x+1)·2^log2_block)` intersect a useful interval. This is the live set
+    /// of a table whose entries each aggregate one block of witness bits
+    /// (e.g. the post-URM tables at `log2_block = k_skip`, or packed words at
+    /// `log2_block = 7`): outside it the honest table is identically zero.
+    pub fn useful_block_intervals(&self, log2_block: usize) -> Vec<(usize, usize)> {
+        let mut out: Vec<(usize, usize)> = Vec::new();
+        for (s, e) in self.useful_intervals() {
+            let (s2, e2) = (s >> log2_block, e.div_ceil(1usize << log2_block));
+            match out.last_mut() {
+                Some((_, prev_e)) if *prev_e >= s2 => *prev_e = (*prev_e).max(e2),
+                _ => out.push((s2, e2)),
+            }
+        }
+        out
+    }
+
+    /// Sorted, merged list of useful bit intervals `[start, end)` — the
+    /// semantic content of the spec (everything outside is declared zero).
+    /// Consumed by the general (multi-run) kernel paths and by tests; cost is
+    /// O(total blocks), fine off the single-run hot path.
+    pub fn useful_intervals(&self) -> Vec<(usize, usize)> {
+        let mut intervals: Vec<(usize, usize)> = Vec::new();
+        let mut offset = 0usize;
+        for run in &self.runs {
+            let block_bits = 1usize << run.k_log;
+            if run.useful_bits_per_block > 0 {
+                for blk in 0..run.n_blocks {
+                    let start = offset + blk * block_bits;
+                    let end = start + run.useful_bits_per_block;
+                    match intervals.last_mut() {
+                        Some((_, prev_end)) if *prev_end == start => *prev_end = end,
+                        _ => intervals.push((start, end)),
+                    }
+                }
+            }
+            offset += run.extent_bits();
+        }
+        intervals
     }
 }
 
@@ -146,6 +361,11 @@ pub struct ZerocheckProof {
     pub final_a_eval: F128,
     pub final_b_eval: F128,
     pub final_c_eval: F128,
+    /// PoW nonces in transcript order: initial eq point, skip point, then
+    /// one nonce per multilinear round.  Empty under
+    /// [`ZerocheckGrinding::disabled`].
+    #[serde(default)]
+    pub grinding_nonces: Vec<u64>,
 }
 
 /// Reasons the verifier may reject a proof.
@@ -157,6 +377,13 @@ pub enum VerifyError {
     BadRound1Length { expected: usize, got: usize },
     /// Wrong number of multilinear-round messages (expected `log_n - K_SKIP`).
     BadMultilinearRoundsLength { expected: usize, got: usize },
+    /// The supplied nonce vector does not match the configured grinding
+    /// schedule.  This is checked before replaying the transcript so a
+    /// malformed proof cannot shift nonce-to-challenge alignment.
+    BadGrindingNonceCount { expected: usize, got: usize },
+    /// A nonce does not satisfy the PoW at the transcript position where its
+    /// corresponding challenge is sampled.
+    InvalidGrindingNonce { which: &'static str },
     /// `proof.final_c_eval` doesn't match the verifier's reconstruction
     /// `C_s · interpolate_at_z_on_lambda(round1_c, k_skip, z)`. Catches
     /// dishonesty in the round-1 C message or in the final c-eval claim.
@@ -191,20 +418,41 @@ pub fn prove_packed<C: Challenger>(
     m: usize,
     challenger: &mut C,
 ) -> (ZerocheckProof, ZerocheckClaim) {
-    prove_packed_padded(
+    prove_packed_padded_with_grinding(
         a_packed,
         b_packed,
         c_packed,
         m,
         &PaddingSpec::dense(m),
+        ZerocheckGrinding::disabled(),
         challenger,
     )
 }
 
-/// Same as [`prove_packed`] but lets the caller declare a per-block padding
-/// pattern so URM can skip work for chunks that fall entirely in the zero
-/// padding of every block. Output is byte-identical to the dense path when
-/// the padding bits are honestly zero.
+/// [`prove_packed`] with an explicit Fiat--Shamir grinding policy.
+pub fn prove_packed_with_grinding<C: Challenger>(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    c_packed: &[u8],
+    m: usize,
+    grinding: ZerocheckGrinding,
+    challenger: &mut C,
+) -> (ZerocheckProof, ZerocheckClaim) {
+    prove_packed_padded_with_grinding(
+        a_packed,
+        b_packed,
+        c_packed,
+        m,
+        &PaddingSpec::dense(m),
+        grinding,
+        challenger,
+    )
+}
+
+/// Same as [`prove_packed`] but lets the caller declare a run-list padding
+/// pattern so URM can skip work for chunks that fall entirely in zero
+/// padding (or in the trailing gap after the last run). Output is
+/// byte-identical to the dense path when the padding bits are honestly zero.
 pub fn prove_packed_padded<C: Challenger>(
     a_packed: &[u8],
     b_packed: &[u8],
@@ -213,8 +461,29 @@ pub fn prove_packed_padded<C: Challenger>(
     padding: &PaddingSpec,
     challenger: &mut C,
 ) -> (ZerocheckProof, ZerocheckClaim) {
-    let (proof, claim, _, _) = prove_packed_padded_inner(
-        a_packed, b_packed, c_packed, m, padding, false, challenger, None, None,
+    prove_packed_padded_with_grinding(
+        a_packed,
+        b_packed,
+        c_packed,
+        m,
+        padding,
+        ZerocheckGrinding::disabled(),
+        challenger,
+    )
+}
+
+/// [`prove_packed_padded`] with an explicit Fiat--Shamir grinding policy.
+pub fn prove_packed_padded_with_grinding<C: Challenger>(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    c_packed: &[u8],
+    m: usize,
+    padding: &PaddingSpec,
+    grinding: ZerocheckGrinding,
+    challenger: &mut C,
+) -> (ZerocheckProof, ZerocheckClaim) {
+    let (proof, claim, _) = prove_packed_padded_inner(
+        a_packed, b_packed, c_packed, m, padding, grinding, false, challenger,
     );
     (proof, claim)
 }
@@ -234,47 +503,36 @@ pub fn prove_packed_padded_capture_s_hat_v_c<C: Challenger>(
     padding: &PaddingSpec,
     challenger: &mut C,
 ) -> (ZerocheckProof, ZerocheckClaim, Vec<F128>) {
-    let (proof, claim, captured, _) = prove_packed_padded_inner(
-        a_packed, b_packed, c_packed, m, padding, true, challenger, None, None,
-    );
-    (
-        proof,
-        claim,
-        captured.expect("capture=true must produce s_hat_v_c"),
-    )
-}
-
-/// [`prove_packed_padded_capture_s_hat_v_c`] with the round-1 C side computed
-/// from the lincheck stripe (see
-/// [`univariate_skip_optimized::round1_c_banks_from_stripe`]). Requires
-/// `c_packed` to be the witness itself (C = I). Output is bit-identical.
-#[allow(clippy::too_many_arguments)]
-pub fn prove_packed_padded_capture_s_hat_v_c_with_stripe<C: Challenger>(
-    a_packed: &[u8],
-    b_packed: &[u8],
-    c_packed: &[u8],
-    m: usize,
-    padding: &PaddingSpec,
-    challenger: &mut C,
-    stripe_c: univariate_skip_optimized::StripeC<'_>,
-    ab_pre: Option<&univariate_skip_optimized::Round1AbPre>,
-) -> (ZerocheckProof, ZerocheckClaim, Vec<F128>, Option<Vec<Vec<F128>>>) {
-    let (proof, claim, captured, banked) = prove_packed_padded_inner(
+    prove_packed_padded_capture_s_hat_v_c_with_grinding(
         a_packed,
         b_packed,
         c_packed,
         m,
         padding,
-        true,
+        ZerocheckGrinding::disabled(),
         challenger,
-        Some(stripe_c),
-        ab_pre,
+    )
+}
+
+/// [`prove_packed_padded_capture_s_hat_v_c`] with an explicit grinding
+/// policy.  The returned `s_hat_v_c` is unchanged; only the Fiat--Shamir
+/// transcript and nonce payload differ when grinding is enabled.
+pub fn prove_packed_padded_capture_s_hat_v_c_with_grinding<C: Challenger>(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    c_packed: &[u8],
+    m: usize,
+    padding: &PaddingSpec,
+    grinding: ZerocheckGrinding,
+    challenger: &mut C,
+) -> (ZerocheckProof, ZerocheckClaim, Vec<F128>) {
+    let (proof, claim, captured) = prove_packed_padded_inner(
+        a_packed, b_packed, c_packed, m, padding, grinding, true, challenger,
     );
     (
         proof,
         claim,
         captured.expect("capture=true must produce s_hat_v_c"),
-        banked,
     )
 }
 
@@ -285,16 +543,10 @@ fn prove_packed_padded_inner<C: Challenger>(
     c_packed: &[u8],
     m: usize,
     padding: &PaddingSpec,
+    grinding: ZerocheckGrinding,
     capture_s_hat_v_c: bool,
     challenger: &mut C,
-    stripe_c: Option<univariate_skip_optimized::StripeC<'_>>,
-    ab_pre: Option<&univariate_skip_optimized::Round1AbPre>,
-) -> (
-    ZerocheckProof,
-    ZerocheckClaim,
-    Option<Vec<F128>>,
-    Option<Vec<Vec<F128>>>,
-) {
+) -> (ZerocheckProof, ZerocheckClaim, Option<Vec<F128>>) {
     let k_skip = K_SKIP;
     const N_INNER: usize = 7; // 3 small + 4 medium fixed-constant eq dims
     assert!(
@@ -307,6 +559,7 @@ fn prove_packed_padded_inner<C: Challenger>(
     assert_eq!(b_packed.len(), expected_bytes);
     assert_eq!(c_packed.len(), expected_bytes);
     let n_mlv = m - k_skip;
+    let mut grinding_nonces = Vec::with_capacity(grinding.nonce_count(m));
 
     challenger.observe_label(b"flock-zerocheck-v0");
 
@@ -319,7 +572,13 @@ fn prove_packed_padded_inner<C: Challenger>(
     //   r[k_skip+3..k_skip+7]       — protocol medium-eq constants β_i
     //   r[k_skip+7..m]              — sampled (the "outer" eq weights for
     //                                  the URM and multilinear rounds)
-    let r_skip = challenger.sample_f128_vec(k_skip);
+    let r_skip = if let Some(bits) = grinding.initial_bits(m) {
+        let (nonce, r_skip) = challenger.grind_pow_and_sample_f128_vec(bits, k_skip);
+        grinding_nonces.push(nonce);
+        r_skip
+    } else {
+        challenger.sample_f128_vec(k_skip)
+    };
     let r_outer = challenger.sample_f128_vec(m - k_skip - N_INNER);
     let mut r = vec![F128::ZERO; m];
     r[..k_skip].copy_from_slice(&r_skip);
@@ -343,9 +602,9 @@ fn prove_packed_padded_inner<C: Challenger>(
     let ntt_s = AdditiveNttGf8::new(k_skip, F8::ZERO);
     let ntt_l = AdditiveNttGf8::new(k_skip, F8(1u8 << k_skip));
     let inv_table = InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
-    let (round1_ab_opt, round1_c_opt, s_hat_v_c, banked_s_hat_v_c) = if capture_s_hat_v_c {
-        let (ab, c, s, banked) = match stripe_c {
-            Some(sc) => crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_extract_c_packed_padded_with_s_hat_v_stripe_c(
+    let (round1_ab_opt, round1_c_opt, s_hat_v_c) = if capture_s_hat_v_c {
+        let (ab, c, s) =
+            crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_extract_c_packed_padded_with_s_hat_v(
                 a_packed,
                 b_packed,
                 c_packed,
@@ -354,29 +613,13 @@ fn prove_packed_padded_inner<C: Challenger>(
                 &r,
                 &inv_table,
                 padding,
-                sc,
-                ab_pre,
-            ),
-            None => {
-                let (ab, c, s) = crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_extract_c_packed_padded_with_s_hat_v(
-                    a_packed,
-                    b_packed,
-                    c_packed,
-                    m,
-                    k_skip,
-                    &r,
-                    &inv_table,
-                    padding,
-                );
-                (ab, c, s, None)
-            }
-        };
-        (ab, c, Some(s), banked)
+            );
+        (ab, c, Some(s))
     } else {
         let (ab, c) = round1_shift_reduce_extract_c_packed_padded(
             a_packed, b_packed, c_packed, m, k_skip, &r, &inv_table, padding,
         );
-        (ab, c, None, None)
+        (ab, c, None)
     };
     let c_s = c_s_f128();
     let round1_ab: Vec<F128> = round1_ab_opt.iter().map(|x| c_s * *x).collect();
@@ -391,7 +634,13 @@ fn prove_packed_padded_inner<C: Challenger>(
     // ---- 4. Observe round-1 message, sample z (URM fold point) ----
     challenger.observe_f128_slice(&round1_ab);
     challenger.observe_f128_slice(&round1_c);
-    let z = challenger.sample_f128();
+    let z = if let Some(bits) = grinding.skip_bits() {
+        let (nonce, z) = challenger.grind_pow_and_sample_f128(bits);
+        grinding_nonces.push(nonce);
+        z
+    } else {
+        challenger.sample_f128()
+    };
 
     // ---- 5. c_eval = ĉ(z, r_rest) via interpolation of round1_c at z ----
     //
@@ -411,143 +660,75 @@ fn prove_packed_padded_inner<C: Challenger>(
     let fold_table = UniSkipFoldTable::new(k_skip, z);
     let mut mlv_arg = vec![F128::ONE; n_mlv];
     mlv_arg[1..].copy_from_slice(&r[k_skip + 1..]);
-
-    let lookahead_on = !RS_TAIL_LOOKAHEAD_DISABLE.load(std::sync::atomic::Ordering::Relaxed);
-    // Integrated round-2 lookahead: round 2 emits the eight lookahead sums
-    // alongside its fold, from which BOTH round 2's and round 3's messages
-    // derive with zero further data passes — so the tail below starts
-    // directly with 4→1 passes and its `fold1` entry (a full-size pass that
-    // saves no traffic and pays the same product bill) disappears. aarch64
-    // only (the lookahead round-2 kernel has no AVX-512 arm); opt-in — see
-    // [`RS_TAIL_LOOKAHEAD_FORCE`] for why it is not yet the default.
-    let use_r2_lookahead = lookahead_on
-        && cfg!(all(target_arch = "aarch64", target_feature = "aes"))
-        && n_mlv >= 4
-        && (1usize << (m - k_skip)) >= 1024;
-
-    // Compact variant K (challenge-tree architecture): rounds 2..5 in TWO
-    // passes — the compact producer (48 B/pair anchors+packed-deltas, r2
-    // wire msg, r3 as a deferred quadratic in ρ₁) and the table-composed
-    // double fold (binds ρ₁,ρ₂ through λ-scaled byte tables, r4 wire msg,
-    // r5 deferred in ρ₃, quarter-size level out). The cascade tail resumes
-    // its ordinary cadence from the quarter level. Values and transcript
-    // identical (exact F128, pure reassociation; test-pinned). ρ-nonzero
-    // gates cover the two parity unscalings (each misses w.p. 2^-128).
-    // DEFAULT ON — certified 2026-08-27: mechanism sum (r2 + K fold +
-    // tail) 79.9-84.5 vs 85.9-87.9 ms, 3/3 disjoint, −4.9 avg at m=32 8T
-    // grind-free. The transcript tests pin value identity against the
-    // incumbent route via ZC_COMPACT_K_DISABLE.
-    let use_compact_k = lookahead_on
-        && cfg!(all(target_arch = "aarch64", target_feature = "aes"))
-        && n_mlv >= 7
-        && (1usize << (m - k_skip)) >= 1024
-        && r[k_skip + 1] != F128::ZERO
-        && r[k_skip + 3] != F128::ZERO
-        && !ZC_COMPACT_K_DISABLE.load(std::sync::atomic::Ordering::Relaxed);
-    let tail_cascade = use_r2_lookahead || use_compact_k;
-
-    let mut multilinear_msgs = Vec::with_capacity(n_mlv);
-    let mut mlv_rhos: Vec<F128> = Vec::with_capacity(n_mlv);
-    let (mut a_mlv, mut b_mlv, mut rho_prev, mut pending2, mut i);
-    if use_compact_k {
-        let (compact, m1a, mia, la3) = uni_skip_fold_round23_compact_padded(
-            a_packed, b_packed, m, k_skip, &fold_table, &mlv_arg, padding,
+    // Support-proportional prover (M6): under a multi-run count-derived spec
+    // the post-URM tables are zero outside the declared support (the live
+    // interval list). While that support is sparse (live·16 ≤ n), round 2 and
+    // the tail rounds fold/evaluate over the live intervals only — every
+    // skipped term carries an `a·b` factor of zero, so all messages and folded
+    // values are byte-identical to the dense path.
+    //
+    // The buffers hold the LIVE SPAN, not the padded domain: dead positions get
+    // no storage at all, so both the fold cost and the footprint are
+    // count-derived and the phase leaves the capacity axis entirely. When the
+    // tail leaves the sparse path — the live fraction crosses the gate, or the
+    // domain drops below the fused threshold and the naive kernels need global
+    // indexing — `expand_to_dense` scatters the live span back into a full
+    // padded buffer once. See [`multilinear::LiveLayout`].
+    let sparse_from_round2 = padding.as_single_run().is_none() && {
+        let list = padding.useful_block_intervals(k_skip);
+        let live_elems: usize = list.iter().map(|&(s, e)| e - s).sum();
+        let n_out = 1usize << n_mlv;
+        n_out >= 8 && live_elems * sparse_tail_gate() <= n_out
+    };
+    // `store` is the compaction map for the tail buffers: `Some` means they
+    // hold ONLY the live span, `None` means the full padded domain. `domain`
+    // is the logical multilinear size and halves every round regardless —
+    // under compaction it is no longer `a_mlv.len()`.
+    let mut domain = 1usize << n_mlv;
+    let (mut a_mlv, mut b_mlv, msg_1, msg_inf, mut store) = if sparse_from_round2 {
+        let (a, b, m1, mi, st) = multilinear::uni_skip_fold_and_round_pair_runs_sparse(
+            a_packed,
+            b_packed,
+            m,
+            k_skip,
+            &fold_table,
+            &mlv_arg,
+            padding,
         );
-        multilinear_msgs.push((m1a, mia));
-        challenger.observe_f128(m1a);
-        challenger.observe_f128(mia);
-        let rho1 = challenger.sample_f128();
-        mlv_rhos.push(rho1);
-        let (m1b, mib) = eval_deferred_round_msg(&la3, rho1);
-        multilinear_msgs.push((m1b, mib));
-        challenger.observe_f128(m1b);
-        challenger.observe_f128(mib);
-        let rho2 = challenger.sample_f128();
-        mlv_rhos.push(rho2);
-        if zc_timing {
-            eprintln!(
-                "[zc-timing] round2 fused fold: {:.2} ms",
-                t_round2.elapsed().as_secs_f64() * 1e3
-            );
-        }
-        let t_k = std::time::Instant::now();
-        let n_groups = 1usize << (m - k_skip - 2);
-        let mut a_q = crate::scratch::take_f128(n_groups);
-        let mut b_q = crate::scratch::take_f128(n_groups);
-        let mut r_next4 = vec![F128::ONE; n_mlv - 2];
-        r_next4[1..].copy_from_slice(&r[k_skip + 3..]);
-        let (m4_1, m4_inf, la5) = fold2_compact_round45_into(
-            &compact, &fold_table, rho1, rho2, &r_next4, &mut a_q, &mut b_q,
-        );
-        compact.recycle();
-        multilinear_msgs.push((m4_1, m4_inf));
-        challenger.observe_f128(m4_1);
-        challenger.observe_f128(m4_inf);
-        let rho3 = challenger.sample_f128();
-        mlv_rhos.push(rho3);
-        let (m5_1, m5_inf) = eval_deferred_round_msg(&la5, rho3);
-        multilinear_msgs.push((m5_1, m5_inf));
-        challenger.observe_f128(m5_1);
-        challenger.observe_f128(m5_inf);
-        let rho4 = challenger.sample_f128();
-        mlv_rhos.push(rho4);
-        if zc_timing {
-            eprintln!(
-                "[zc-timing] compact K double fold: {:.2} ms",
-                t_k.elapsed().as_secs_f64() * 1e3
-            );
-        }
-        a_mlv = a_q;
-        b_mlv = b_q;
-        rho_prev = rho3;
-        pending2 = Some(rho4);
-        i = 3;
-    } else if use_r2_lookahead {
-        let (a, b, q) = multilinear::uni_skip_fold_and_round_pair_lookahead_packed_padded(
-            a_packed, b_packed, m, k_skip, &fold_table, &mlv_arg, padding,
-        );
-        a_mlv = a;
-        b_mlv = b;
-        // Round 2's message from the Y∈{0,1} columns — identical to the
-        // classic kernel's return (mlv_arg[0] = ONE Convention A).
-        let (m1a, mia) = lookahead_msg_first(&q, mlv_arg[1]);
-        multilinear_msgs.push((m1a, mia));
-        challenger.observe_f128(m1a);
-        challenger.observe_f128(mia);
-        let rho_a = challenger.sample_f128();
-        mlv_rhos.push(rho_a);
-        // Round 3's message: the column polynomials evaluated at ρ₁.
-        let (m1b, mib) = lookahead_msg_second(&q, rho_a);
-        multilinear_msgs.push((m1b, mib));
-        challenger.observe_f128(m1b);
-        challenger.observe_f128(mib);
-        let rho_b = challenger.sample_f128();
-        mlv_rhos.push(rho_b);
-        rho_prev = rho_a;
-        pending2 = Some(rho_b);
-        i = 1;
+        (a, b, m1, mi, Some(st))
     } else {
-        let (a, b, msg_1, msg_inf) = uni_skip_fold_and_round_pair_optimized_packed_padded(
-            a_packed, b_packed, m, k_skip, &fold_table, &mlv_arg, padding,
+        let (a, b, m1, mi) = uni_skip_fold_and_round_pair_optimized_packed_padded(
+            a_packed,
+            b_packed,
+            m,
+            k_skip,
+            &fold_table,
+            &mlv_arg,
+            padding,
         );
-        a_mlv = a;
-        b_mlv = b;
-        multilinear_msgs.push((msg_1, msg_inf));
-        challenger.observe_f128(msg_1);
-        challenger.observe_f128(msg_inf);
-        let rho = challenger.sample_f128();
-        mlv_rhos.push(rho);
-        rho_prev = rho;
-        pending2 = None;
-        i = 0;
-    }
-    if zc_timing && !use_compact_k {
+        (a, b, m1, mi, None)
+    };
+
+    if zc_timing {
         eprintln!(
             "[zc-timing] round2 fused fold: {:.2} ms",
             t_round2.elapsed().as_secs_f64() * 1e3
         );
     }
     let t_tail = std::time::Instant::now();
+    let mut multilinear_msgs = Vec::with_capacity(n_mlv);
+    multilinear_msgs.push((msg_1, msg_inf));
+    challenger.observe_f128(msg_1);
+    challenger.observe_f128(msg_inf);
+    let mut mlv_rhos: Vec<F128> = Vec::with_capacity(n_mlv);
+    let rho = if let Some(bits) = grinding.multilinear_round_bits() {
+        let (nonce, rho) = challenger.grind_pow_and_sample_f128(bits);
+        grinding_nonces.push(nonce);
+        rho
+    } else {
+        challenger.sample_f128()
+    };
+    mlv_rhos.push(rho);
 
     // ---- 7. Rounds 3..(n_mlv + 1) — AB only (c is done) ----
     //
@@ -572,66 +753,17 @@ fn prove_packed_padded_inner<C: Challenger>(
         (Vec::new(), Vec::new())
     };
 
-    // LOOKAHEAD/cascade tail (idea from the challenge tree, machinery shared
-    // with the AG-skip tail): one 4→1 pass serves TWO rounds. The pass folds
-    // the deferred challenges and, from the four folded values held per
-    // output position, accumulates the sums that determine the next two
-    // messages as polynomials — the first evaluated directly, the second a
-    // quadratic in the next challenge, evaluated after sampling with zero
-    // data passes. Deletes the intermediate state's DRAM round trip per round
-    // pair; the emitted messages (and hence the transcript) are identical.
-    //
-    // Invariant: `a_mlv`/`b_mlv` are folded through every sampled challenge
-    // EXCEPT `rho_prev` (and `pending2`, if set). Entry state comes from the
-    // round-2 branch above (integrated lookahead: two challenges deferred,
-    // one tail message already emitted; classic: one deferred, none).
-    while i < n_mlv - 1 {
-        let len = a_mlv.len();
-        // Lookahead needs TWO more message rounds and the fused-size floor.
-        if tail_cascade && i + 2 <= n_mlv - 1 && len >= 1024 {
-            let out_len = if pending2.is_some() { len / 4 } else { len / 2 };
-            let (ao, bo) = (&mut a_nxt[..out_len], &mut b_nxt[..out_len]);
-            let q = if let Some(r2) = pending2 {
-                fold2_lookahead_into(&a_mlv, &b_mlv, ao, bo, (rho_prev, r2), &r[k_skip + i + 3..])
-            } else {
-                fold1_lookahead_into(
-                    &a_mlv,
-                    &b_mlv,
-                    ao,
-                    bo,
-                    (rho_prev, F128::ZERO),
-                    &r[k_skip + i + 3..],
-                )
-            };
-            std::mem::swap(&mut a_mlv, &mut a_nxt);
-            std::mem::swap(&mut b_mlv, &mut b_nxt);
-            a_mlv.truncate(out_len);
-            b_mlv.truncate(out_len);
-            let (m1a, mia) = lookahead_msg_first(&q, r[k_skip + i + 2]);
-            multilinear_msgs.push((m1a, mia));
-            challenger.observe_f128(m1a);
-            challenger.observe_f128(mia);
-            let rho_a = challenger.sample_f128();
-            mlv_rhos.push(rho_a);
-            let (m1b, mib) = lookahead_msg_second(&q, rho_a);
-            multilinear_msgs.push((m1b, mib));
-            challenger.observe_f128(m1b);
-            challenger.observe_f128(mib);
-            let rho_b = challenger.sample_f128();
-            mlv_rhos.push(rho_b);
-            rho_prev = rho_a;
-            pending2 = Some(rho_b);
-            i += 2;
-            continue;
-        }
-        // Leaving lookahead mode: resolve the deferred fold before classic
-        // processing (arrays here are small — the serial fold is free).
-        if let Some(r2) = pending2.take() {
-            fold_in_place_pair(&mut a_mlv, &mut b_mlv, rho_prev);
-            rho_prev = r2;
-            continue;
-        }
-        let log_n_before = a_mlv.len().trailing_zeros() as usize;
+    // `sparse_dirty` tracks whether the current buffers' dead regions hold
+    // unwritten scratch. Under compaction the dead regions are not stored at
+    // all, so leaving the sparse path means EXPANDING (scatter + zero-fill)
+    // rather than zeroing in place.
+    let mut sparse_dirty = sparse_from_round2;
+
+    for i in 0..(n_mlv - 1) {
+        let rho_prev = mlv_rhos[i];
+        // From the LOGICAL domain, not the buffer: under live-span storage
+        // `a_mlv.len()` is the compacted length and need not be a power of two.
+        let log_n_before = domain.trailing_zeros() as usize;
 
         // r_next for the next round's message: length log_n_before - 1.
         // r_next[0] = ONE (Convention A factor); r_next[1..] are the eq
@@ -639,7 +771,66 @@ fn prove_packed_padded_inner<C: Challenger>(
         let mut r_next = vec![F128::ONE; log_n_before - 1];
         r_next[1..].copy_from_slice(&r[k_skip + i + 2..]);
 
-        let (m1, mi) = if log_n_before >= 10 {
+        // The sparse path also requires the fused domain (>= 1024): below it
+        // the naive kernels index globally, so compaction must be undone.
+        let use_sparse = store
+            .as_ref()
+            .is_some_and(|st| domain >= 1024 && st.len() * sparse_tail_gate() <= domain);
+        if !use_sparse
+            && let Some(st) = store.take()
+            && sparse_dirty
+        {
+            // Back to global indexing: scatter the live span into a full
+            // padded buffer and zero the rest.
+            let a_full = multilinear::expand_to_dense(&a_mlv, &st, domain);
+            let b_full = multilinear::expand_to_dense(&b_mlv, &st, domain);
+            crate::scratch::give_f128(std::mem::replace(&mut a_mlv, a_full));
+            crate::scratch::give_f128(std::mem::replace(&mut b_mlv, b_full));
+            // The ping-pong scratch shrank toward the compacted cap while
+            // the tail ran sparse; the dense fold below slices
+            // `a_nxt[..domain/2]`, so the scratch must re-grow with the
+            // buffers (the recorded gate=4 panic: range end 1024 out of
+            // range for slice of length 678). A fragmented near-full spec
+            // can force this exit at `domain >= 1024` even at gate = 1 —
+            // interval ends round `st.len()` outward past the domain.
+            if a_nxt.len() < domain / 2 {
+                crate::scratch::give_f128(a_nxt);
+                crate::scratch::give_f128(b_nxt);
+                a_nxt = crate::scratch::take_f128(domain / 2);
+                b_nxt = crate::scratch::take_f128(domain / 2);
+            }
+            sparse_dirty = false;
+        }
+
+        let (m1, mi) = if use_sparse {
+            let st = store.as_ref().expect("use_sparse implies store");
+            // Output storage is bounded by the input's: shrinking pairs can
+            // only round outward by one slot per interval end.
+            let cap = st.len() + 2 * st.intervals().len() + 2;
+            if a_nxt.len() < cap {
+                crate::scratch::give_f128(a_nxt);
+                crate::scratch::give_f128(b_nxt);
+                a_nxt = crate::scratch::take_f128(cap);
+                b_nxt = crate::scratch::take_f128(cap);
+            }
+            let (m1, mi, store_out) = fold_and_round_pair_sparse_into(
+                &a_mlv,
+                &b_mlv,
+                &mut a_nxt[..cap],
+                &mut b_nxt[..cap],
+                rho_prev,
+                &r_next,
+                st,
+                domain,
+            );
+            std::mem::swap(&mut a_mlv, &mut a_nxt);
+            std::mem::swap(&mut b_mlv, &mut b_nxt);
+            a_mlv.truncate(store_out.len());
+            b_mlv.truncate(store_out.len());
+            store = Some(store_out);
+            sparse_dirty = true;
+            (m1, mi)
+        } else if log_n_before >= 10 {
             let half = a_mlv.len() / 2;
             let (m1, mi) = fold_and_compute_round_pair_into(
                 &a_mlv,
@@ -663,20 +854,28 @@ fn prove_packed_padded_inner<C: Challenger>(
             round_pair_naive(&a_mlv, &b_mlv, &r_next)
         };
 
+        domain /= 2;
         multilinear_msgs.push((m1, mi));
         challenger.observe_f128(m1);
         challenger.observe_f128(mi);
-        rho_prev = challenger.sample_f128();
-        mlv_rhos.push(rho_prev);
-        i += 1;
+        let rho = if let Some(bits) = grinding.multilinear_round_bits() {
+            let (nonce, rho) = challenger.grind_pow_and_sample_f128(bits);
+            grinding_nonces.push(nonce);
+            rho
+        } else {
+            challenger.sample_f128()
+        };
+        mlv_rhos.push(rho);
     }
+    debug_assert!(
+        store.is_none(),
+        "the tail must leave live-span storage before the final binding \
+         (domain drops below the fused threshold, forcing expansion)"
+    );
 
-    // ---- 8. Final binding: one or (after a trailing lookahead pass) two
-    // deferred challenges remain unfolded ----
-    fold_in_place_pair(&mut a_mlv, &mut b_mlv, rho_prev);
-    if let Some(r2) = pending2 {
-        fold_in_place_pair(&mut a_mlv, &mut b_mlv, r2);
-    }
+    // ---- 8. Final binding at ρ_{n_mlv} (the last challenge) ----
+    let rho_last = *mlv_rhos.last().expect("at least one ρ sampled");
+    fold_in_place_pair(&mut a_mlv, &mut b_mlv, rho_last);
     debug_assert_eq!(a_mlv.len(), 1);
     debug_assert_eq!(b_mlv.len(), 1);
 
@@ -720,6 +919,7 @@ fn prove_packed_padded_inner<C: Challenger>(
         final_a_eval,
         final_b_eval,
         final_c_eval,
+        grinding_nonces,
     };
     let claim = ZerocheckClaim {
         z,
@@ -729,7 +929,7 @@ fn prove_packed_padded_inner<C: Challenger>(
         b_eval: final_b_eval,
         c_eval: final_c_eval,
     };
-    (proof, claim, s_hat_v_c, banked_s_hat_v_c)
+    (proof, claim, s_hat_v_c)
 }
 
 /// Verify a zerocheck proof for an instance over `{0,1}^log_n`.
@@ -743,6 +943,18 @@ fn prove_packed_padded_inner<C: Challenger>(
 pub fn verify<C: Challenger>(
     log_n: usize,
     proof: &ZerocheckProof,
+    challenger: &mut C,
+) -> Result<ZerocheckClaim, VerifyError> {
+    verify_with_grinding(log_n, proof, ZerocheckGrinding::disabled(), challenger)
+}
+
+/// [`verify`] with an explicit Fiat--Shamir grinding policy.  The policy is
+/// a verifier parameter, not prover-controlled proof metadata: it is part of
+/// the security configuration agreed before verification starts.
+pub fn verify_with_grinding<C: Challenger>(
+    log_n: usize,
+    proof: &ZerocheckProof,
+    grinding: ZerocheckGrinding,
     challenger: &mut C,
 ) -> Result<ZerocheckClaim, VerifyError> {
     let m = log_n;
@@ -774,11 +986,26 @@ pub fn verify<C: Challenger>(
             got: proof.multilinear_rounds.len(),
         });
     }
+    if proof.grinding_nonces.len() != grinding.nonce_count(m) {
+        return Err(VerifyError::BadGrindingNonceCount {
+            expected: grinding.nonce_count(m),
+            got: proof.grinding_nonces.len(),
+        });
+    }
 
     challenger.observe_label(b"flock-zerocheck-v0");
+    let mut nonce_idx = 0usize;
 
     // ---- Re-derive r (in lockstep with prove_packed) ----
-    let r_skip = challenger.sample_f128_vec(k_skip);
+    let r_skip = if let Some(bits) = grinding.initial_bits(m) {
+        let r_skip = challenger
+            .verify_pow_and_sample_f128_vec(proof.grinding_nonces[nonce_idx], bits, k_skip)
+            .ok_or(VerifyError::InvalidGrindingNonce { which: "initial" })?;
+        nonce_idx += 1;
+        r_skip
+    } else {
+        challenger.sample_f128_vec(k_skip)
+    };
     let r_outer = challenger.sample_f128_vec(m - k_skip - N_INNER);
     let mut r = vec![F128::ZERO; m];
     r[..k_skip].copy_from_slice(&r_skip);
@@ -793,7 +1020,15 @@ pub fn verify<C: Challenger>(
     // ---- Observe round-1 messages, sample z ----
     challenger.observe_f128_slice(&proof.round1_ab);
     challenger.observe_f128_slice(&proof.round1_c);
-    let z = challenger.sample_f128();
+    let z = if let Some(bits) = grinding.skip_bits() {
+        let z = challenger
+            .verify_pow_and_sample_f128(proof.grinding_nonces[nonce_idx], bits)
+            .ok_or(VerifyError::InvalidGrindingNonce { which: "skip" })?;
+        nonce_idx += 1;
+        z
+    } else {
+        challenger.sample_f128()
+    };
 
     // ---- Reconstruct ĉ(z, r_rest) from round1_c ----
     //
@@ -826,8 +1061,13 @@ pub fn verify<C: Challenger>(
         .map(|(x, y)| *x + *y)
         .collect();
     let combined_at_z = interpolate_at_z_combined(&combined_at_lambda, k_skip, z);
-    let p_c_at_z = interpolate_at_z_on_lambda(&proof.round1_c, k_skip, z);
-    let mut c_running = combined_at_z + p_c_at_z;
+    // `P^C(z)` was already computed above as `computed_c_eval` — same function,
+    // same arguments. Recomputing it cost a second Λ-interpolation: under the
+    // textbook weights that was 8,256 constraints, 4.5% of a BLAKE3 boolean
+    // verify's entire arithmetic, for a value already in hand (measured,
+    // `benches/verifier_mul_count.rs`). Sub-millisecond natively, which is why
+    // it went unnoticed.
+    let mut c_running = combined_at_z + computed_c_eval;
 
     // ---- Multilinear sumcheck chain ----
     //
@@ -856,13 +1096,24 @@ pub fn verify<C: Challenger>(
 
         challenger.observe_f128(msg_1);
         challenger.observe_f128(msg_inf);
-        let rho = challenger.sample_f128();
+        let rho = if let Some(bits) = grinding.multilinear_round_bits() {
+            let rho = challenger
+                .verify_pow_and_sample_f128(proof.grinding_nonces[nonce_idx], bits)
+                .ok_or(VerifyError::InvalidGrindingNonce {
+                    which: "multilinear",
+                })?;
+            nonce_idx += 1;
+            rho
+        } else {
+            challenger.sample_f128()
+        };
         mlv_rhos.push(rho);
 
         let one_plus_rho = F128::ONE + rho;
         // G(ρ) = G(0)·(1+ρ) + G(1)·ρ + G(∞)·ρ·(1+ρ).
         c_running = g0 * one_plus_rho + g1 * rho + g_inf * rho * one_plus_rho;
     }
+    debug_assert_eq!(nonce_idx, proof.grinding_nonces.len());
 
     // ---- AB sumcheck final consistency ----
     //
@@ -983,101 +1234,109 @@ mod tests {
         }
     }
 
-    /// The lookahead/cascade tail emits a byte-identical transcript to the
-    /// classic per-round tail: same messages, same challenges, same claim.
-    /// (The lookahead messages are the same polynomial values, derived
-    /// without the intermediate data pass — this pins that algebra.)
+    /// The 128-bit-per-error grinding schedule is carried on the proof,
+    /// checked before every challenge it protects, and recorded as ordinary
+    /// `Pow` operations for the recursion transcript tape.
     #[test]
-    fn lookahead_tail_transcript_identical_to_classic() {
-        use std::sync::atomic::Ordering;
-        for &m in &[16usize, 18] {
-            let mut rng = Rng::new(7700 + m as u64);
-            let a = rng.bits(1 << m);
-            let b = rng.bits(1 << m);
-            let c: Vec<bool> = a.iter().zip(&b).map(|(x, y)| *x & *y).collect();
-            let (a_p, b_p, c_p) = pack_abc(&a, &b, &c);
+    fn per_challenge_grinding_roundtrip_and_tape() {
+        use crate::transcript_record::{RecordingChallenger, TranscriptOp};
 
-            let mut ch1 = FsChallenger::new(b"flock-test-v0");
-            let (proof_la, claim_la) = prove_packed(&a_p, &b_p, &c_p, m, &mut ch1);
+        let m = 13;
+        let mut rng = Rng::new(0x1280_0001);
+        let a = rng.bits(1 << m);
+        let b = rng.bits(1 << m);
+        let c: Vec<bool> = a.iter().zip(&b).map(|(x, y)| *x & *y).collect();
+        let (a_p, b_p, c_p) = pack_abc(&a, &b, &c);
+        let grinding = ZerocheckGrinding::per_challenge_128();
 
-            RS_TAIL_LOOKAHEAD_DISABLE.store(true, Ordering::Relaxed);
-            let mut ch2 = FsChallenger::new(b"flock-test-v0");
-            let (proof_cl, claim_cl) = prove_packed(&a_p, &b_p, &c_p, m, &mut ch2);
-            RS_TAIL_LOOKAHEAD_DISABLE.store(false, Ordering::Relaxed);
+        let mut ch_prove = FsChallenger::new(b"flock-zc-grinding-v0");
+        let (proof, claim_p) =
+            prove_packed_with_grinding(&a_p, &b_p, &c_p, m, grinding, &mut ch_prove);
+        assert_eq!(proof.grinding_nonces.len(), grinding.nonce_count(m));
+        assert_eq!(grinding.initial_bits(m), Some(4));
+        assert_eq!(grinding.skip_bits(), Some(7));
+        assert_eq!(grinding.multilinear_round_bits(), Some(2));
 
-            assert_eq!(
-                proof_la.multilinear_rounds, proof_cl.multilinear_rounds,
-                "tail messages diverge at m={m}"
-            );
-            assert_eq!(proof_la.round1_ab, proof_cl.round1_ab, "m={m}");
-            assert_eq!(claim_la, claim_cl, "claim diverges at m={m}");
-        }
+        let mut rec = RecordingChallenger::new(FsChallenger::new(b"flock-zc-grinding-v0"));
+        let claim_v = verify_with_grinding(m, &proof, grinding, &mut rec)
+            .expect("grinded honest proof must verify");
+        assert_eq!(claim_p, claim_v);
+
+        let pow_bits: Vec<u32> = rec
+            .shape()
+            .ops()
+            .iter()
+            .filter_map(|op| match op {
+                TranscriptOp::Pow { bits } | TranscriptOp::LegacyPow { bits } => Some(*bits),
+                _ => None,
+            })
+            .collect();
+        let mut expected = vec![4, 7];
+        expected.extend(std::iter::repeat_n(2, m - K_SKIP));
+        assert_eq!(
+            pow_bits, expected,
+            "one PoW immediately precedes each protected challenge"
+        );
+
+        let mut missing = proof.clone();
+        missing.grinding_nonces.pop();
+        let mut ch_bad = FsChallenger::new(b"flock-zc-grinding-v0");
+        assert!(matches!(
+            verify_with_grinding(m, &missing, grinding, &mut ch_bad),
+            Err(VerifyError::BadGrindingNonceCount { .. })
+        ));
     }
 
-    /// Compact variant K (rounds 2..5 in two passes) must produce the exact
-    /// transcript of the incumbent route — messages, claim, everything.
-    /// m = 16/18 exercise real tail depth (n_mlv = 10/12 >= 7 gate).
+    /// A deliberately small, opt-in overhead probe.  It isolates zerocheck's
+    /// PoW work from PCS query/profile differences; use a release build for a
+    /// meaningful number:
+    ///
+    /// `cargo test --release -p flock-core zerocheck_grinding_overhead_probe -- --ignored --nocapture`
     #[test]
-    fn compact_k_transcript_identical_to_classic() {
-        use std::sync::atomic::Ordering;
-        for &m in &[16usize, 18] {
-            let mut rng = Rng::new(8800 + m as u64);
-            let a = rng.bits(1 << m);
-            let b = rng.bits(1 << m);
-            let c: Vec<bool> = a.iter().zip(&b).map(|(x, y)| *x & *y).collect();
-            let (a_p, b_p, c_p) = pack_abc(&a, &b, &c);
+    #[ignore]
+    fn zerocheck_grinding_overhead_probe() {
+        use std::time::Instant;
 
-            let mut ch1 = FsChallenger::new(b"flock-test-v0");
-            let (proof_k, claim_k) = prove_packed(&a_p, &b_p, &c_p, m, &mut ch1);
-
-            ZC_COMPACT_K_DISABLE.store(true, Ordering::Relaxed);
-            let mut ch2 = FsChallenger::new(b"flock-test-v0");
-            let (proof_cl, claim_cl) = prove_packed(&a_p, &b_p, &c_p, m, &mut ch2);
-            ZC_COMPACT_K_DISABLE.store(false, Ordering::Relaxed);
-
-            assert_eq!(
-                proof_k.multilinear_rounds, proof_cl.multilinear_rounds,
-                "compact-K tail messages diverge at m={m}"
-            );
-            assert_eq!(proof_k.round1_ab, proof_cl.round1_ab, "m={m}");
-            assert_eq!(claim_k, claim_cl, "compact-K claim diverges at m={m}");
+        let m = 17;
+        let mut rng = Rng::new(0x1280_BEEF);
+        let a = rng.bits(1 << m);
+        let b = rng.bits(1 << m);
+        let c: Vec<bool> = a.iter().zip(&b).map(|(x, y)| *x & *y).collect();
+        let (a_p, b_p, c_p) = pack_abc(&a, &b, &c);
+        let run = |grinding: ZerocheckGrinding| {
+            let t = Instant::now();
+            let mut ch = FsChallenger::new(b"flock-zc-grinding-probe-v0");
+            let (proof, _) = prove_packed_with_grinding(&a_p, &b_p, &c_p, m, grinding, &mut ch);
+            let elapsed = t.elapsed();
+            (elapsed, proof.grinding_nonces.len())
+        };
+        const REPS: usize = 5;
+        let mut plain = Vec::with_capacity(REPS);
+        let mut grinded = Vec::with_capacity(REPS);
+        let mut plain_nonces = 0;
+        let mut grinded_nonces = 0;
+        for _ in 0..REPS {
+            let (t, n) = run(ZerocheckGrinding::disabled());
+            plain.push(t);
+            plain_nonces = n;
+            let (t, n) = run(ZerocheckGrinding::per_challenge_128());
+            grinded.push(t);
+            grinded_nonces = n;
         }
-    }
-
-    /// The degenerate-b fast path (all-ones b rows skip their folds and
-    /// provably-zero products) must be value-preserving: transcript identity
-    /// with b ≡ 1 on half the domain, mixed with random rows — exercises
-    /// fully-degenerate groups, half-degenerate groups, and the general arm.
-    #[test]
-    fn compact_k_degen_b_transcript_identical() {
-        use std::sync::atomic::Ordering;
-        for &m in &[16usize, 18] {
-            let mut rng = Rng::new(9900 + m as u64);
-            let a = rng.bits(1 << m);
-            let mut b = rng.bits(1 << m);
-            // First half of the rows: b ≡ 1 (row = 128 consecutive bits at
-            // the packed-row granularity used by round 2's 8-byte codes).
-            for (i, slot) in b.iter_mut().enumerate().take(1 << (m - 1)) {
-                let _ = i;
-                *slot = true;
-            }
-            let c: Vec<bool> = a.iter().zip(&b).map(|(x, y)| *x & *y).collect();
-            let (a_p, b_p, c_p) = pack_abc(&a, &b, &c);
-
-            let mut ch1 = FsChallenger::new(b"flock-test-v0");
-            let (proof_k, claim_k) = prove_packed(&a_p, &b_p, &c_p, m, &mut ch1);
-
-            ZC_COMPACT_K_DISABLE.store(true, Ordering::Relaxed);
-            let mut ch2 = FsChallenger::new(b"flock-test-v0");
-            let (proof_cl, claim_cl) = prove_packed(&a_p, &b_p, &c_p, m, &mut ch2);
-            ZC_COMPACT_K_DISABLE.store(false, Ordering::Relaxed);
-
-            assert_eq!(
-                proof_k.multilinear_rounds, proof_cl.multilinear_rounds,
-                "degen-b compact-K messages diverge at m={m}"
-            );
-            assert_eq!(claim_k, claim_cl, "degen-b claim diverges at m={m}");
-        }
+        plain.sort_unstable();
+        grinded.sort_unstable();
+        let plain = plain[REPS / 2];
+        let grinded = grinded[REPS / 2];
+        println!(
+            "zerocheck grinding (m={m}, median of {REPS}): plain {:.2} ms | \
+             grinded {:.2} ms | delta {:.2} ms | {} PoW nonces",
+            plain.as_secs_f64() * 1e3,
+            grinded.as_secs_f64() * 1e3,
+            grinded.saturating_sub(plain).as_secs_f64() * 1e3,
+            grinded_nonces,
+        );
+        assert_eq!(plain_nonces, 0);
+        assert_eq!(grinded_nonces, 2 + m - K_SKIP);
     }
 
     /// **Verify rejects byte-mutated proofs.** Walk each component of the
@@ -1401,6 +1660,408 @@ mod tests {
                 verify(m, &bad, &mut ch).is_err(),
                 "msg_1 tamper round {idx} ACCEPTED"
             );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Run-list PaddingSpec.
+    // -----------------------------------------------------------------------
+
+    /// Run-list construction/accessor sanity: canonical forms, extents,
+    /// single-run detection, and useful-interval merging.
+    #[test]
+    fn padding_spec_run_list_accessors() {
+        // dense(m) is a single run tiling the domain.
+        let dense = PaddingSpec::dense(5);
+        assert_eq!(
+            dense.as_single_run(),
+            Some(PaddingRun {
+                k_log: 5,
+                useful_bits_per_block: 32,
+                n_blocks: 1
+            })
+        );
+        assert_eq!(dense.covered_bits(), 32);
+        assert_eq!(dense.useful_intervals(), vec![(0, 32)]);
+
+        // uniform: one interval per block; partial useful prefixes don't merge.
+        let uni = PaddingSpec::uniform(4, 10, 3);
+        assert_eq!(uni.covered_bits(), 48);
+        assert_eq!(uni.useful_intervals(), vec![(0, 10), (16, 26), (32, 42)]);
+        assert!(uni.as_single_run().is_some());
+
+        // Fully-useful blocks merge into one interval, across run boundaries
+        // too when the next run starts where the previous one's data ends.
+        let multi = PaddingSpec::from_runs(vec![
+            PaddingRun {
+                k_log: 4,
+                useful_bits_per_block: 16,
+                n_blocks: 2,
+            },
+            PaddingRun {
+                k_log: 3,
+                useful_bits_per_block: 4,
+                n_blocks: 1,
+            },
+        ]);
+        assert!(multi.as_single_run().is_none());
+        assert_eq!(multi.covered_bits(), 40);
+        assert_eq!(multi.useful_intervals(), vec![(0, 36)]);
+
+        // Zero-block runs are dropped (canonical form), so a list that
+        // degenerates to one real run still takes the single-run fast path;
+        // zero-useful runs cover address space but contribute no intervals.
+        let canon = PaddingSpec::from_runs(vec![
+            PaddingRun {
+                k_log: 4,
+                useful_bits_per_block: 16,
+                n_blocks: 0,
+            },
+            PaddingRun {
+                k_log: 3,
+                useful_bits_per_block: 0,
+                n_blocks: 2,
+            },
+        ]);
+        assert_eq!(canon.runs().len(), 1);
+        assert!(canon.as_single_run().is_some());
+        assert_eq!(canon.covered_bits(), 16);
+        assert_eq!(canon.useful_intervals(), Vec::<(usize, usize)>::new());
+    }
+
+    /// A run whose useful prefix exceeds its block size is malformed.
+    #[test]
+    #[should_panic(expected = "exceeds block size")]
+    fn padding_spec_rejects_oversized_useful_prefix() {
+        let _ = PaddingSpec::uniform(4, 17, 1);
+    }
+
+    /// Zero every bit outside the spec's useful intervals (honest padding).
+    fn zero_outside_useful(spec: &PaddingSpec, bits: &mut [bool]) {
+        let mut useful = vec![false; bits.len()];
+        for (s, e) in spec.useful_intervals() {
+            useful[s..e].fill(true);
+        }
+        for (b, u) in bits.iter_mut().zip(&useful) {
+            if !*u {
+                *b = false;
+            }
+        }
+    }
+
+    /// **Single-run spec is byte-identical to the dense prover** (same proof,
+    /// same claim, same transcript position) on an honestly padded witness —
+    /// the run-list generalization must not perturb today's wire format.
+    /// Covers the BLAKE3 shape (k_log=14, useful=15409) over several blocks.
+    #[test]
+    fn prove_padded_single_run_matches_dense() {
+        let (m, k_log, useful_bits) = (17usize, 14usize, 15_409usize);
+        let padding = PaddingSpec::uniform(k_log, useful_bits, 1 << (m - k_log));
+
+        let mut rng = Rng::new(0x5111_C1E4);
+        let mut a = rng.bits(1 << m);
+        let mut b = rng.bits(1 << m);
+        zero_outside_useful(&padding, &mut a);
+        zero_outside_useful(&padding, &mut b);
+        let c: Vec<bool> = a.iter().zip(&b).map(|(x, y)| *x & *y).collect();
+        let (a_p, b_p, c_p) = pack_abc(&a, &b, &c);
+
+        let mut ch_dense = FsChallenger::new(b"flock-test-v0");
+        let (proof_dense, claim_dense) = prove_packed(&a_p, &b_p, &c_p, m, &mut ch_dense);
+
+        let mut ch_padded = FsChallenger::new(b"flock-test-v0");
+        let (proof_padded, claim_padded) =
+            prove_packed_padded(&a_p, &b_p, &c_p, m, &padding, &mut ch_padded);
+
+        assert_eq!(proof_dense, proof_padded, "proof mismatch");
+        assert_eq!(claim_dense, claim_padded, "claim mismatch");
+        // Transcript position: the next challenge either prover's caller
+        // would draw (lincheck's α slot) must agree.
+        assert_eq!(
+            ch_dense.sample_f128(),
+            ch_padded.sample_f128(),
+            "post-proof transcript state diverged"
+        );
+    }
+
+    /// **Multi-run spec is byte-identical to the dense prover** through the
+    /// general kernel paths (full-length b_med_counts table in round 1,
+    /// per-pair skip table in round 2), including the `capture_s_hat_v_c`
+    /// variant. The spec has two runs of different block shapes plus an
+    /// implicit trailing gap — the shape of a multi-table slot schedule.
+    #[test]
+    fn prove_padded_multi_run_matches_dense() {
+        let m = 15usize;
+        // Two runs (2×2^13 + 1×2^12 = 20480 bits) + a 12288-bit trailing gap.
+        let padding = PaddingSpec::from_runs(vec![
+            PaddingRun {
+                k_log: 13,
+                useful_bits_per_block: 5_000,
+                n_blocks: 2,
+            },
+            PaddingRun {
+                k_log: 12,
+                useful_bits_per_block: 3_000,
+                n_blocks: 1,
+            },
+        ]);
+        assert!(padding.as_single_run().is_none(), "must exercise multi-run");
+        assert!(padding.covered_bits() < 1 << m, "must exercise the gap");
+
+        let mut rng = Rng::new(0x0417_1157);
+        let mut a = rng.bits(1 << m);
+        let mut b = rng.bits(1 << m);
+        zero_outside_useful(&padding, &mut a);
+        zero_outside_useful(&padding, &mut b);
+        let c: Vec<bool> = a.iter().zip(&b).map(|(x, y)| *x & *y).collect();
+        let (a_p, b_p, c_p) = pack_abc(&a, &b, &c);
+
+        let mut ch_dense = FsChallenger::new(b"flock-test-v0");
+        let (proof_dense, claim_dense, s_hat_v_dense) = prove_packed_padded_capture_s_hat_v_c(
+            &a_p,
+            &b_p,
+            &c_p,
+            m,
+            &PaddingSpec::dense(m),
+            &mut ch_dense,
+        );
+
+        let mut ch_padded = FsChallenger::new(b"flock-test-v0");
+        let (proof_padded, claim_padded, s_hat_v_padded) =
+            prove_packed_padded_capture_s_hat_v_c(&a_p, &b_p, &c_p, m, &padding, &mut ch_padded);
+
+        assert_eq!(proof_dense, proof_padded, "proof mismatch");
+        assert_eq!(claim_dense, claim_padded, "claim mismatch");
+        assert_eq!(s_hat_v_dense, s_hat_v_padded, "s_hat_v_c mismatch");
+        assert_eq!(
+            ch_dense.sample_f128(),
+            ch_padded.sample_f128(),
+            "post-proof transcript state diverged"
+        );
+
+        // And the multi-run proof still verifies.
+        let mut ch_verify = FsChallenger::new(b"flock-test-v0");
+        verify(m, &proof_padded, &mut ch_verify).expect("multi-run proof must verify");
+    }
+
+    /// **Sparse multi-run spec is byte-identical to the dense prover** through
+    /// the M6 support-proportional tail (`fold_and_round_pair_sparse_into`):
+    /// the support here is ~1% of the domain, so the tail's sparse rounds
+    /// genuinely run (unlike `prove_padded_multi_run_matches_dense`, whose
+    /// support is too dense to trigger them), including the mid-tail
+    /// switch-back to the dense kernels (zeroing dead scratch) once the live
+    /// fraction crosses the threshold.
+    #[test]
+    fn prove_padded_sparse_multi_run_matches_dense() {
+        let m = 16usize;
+        // Two count-derived-shaped runs: blocks of 2^13 bits with a 256-bit
+        // declared prefix (n_t = 2 rows of 128), then a gap-shaped zero run,
+        // then a smaller block shape — plus the implicit trailing gap.
+        let padding = PaddingSpec::from_runs(vec![
+            PaddingRun {
+                k_log: 13,
+                useful_bits_per_block: 256,
+                n_blocks: 3,
+            },
+            PaddingRun {
+                k_log: 13,
+                useful_bits_per_block: 0,
+                n_blocks: 1,
+            },
+            PaddingRun {
+                k_log: 12,
+                useful_bits_per_block: 128,
+                n_blocks: 2,
+            },
+        ]);
+        assert!(padding.as_single_run().is_none(), "must exercise multi-run");
+        let live = padding.useful_block_intervals(K_SKIP);
+        let live_elems: usize = live.iter().map(|&(s, e)| e - s).sum();
+        assert!(
+            live_elems * 16 <= 1usize << (m - K_SKIP),
+            "spec must be sparse enough to drive the sparse tail"
+        );
+
+        let mut rng = Rng::new(0x0616_5A9D);
+        let mut a = rng.bits(1 << m);
+        let mut b = rng.bits(1 << m);
+        zero_outside_useful(&padding, &mut a);
+        zero_outside_useful(&padding, &mut b);
+        let c: Vec<bool> = a.iter().zip(&b).map(|(x, y)| *x & *y).collect();
+        let (a_p, b_p, c_p) = pack_abc(&a, &b, &c);
+
+        let mut ch_dense = FsChallenger::new(b"flock-test-v0");
+        let (proof_dense, claim_dense, s_hat_v_dense) = prove_packed_padded_capture_s_hat_v_c(
+            &a_p,
+            &b_p,
+            &c_p,
+            m,
+            &PaddingSpec::dense(m),
+            &mut ch_dense,
+        );
+
+        let mut ch_padded = FsChallenger::new(b"flock-test-v0");
+        let (proof_padded, claim_padded, s_hat_v_padded) =
+            prove_packed_padded_capture_s_hat_v_c(&a_p, &b_p, &c_p, m, &padding, &mut ch_padded);
+
+        assert_eq!(proof_dense, proof_padded, "proof mismatch");
+        assert_eq!(claim_dense, claim_padded, "claim mismatch");
+        assert_eq!(s_hat_v_dense, s_hat_v_padded, "s_hat_v_c mismatch");
+        assert_eq!(
+            ch_dense.sample_f128(),
+            ch_padded.sample_f128(),
+            "post-proof transcript state diverged"
+        );
+
+        let mut ch_verify = FsChallenger::new(b"flock-test-v0");
+        verify(m, &proof_padded, &mut ch_verify).expect("sparse multi-run proof must verify");
+    }
+
+    /// The support-proportional dispatch is byte-identical to the dense
+    /// prover on FRAGMENTED slot schedules — the shapes that separate "tasks
+    /// derived from the live intervals" from "tasks derived from the domain".
+    /// Each case targets one way the interval-derived dispatch could differ
+    /// from a whole-domain scan:
+    ///
+    /// - *fragmented*: many small intervals separated by dead gaps, so tasks
+    ///   coalesce several pieces and their output spans cover gaps that must
+    ///   stay unwritten.
+    /// - *unaligned*: `useful_bits_per_block` is not a multiple of the pair
+    ///   window (2^(k_skip+1)), so consecutive intervals round to pair
+    ///   intervals that TOUCH — they must merge, or the shared boundary pair
+    ///   is folded (and accumulated into the message) twice.
+    /// - *wide*: live pairs exceed one task's budget in both round 2 and the
+    ///   tail, exercising the multi-task output carve and the message
+    ///   regrouping across tasks.
+    #[test]
+    fn prove_sparse_fragmented_multi_run_matches_dense() {
+        let cases: [(&str, usize, PaddingSpec); 3] = [
+            (
+                "fragmented",
+                16,
+                PaddingSpec::from_runs(
+                    (0..8)
+                        .flat_map(|_| {
+                            [
+                                PaddingRun {
+                                    k_log: 9,
+                                    useful_bits_per_block: 128,
+                                    n_blocks: 6,
+                                },
+                                PaddingRun {
+                                    k_log: 9,
+                                    useful_bits_per_block: 0,
+                                    n_blocks: 2,
+                                },
+                            ]
+                        })
+                        .collect(),
+                ),
+            ),
+            (
+                "unaligned",
+                16,
+                PaddingSpec::from_runs(vec![
+                    PaddingRun {
+                        k_log: 10,
+                        useful_bits_per_block: 200,
+                        n_blocks: 20,
+                    },
+                    PaddingRun {
+                        k_log: 8,
+                        useful_bits_per_block: 129,
+                        n_blocks: 40,
+                    },
+                ]),
+            ),
+            (
+                "wide",
+                24,
+                PaddingSpec::from_runs(vec![
+                    PaddingRun {
+                        k_log: 12,
+                        useful_bits_per_block: 3000,
+                        n_blocks: 2048,
+                    },
+                    PaddingRun {
+                        k_log: 12,
+                        useful_bits_per_block: 0,
+                        n_blocks: 512,
+                    },
+                    PaddingRun {
+                        k_log: 11,
+                        useful_bits_per_block: 1500,
+                        n_blocks: 2048,
+                    },
+                ]),
+            ),
+        ];
+
+        for (name, m, padding) in cases {
+            assert!(
+                padding.as_single_run().is_none(),
+                "{name}: must exercise multi-run"
+            );
+            let live = padding.useful_block_intervals(K_SKIP);
+            let live_elems: usize = live.iter().map(|&(s, e)| e - s).sum();
+            assert!(
+                live.len() > 4 && live_elems <= 1usize << (m - K_SKIP),
+                "{name}: must be fragmented and drive the sparse path \
+                 ({} intervals, {live_elems} live)",
+                live.len(),
+            );
+            if name == "wide" {
+                // Keep this case doing its job: it only covers the multi-task
+                // carve while its live work exceeds one task's budget
+                // (`LIVE_PAIRS_PER_TASK` in multilinear.rs, 2^16 pairs).
+                let live_pairs: usize = padding
+                    .useful_block_intervals(K_SKIP + 1)
+                    .iter()
+                    .map(|&(s, e)| e - s)
+                    .sum();
+                assert!(
+                    live_pairs > 1 << 16,
+                    "{name}: {live_pairs} live pairs no longer forces a \
+                     multi-task round-2 dispatch"
+                );
+            }
+
+            let mut rng = Rng::new(0x_5B10_2C4E ^ m as u64);
+            let mut a = rng.bits(1 << m);
+            let mut b = rng.bits(1 << m);
+            zero_outside_useful(&padding, &mut a);
+            zero_outside_useful(&padding, &mut b);
+            let c: Vec<bool> = a.iter().zip(&b).map(|(x, y)| *x & *y).collect();
+            let (a_p, b_p, c_p) = pack_abc(&a, &b, &c);
+
+            let mut ch_dense = FsChallenger::new(b"flock-test-v0");
+            let (proof_dense, claim_dense, s_hat_v_dense) = prove_packed_padded_capture_s_hat_v_c(
+                &a_p,
+                &b_p,
+                &c_p,
+                m,
+                &PaddingSpec::dense(m),
+                &mut ch_dense,
+            );
+
+            let mut ch_padded = FsChallenger::new(b"flock-test-v0");
+            let (proof_padded, claim_padded, s_hat_v_padded) =
+                prove_packed_padded_capture_s_hat_v_c(
+                    &a_p,
+                    &b_p,
+                    &c_p,
+                    m,
+                    &padding,
+                    &mut ch_padded,
+                );
+
+            assert_eq!(proof_dense, proof_padded, "{name}: proof mismatch");
+            assert_eq!(claim_dense, claim_padded, "{name}: claim mismatch");
+            assert_eq!(s_hat_v_dense, s_hat_v_padded, "{name}: s_hat_v_c mismatch");
+
+            let mut ch_verify = FsChallenger::new(b"flock-test-v0");
+            verify(m, &proof_padded, &mut ch_verify)
+                .unwrap_or_else(|e| panic!("{name}: proof must verify: {e:?}"));
         }
     }
 

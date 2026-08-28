@@ -12,11 +12,13 @@
 #                    binius64 ships no such bench, so this script emits a small
 #                    self-contained example (keccak_permutations.rs) that uses
 #                    binius64's public keccak-f permutation gadget. Directly
-#                    comparable to Flock `cargo bench --bench keccak_proof`
+#                    comparable to Flock `cargo bench --bench keccak3_proof`
+#                    (3-wide encoder; the single-permutation bench was retired)
 #                    (K=4096) and plonky3's `keccak-f-permutations`.
 #   hash             The built-in Keccak-256 bench: one sponge hash of an
 #                    HASH_MAX_BYTES-byte message = ceil(bytes/136) sequentially-
-#                    dependent permutations. Comparable to Flock `keccak_chain_proof`.
+#                    dependent permutations. (The Flock keccak_chain_proof
+#                    comparison bench was retired with the chain product, 2026-08-14.)
 #
 # sha256 — N INDEPENDENT SHA-256 compressions via a tracked example
 #   (sha256_compressions.rs, on binius64's public sha256::Compress gadget).
@@ -165,7 +167,7 @@ if [[ "$MODE" == "perm" ]]; then
 	fi
 
 	NPERM="${N_PERMUTATIONS:-4096}"
-	echo "=== KECCAK_MODE=perm  N_PERMUTATIONS=$NPERM (independent; cf. Flock keccak_proof K=4096) ==="
+	echo "=== KECCAK_MODE=perm  N_PERMUTATIONS=$NPERM (independent; cf. Flock keccak3_proof) ==="
 	RUSTFLAGS="-Ctarget-cpu=native" N_PERMUTATIONS="$NPERM" RAYON_NUM_THREADS="$RAYON_NUM_THREADS" \
 		cargo run --release --manifest-path "$DIR/Cargo.toml" -p binius-examples \
 		--example keccak_permutations
@@ -173,7 +175,7 @@ else
 	# Built-in Keccak-256 message-hash criterion bench (sequentially-dependent).
 	BYTES="${HASH_MAX_BYTES:-557056}"
 	PERMS=$(( (BYTES + 135) / 136 ))
-	echo "=== KECCAK_MODE=hash  HASH_MAX_BYTES=$BYTES (~$PERMS perms, cf. Flock keccak_chain_proof 4096) ==="
+	echo "=== KECCAK_MODE=hash  HASH_MAX_BYTES=$BYTES (~$PERMS perms; the Flock chain bench is retired) ==="
 
 	BENCH_LOG="$(mktemp)"
 	RUSTFLAGS="-Ctarget-cpu=native" HASH_MAX_BYTES="$BYTES" RAYON_NUM_THREADS="$RAYON_NUM_THREADS" \

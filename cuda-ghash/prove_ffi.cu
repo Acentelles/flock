@@ -38,6 +38,8 @@
 #include "challenger.hpp"
 #include "zc_challenger_device.cuh"
 #include "pow_grind.cuh"
+#include "f256.cuh"
+#include "ligerito_f256.cuh"
 
 #define CK(x) do { cudaError_t e=(x); if(e){ \
     printf("FFI CUDA error %s at %s:%d\n", cudaGetErrorString(e), __FILE__, __LINE__); \
@@ -160,41 +162,6 @@ cudaError_t get_cached_twiddles(int k_code, const TwiddleTable*& host, F128*& de
     return cudaSuccess;
 }
 
-struct InduceScratch {
-    F128* alpha = nullptr;
-    F128* basis = nullptr;
-    unsigned long long* queries = nullptr;
-    long long alpha_capacity = 0;
-    long long basis_capacity = 0;
-    size_t query_capacity = 0;
-};
-
-cudaError_t grow_buffer(F128*& buffer, long long& capacity, long long required) {
-    if (required <= capacity) return cudaSuccess;
-    if (buffer) {
-        cudaError_t err = cudaFree(buffer);
-        if (err != cudaSuccess) return err;
-        buffer = nullptr;
-        capacity = 0;
-    }
-    cudaError_t err = cudaMalloc(&buffer, required * sizeof(F128));
-    if (err == cudaSuccess) capacity = required;
-    return err;
-}
-
-cudaError_t grow_query_buffer(InduceScratch& scratch, size_t required) {
-    if (required <= scratch.query_capacity) return cudaSuccess;
-    if (scratch.queries) {
-        cudaError_t err = cudaFree(scratch.queries);
-        if (err != cudaSuccess) return err;
-        scratch.queries = nullptr;
-        scratch.query_capacity = 0;
-    }
-    cudaError_t err = cudaMalloc(&scratch.queries, required * sizeof(unsigned long long));
-    if (err == cudaSuccess) scratch.query_capacity = required;
-    return err;
-}
-
 F128 ADD(F128 a, F128 b) { return f128_add_hd(a, b); }
 F128 MUL(F128 a, F128 b) { return f128_mul_hd(a, b); }
 const F128 ONE{1, 0};
@@ -204,22 +171,6 @@ F128 frch(ChF128 x) { return F128{x.lo, x.hi}; }
 F128 interp3(F128 h0, F128 h1, F128 hinf, F128 rho) {
     F128 c1 = ADD(ADD(h0, h1), hinf);
     return ADD(h0, MUL(rho, ADD(c1, MUL(rho, hinf))));
-}
-
-ZcSha pack_challenger(const Sha256& s) {
-    ZcSha z;
-    for (int i = 0; i < 8; i++) z.h[i] = s.h[i];
-    z.total_len = s.total_len;
-    for (int i = 0; i < 64; i++) z.buf[i] = s.buf[i];
-    z.buf_len = (unsigned)s.buf_len;
-    return z;
-}
-
-void unpack_challenger(Sha256& s, const ZcSha& z) {
-    for (int i = 0; i < 8; i++) s.h[i] = z.h[i];
-    s.total_len = z.total_len;
-    for (int i = 0; i < 64; i++) s.buf[i] = z.buf[i];
-    s.buf_len = z.buf_len;
 }
 
 vector<F128> build_eq_host(const F128* r, int n) {
@@ -302,25 +253,6 @@ __global__ void generate_blake3_compression_inputs(uint32_t* cv, uint32_t* m, b3
     for (int i = 0; i < 16; i++) m[blk * 16 + i] = NXT;
     ctr[blk] = ((b3u64)NXT << 32) | NXT; blen[blk] = NXT; flags[blk] = NXT;
 #undef NXT
-}
-
-// replicate-fill for the unfused commit fallback.
-__global__ void replicate_prover_message(const F128* __restrict__ msg, F128* __restrict__ cw,
-                                   long long cw_len, long long msg_len) {
-    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= cw_len) return;
-    cw[i] = msg[i % msg_len];
-}
-
-__global__ void gather_codeword_rows(const F128* __restrict__ codeword,
-                                     const unsigned long long* __restrict__ positions,
-                                     int n_rows, int row_len, F128* __restrict__ rows) {
-    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    long long n = (long long)n_rows * row_len;
-    if (i >= n) return;
-    int row = (int)(i / row_len);
-    int col = (int)(i % row_len);
-    rows[i] = codeword[positions[row] * row_len + col];
 }
 
 __global__ void ring_switch_fold_rows_grouped(const F128* __restrict__ witness,
@@ -423,27 +355,8 @@ __global__ void ring_switch_combine_basis(const F128* __restrict__ suffix_ab,
     combined[i] = acc;
 }
 
-int copy_codeword_rows(const F128* d_codeword, const vector<size_t>& positions,
-                       int row_len, vector<F128>& rows) {
-    vector<unsigned long long> host_positions(positions.begin(), positions.end());
-    rows.resize(positions.size() * (size_t)row_len);
-    if (rows.empty()) return 0;
-
-    unsigned long long* d_positions;
-    F128* d_rows;
-    CK(ffi_malloc(&d_positions, host_positions.size() * sizeof(unsigned long long)));
-    CK(ffi_malloc(&d_rows, rows.size() * sizeof(F128)));
-    CK(cudaMemcpy(d_positions, host_positions.data(),
-                  host_positions.size() * sizeof(unsigned long long), cudaMemcpyHostToDevice));
-    int threads = 256;
-    gather_codeword_rows<<<(unsigned)((rows.size() + threads - 1) / threads), threads>>>(
-        d_codeword, d_positions, (int)positions.size(), row_len, d_rows);
-    CK(cudaGetLastError());
-    CK(cudaMemcpy(rows.data(), d_rows, rows.size() * sizeof(F128), cudaMemcpyDeviceToHost));
-    CK(ffi_free(d_positions));
-    CK(ffi_free(d_rows));
-    return 0;
-}
+cudaError_t lig_arena_alloc(void** p, size_t bytes) { return device_arena.allocate(p, bytes); }
+cudaError_t lig_arena_release(void* p) { return device_arena.release(p); }
 
 } // namespace
 
@@ -467,14 +380,28 @@ typedef struct {
     const uint8_t* zc_f8mul;      // 256*256
     // ligerito config (embedded TOML on the Rust side)
     int initial_k;                // 6
-    int num_levels;               // e.g. 5
+    int num_levels;               // = recursive_steps + 1
     const int* log_inv_rates;     // [num_levels]
     const int* recursive_ks;      // [recursive_steps]
     const int* queries;           // [num_levels]
-    const int* grinding_bits;     // [num_levels]
-    const int* fold_grinding_bits; // [num_levels]
+    const int* grinding_bits;     // [num_levels] query-phase PoW
+    const int* claim_batch_grinding_bits;       // [num_levels]
+    const int* consistency_batch_grinding_bits; // [num_levels]
     const int* ood_samples;       // [num_levels]
     int recursive_steps;
+    // 128-bit FS grinding schedule for the PIOPs + transport (from the Rust
+    // PcsParams accessors). 0 = the site is ABSENT (no PoW op, legacy shape);
+    // the ligerito claim/consistency/query grinds above always absorb, 0-bit
+    // included.
+    int zc_initial_bits;          // ZerocheckGrinding::initial_bits(m)
+    int zc_skip_bits;             // ZerocheckGrinding::skip_bits()
+    int zc_round_bits;            // ZerocheckGrinding::multilinear_round_bits()
+    int lc_alpha_bits;            // LincheckGrinding::alpha_bits()
+    int lc_beta_bits;             // LincheckGrinding::beta_bits() (per pinned circuit)
+    int lc_round_bits;            // LincheckGrinding::multilinear_round_bits()
+    int lc_skip_bits;             // LincheckGrinding::skip_bits(k_skip)
+    int rs_bits;                  // OpeningGrinding::ring_switch_bits (per claim)
+    int gamma_bits;               // OpeningGrinding::claim_batch_bits (2 claims)
     // Optional: dump the generated packed witness (len F128, raw LE) here so a
     // host-side Rust prover can replay the identical instance. NULL = no dump.
     const char* dump_z_path;
@@ -534,7 +461,8 @@ int flock_cuda_prove_blake3(const FlockCudaProveParams* P, uint8_t** out, size_t
     }
 
     // ================= L0 commit ============================================
-    F128* d_cw0; uint8_t* d_tree0; long long l0_bl; int l0_ni; uint8_t l0root[32];
+    F128* d_cw0; uint8_t* d_tree0; long long l0_bl; int l0_ni;
+    std::vector<MHash> l0_cap;
     {
         int k_code = (log_n - P->initial_k) + P->log_inv_rates[0];
         int num_ntts = 1 << P->initial_k;
@@ -553,22 +481,27 @@ int flock_cuda_prove_blake3(const FlockCudaProveParams* P, uint8_t** out, size_t
         CK(cudaGetLastError());
         launch_merkle((const uint8_t*)d_cw0, d_tree0, l0_bl, num_ntts * 16);
         CK(cudaDeviceSynchronize());
-        CK(cudaMemcpy(l0root, d_tree0 + (size_t)(2 * l0_bl - 2) * 32, 32, cudaMemcpyDeviceToHost));
+        // The commitment IS the cap layer (no root): 2^c nodes at the
+        // stratified schedule's cap depth for the L0 query count.
+        uint32_t c0 = stratified_cap_depth(
+            stratified_depths((size_t)P->queries[0], (uint32_t)k_code));
+        l0_cap = merkle_cap_layer_device(d_tree0, (size_t)l0_bl, c0);
     }
 
     // ================= challenger + statement binding =======================
     FsChallenger ch(P->domain, P->domain_len);
     ch.observe_label((const uint8_t*)"flock-r1cs-v0", 13);
     ch.observe_bytes(P->statement_digest, 32);
-    ch.observe_bytes(l0root, 32);
+    ch.observe_bytes((const uint8_t*)l0_cap.data(), l0_cap.size() * 32);
 
     FfiWriter W;
-    W.hash(l0root);                       // commitment root
+    W.hashes(l0_cap);                     // the commitment cap
 
     // ================= zerocheck (test_zerocheck_full flow) =================
     vector<F128> zc_r1ab(64), zc_r1c(64), zc_m1s, zc_mis;
     F128 zc_z, zc_fa, zc_fb, zc_fc;
     vector<F128> zc_r(m), mlv_rhos;
+    vector<uint64_t> zc_nonces;   // [initial, skip z, one per multilinear round]
     {
         const long long n_out = 1LL << (m - 6);
         static std::once_flag zerocheck_setup_once;
@@ -599,7 +532,12 @@ int flock_cuda_prove_blake3(const FlockCudaProveParams* P, uint8_t** out, size_t
         CK(ffi_malloc(&d_eqhi, (1LL << (zt_dfull - zt_lobits)) * sizeof(F128)));
 
         ch.observe_label((const uint8_t*)"flock-zerocheck-v0", 18);
-        std::vector<ChF128> rs(6); ch.sample_f128_vec(rs.data(), 6);
+        // PoW before the initial eq point (the skip vector); r_outer is plain.
+        std::vector<ChF128> rs(6);
+        if (P->zc_initial_bits > 0)
+            zc_nonces.push_back(ch.grind_pow_and_sample_f128_vec((uint32_t)P->zc_initial_bits, rs.data(), 6));
+        else
+            ch.sample_f128_vec(rs.data(), 6);
         std::vector<ChF128> ro(m - 13); ch.sample_f128_vec(ro.data(), m - 13);
         for (int i = 0; i < 6; i++) zc_r[i] = frch(rs[i]);
         int sm[3] = {0xF7, 0x53, 0xB5};
@@ -621,7 +559,13 @@ int flock_cuda_prove_blake3(const FlockCudaProveParams* P, uint8_t** out, size_t
         { std::vector<ChF128> s(64);
           for (int i = 0; i < 64; i++) s[i] = toch(zc_r1ab[i]); ch.observe_f128_slice(s.data(), 64);
           for (int i = 0; i < 64; i++) s[i] = toch(zc_r1c[i]);  ch.observe_f128_slice(s.data(), 64); }
-        zc_z = frch(ch.sample_f128());
+        if (P->zc_skip_bits > 0) {
+            ChF128 zc_;
+            zc_nonces.push_back(ch.grind_pow_and_sample_f128((uint32_t)P->zc_skip_bits, &zc_));
+            zc_z = frch(zc_);
+        } else {
+            zc_z = frch(ch.sample_f128());
+        }
 
         // c-interp at z over Λ (final_c_eval)
         { vector<F128> wl = lagrange_phi(6, zc_z, 64);
@@ -648,15 +592,9 @@ int flock_cuda_prove_blake3(const FlockCudaProveParams* P, uint8_t** out, size_t
           for (int i = n_tail - 1; i >= 0; i--) { S[i] = MUL(prefixes[i], inv); inv = MUL(inv, values[i]); }
           for (int i = 1; i < n_tail; i++) S[i] = MUL(S[i - 1], S[i]); }
 
-        F128 *d_part8, *d_out8, *d_scales, *d_rhos, *d_m1_log, *d_mi_log;
-        ZcSha* d_state;
+        F128 *d_part8, *d_out8;
         CK(ffi_malloc(&d_part8, 8 * ZT_MAX_BLOCKS * sizeof(F128)));
         CK(ffi_malloc(&d_out8, 8 * sizeof(F128)));
-        CK(ffi_malloc(&d_scales, n_tail * sizeof(F128)));
-        CK(ffi_malloc(&d_rhos, n_tail * sizeof(F128)));
-        CK(ffi_malloc(&d_m1_log, n_tail * sizeof(F128)));
-        CK(ffi_malloc(&d_mi_log, n_tail * sizeof(F128)));
-        CK(ffi_malloc(&d_state, sizeof(ZcSha)));
 
         launch_zerocheck_second_round_fold_with_lookahead((const uint8_t*)d_a, (const uint8_t*)d_b, d_ft,
                                    d_eqlo, d_eqhi, zt_lobits, n_out, d_am, d_bm,
@@ -666,7 +604,13 @@ int flock_cuda_prove_blake3(const FlockCudaProveParams* P, uint8_t** out, size_t
         auto observe_message = [&](F128 m1, F128 mi) {
             zc_m1s.push_back(m1); zc_mis.push_back(mi);
             ch.observe_f128(toch(m1)); ch.observe_f128(toch(mi));
-            mlv_rhos.push_back(frch(ch.sample_f128()));
+            if (P->zc_round_bits > 0) {
+                ChF128 rho;
+                zc_nonces.push_back(ch.grind_pow_and_sample_f128((uint32_t)P->zc_round_bits, &rho));
+                mlv_rhos.push_back(frch(rho));
+            } else {
+                mlv_rhos.push_back(frch(ch.sample_f128()));
+            }
         };
         F128 h[8];
         CK(cudaMemcpy(h, d_out8, 8 * sizeof(F128), cudaMemcpyDeviceToHost));
@@ -697,8 +641,13 @@ int flock_cuda_prove_blake3(const FlockCudaProveParams* P, uint8_t** out, size_t
           CK(cudaGetLastError());
           F128* t; t = cA; cA = nA; nA = t; t = cB; cB = nB; nB = t;
           L = half; }
+        // Host-driven rounds to the end. The device finisher
+        // (finish_zerocheck_tail) predates per-round PoW grinding — every
+        // round's ρ is now ground on the host challenger, so the last rounds
+        // run as (tiny) individual kernels instead. ~n_tail extra launches,
+        // microseconds total.
         int i = k - 1;
-        for (; i < n_tail && L / 4 > ZT_FINISH_OP; i++) {
+        for (; i < n_tail; i++) {
             launch_zerocheck_tail_fold_and_message(cA, cB, nA, nB, d_eqlo, d_eqhi, i + 1, zt_lobits,
                                      L / 4, mlv_rhos.back(), S[i],
                                      d_p1, d_pinf, d_m1d, d_mid);
@@ -709,28 +658,6 @@ int flock_cuda_prove_blake3(const FlockCudaProveParams* P, uint8_t** out, size_t
             CK(cudaMemcpy(&m1, d_m1d, sizeof(F128), cudaMemcpyDeviceToHost));
             CK(cudaMemcpy(&mi, d_mid, sizeof(F128), cudaMemcpyDeviceToHost));
             observe_message(m1, mi);
-        }
-        if (i < n_tail) {
-            int rounds = n_tail - i;
-            ZcSha state = pack_challenger(ch.hasher);
-            CK(cudaMemcpy(d_state, &state, sizeof(ZcSha), cudaMemcpyHostToDevice));
-            CK(cudaMemcpy(d_scales, S.data() + i, rounds * sizeof(F128), cudaMemcpyHostToDevice));
-            finish_zerocheck_tail<<<1, ZT_FIN_TPB>>>(cA, cB, nA, nB, d_eqlo, d_eqhi,
-                                                zt_lobits, i + 1, d_scales,
-                                                mlv_rhos.back(), rounds, L, d_state,
-                                                d_rhos, d_m1_log, d_mi_log);
-            CK(cudaGetLastError());
-            vector<F128> rhos(rounds), m1s(rounds), mis(rounds);
-            CK(cudaMemcpy(&state, d_state, sizeof(ZcSha), cudaMemcpyDeviceToHost));
-            CK(cudaMemcpy(rhos.data(), d_rhos, rounds * sizeof(F128), cudaMemcpyDeviceToHost));
-            CK(cudaMemcpy(m1s.data(), d_m1_log, rounds * sizeof(F128), cudaMemcpyDeviceToHost));
-            CK(cudaMemcpy(mis.data(), d_mi_log, rounds * sizeof(F128), cudaMemcpyDeviceToHost));
-            unpack_challenger(ch.hasher, state);
-            for (int j = 0; j < rounds; j++) {
-                zc_m1s.push_back(m1s[j]); zc_mis.push_back(mis[j]); mlv_rhos.push_back(rhos[j]);
-            }
-            if (rounds & 1) { F128* t; t = cA; cA = nA; nA = t; t = cB; cB = nB; nB = t; }
-            L >>= rounds;
         }
 
         // final binding + evals
@@ -745,8 +672,7 @@ int flock_cuda_prove_blake3(const FlockCudaProveParams* P, uint8_t** out, size_t
         ffi_free(d_am); ffi_free(d_bm); ffi_free(d_amn); ffi_free(d_bmn);
         ffi_free(d_p1); ffi_free(d_pinf); ffi_free(d_m1d); ffi_free(d_mid);
         ffi_free(d_eqlo); ffi_free(d_eqhi);
-        ffi_free(d_part8); ffi_free(d_out8); ffi_free(d_scales); ffi_free(d_rhos);
-        ffi_free(d_m1_log); ffi_free(d_mi_log); ffi_free(d_state);
+        ffi_free(d_part8); ffi_free(d_out8);
     }
     ffi_free(d_a); ffi_free(d_b);
     // zerocheck proof section
@@ -754,6 +680,8 @@ int flock_cuda_prove_blake3(const FlockCudaProveParams* P, uint8_t** out, size_t
     W.u64(zc_m1s.size());
     for (size_t i = 0; i < zc_m1s.size(); i++) { W.f128(zc_m1s[i]); W.f128(zc_mis[i]); }
     W.f128(zc_fa); W.f128(zc_fb); W.f128(zc_fc);
+    W.u64(zc_nonces.size());
+    for (uint64_t n : zc_nonces) W.u64(n);
 
     // x_ab (RowMajor): z_skip = zc_z, inner = mlv[..k_log-6], outer = mlv[k_log-6..]
     const int irl = k_log - k_skip;
@@ -762,6 +690,7 @@ int flock_cuda_prove_blake3(const FlockCudaProveParams* P, uint8_t** out, size_t
 
     // ================= lincheck (test_lincheck flow + const-pin beta) =======
     vector<F128> lc_e1s, lc_einfs, lc_zpart(64), lc_rrounds;
+    vector<uint64_t> lc_nonces;   // [α, β per pin, one per round, φ8 skip]
     F128 lc_rskip, lc_w;
     F128* d_zvec = nullptr;
     F128* d_zvec_initial = nullptr;
@@ -770,9 +699,24 @@ int flock_cuda_prove_blake3(const FlockCudaProveParams* P, uint8_t** out, size_t
         const int n_log = m - k_log;
         const long long n_outer = 1LL << n_log, n_stripes = n_outer / 8;
         ch.observe_label((const uint8_t*)"flock-lincheck-v0", 17);
-        F128 alpha = frch(ch.sample_f128());
+        F128 alpha;
+        if (P->lc_alpha_bits > 0) {
+            ChF128 a;
+            lc_nonces.push_back(ch.grind_pow_and_sample_f128((uint32_t)P->lc_alpha_bits, &a));
+            alpha = frch(a);
+        } else {
+            alpha = frch(ch.sample_f128());
+        }
         F128 beta{0, 0}; bool has_pin = P->const_pin_col >= 0;
-        if (has_pin) beta = frch(ch.sample_f128());
+        if (has_pin) {
+            if (P->lc_beta_bits > 0) {
+                ChF128 b;
+                lc_nonces.push_back(ch.grind_pow_and_sample_f128((uint32_t)P->lc_beta_bits, &b));
+                beta = frch(b);
+            } else {
+                beta = frch(ch.sample_f128());
+            }
+        }
 
         static std::once_flag matrix_setup_once;
         static cudaError_t matrix_setup_error = cudaSuccess;
@@ -849,7 +793,15 @@ int flock_cuda_prove_blake3(const FlockCudaProveParams* P, uint8_t** out, size_t
             CK(cudaMemcpy(&einf, d_einf, sizeof(F128), cudaMemcpyDeviceToHost));
             lc_e1s.push_back(e1); lc_einfs.push_back(einf);
             ch.observe_f128(toch(e1)); ch.observe_f128(toch(einf));
-            F128 r = frch(ch.sample_f128()); lc_rrounds.push_back(r);
+            F128 r;
+            if (P->lc_round_bits > 0) {
+                ChF128 rc;
+                lc_nonces.push_back(ch.grind_pow_and_sample_f128((uint32_t)P->lc_round_bits, &rc));
+                r = frch(rc);
+            } else {
+                r = frch(ch.sample_f128());
+            }
+            lc_rrounds.push_back(r);
             launch_linear_check_fold_pair(cC, cZ, nC, nZ, half, r);
             CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
             F128* t; t = cC; cC = nC; nC = t; t = cZ; cZ = nZ; nZ = t;
@@ -858,7 +810,13 @@ int flock_cuda_prove_blake3(const FlockCudaProveParams* P, uint8_t** out, size_t
         CK(cudaMemcpy(lc_zpart.data(), cZ, 64 * sizeof(F128), cudaMemcpyDeviceToHost));
         { std::vector<ChF128> s(64); for (int i = 0; i < 64; i++) s[i] = toch(lc_zpart[i]);
           ch.observe_f128_slice(s.data(), 64); }
-        lc_rskip = frch(ch.sample_f128());
+        if (P->lc_skip_bits > 0) {
+            ChF128 rs_;
+            lc_nonces.push_back(ch.grind_pow_and_sample_f128((uint32_t)P->lc_skip_bits, &rs_));
+            lc_rskip = frch(rs_);
+        } else {
+            lc_rskip = frch(ch.sample_f128());
+        }
         { vector<F128> lam = lagrange_weights_host(k_skip, lc_rskip);
           lc_w = F128{0, 0};
           for (int i = 0; i < 64; i++) lc_w = ADD(lc_w, MUL(lam[i], lc_zpart[i])); }
@@ -872,6 +830,8 @@ int flock_cuda_prove_blake3(const FlockCudaProveParams* P, uint8_t** out, size_t
     W.u64(lc_e1s.size());
     for (size_t i = 0; i < lc_e1s.size(); i++) { W.f128(lc_e1s[i]); W.f128(lc_einfs[i]); }
     W.f128s(lc_zpart);
+    W.u64(lc_nonces.size());
+    for (uint64_t n : lc_nonces) W.u64(n);
 
     // r_inner_rest = reverse(rounds)
     vector<F128> r_inner_rest(lc_rrounds.rbegin(), lc_rrounds.rend());
@@ -910,14 +870,21 @@ int flock_cuda_prove_blake3(const FlockCudaProveParams* P, uint8_t** out, size_t
     CK(ffi_free(d_shat_partials));
 
     ch.observe_label((const uint8_t*)"flock-pcs-open-batch-v0", 23);
-    struct RsWork { vector<F128> shat, eq_rd; F128 claim; };
+    struct RsWork { vector<F128> shat, eq_rd; F128 claim; uint64_t nonce; };
     RsWork rsw[2];
     const vector<F128>* shats[2] = { &shat_ab, &shat_c };
     for (int i = 0; i < 2; i++) {
         ch.observe_label((const uint8_t*)"flock-ring-switch-v0", 20);
         { std::vector<ChF128> s(128); for (int j = 0; j < 128; j++) s[j] = toch((*shats[i])[j]);
           ch.observe_f128_slice(s.data(), 128); }
-        std::vector<ChF128> rd(7); ch.sample_f128_vec(rd.data(), 7);
+        // PoW before the ring-switch point r'' (omitted ENTIRELY at 0 bits —
+        // unlike the ladder's grinds, this site has no 0-bit nonce absorb).
+        std::vector<ChF128> rd(7);
+        rsw[i].nonce = 0;
+        if (P->rs_bits > 0)
+            rsw[i].nonce = ch.grind_pow_and_sample_f128_vec((uint32_t)P->rs_bits, rd.data(), 7);
+        else
+            ch.sample_f128_vec(rd.data(), 7);
         vector<F128> rdf(7); for (int j = 0; j < 7; j++) rdf[j] = frch(rd[j]);
         rsw[i].shat = *shats[i];
         rsw[i].eq_rd = build_eq_host(rdf.data(), 7);
@@ -926,7 +893,18 @@ int flock_cuda_prove_blake3(const FlockCudaProveParams* P, uint8_t** out, size_t
         for (int j = 0; j < 128; j++) c = ADD(c, MUL(shat_u[j], rsw[i].eq_rd[j]));
         rsw[i].claim = c;
     }
-    F128 gam[2]; gam[0] = frch(ch.sample_f128()); gam[1] = frch(ch.sample_f128());
+    // The γ batch coefficients: ONE two-word vec squeeze (grind-fused when the
+    // claim-batch policy is on; batching_nonces carries the single nonce).
+    vector<uint64_t> batching_nonces;
+    F128 gam[2];
+    {
+        ChF128 g[2];
+        if (P->gamma_bits > 0)
+            batching_nonces.push_back(ch.grind_pow_and_sample_f128_vec((uint32_t)P->gamma_bits, g, 2));
+        else
+            ch.sample_f128_vec(g, 2);
+        gam[0] = frch(g[0]); gam[1] = frch(g[1]);
+    }
     F128 target = ADD(MUL(gam[0], rsw[0].claim), MUL(gam[1], rsw[1].claim));
 
     // Build the combined basis on the device. Keep it resident for sumcheck.
@@ -947,285 +925,80 @@ int flock_cuda_prove_blake3(const FlockCudaProveParams* P, uint8_t** out, size_t
     CK(ffi_free(d_suffix_ab)); CK(ffi_free(d_suffix_c));
     CK(ffi_free(d_weights_ab)); CK(ffi_free(d_weights_c));
 
-    F128 *p0, *p2, *du0, *du2, *d_sc_part, *d_sc_out;
-    CK(ffi_malloc(&p0, SMC_MAX_BLOCKS * sizeof(F128)));
-    CK(ffi_malloc(&p2, SMC_MAX_BLOCKS * sizeof(F128)));
-    CK(ffi_malloc(&du0, sizeof(F128))); CK(ffi_malloc(&du2, sizeof(F128)));
-    CK(ffi_malloc(&d_sc_part, 8 * SMC_MAX_BLOCKS * sizeof(F128)));
-    CK(ffi_malloc(&d_sc_out, 8 * sizeof(F128)));
-    int initial_message_blocks = sumcheck_blocks(len / 4);
-    sumcheck_lookahead_message_partial<<<initial_message_blocks, SMC_TPB>>>(df, dcb, len / 4, d_sc_part);
-    combine_sumcheck_lookahead_message<<<8, SMC_TPB>>>(d_sc_part, initial_message_blocks, d_sc_out);
-    CK(cudaGetLastError());
-    // ring-switch proof section
-    W.f128s(shat_ab); W.f128s(shat_c);
-
-    // ================= ligerito recursion (test_ligerito_l0 flow) ===========
-    vector<F128> sc_transcript;          // (u0,u2) pairs in transcript order
-    vector<F128> ood_values;
-    vector<uint64_t> grind_nonces, fold_grind_nonces;
-    vector<MHash> rec_roots;
-    struct LevelOpen { vector<F128> rows_flat; size_t n_rows, row_len; vector<MHash> proof; };
-    vector<LevelOpen> level_opens;       // [0] = initial (L0), then per recursive level
-    vector<F128> yr_out;
-
+    // Round-0 message over (witness, combined basis) — the `round0_prime` the
+    // Rust combine pass hands the ladder (the L0 OOD loop then β-batches into
+    // it inside run_ligerito_f256, exactly as the Rust driver does).
+    F128 first_u0, first_u2;
     {
-        ch.observe_label((const uint8_t*)"flock-ligerito-basis-v0", 23);
-        ch.observe_f128(toch(target));
-        ch.observe_bytes(l0root, 32);
-
-        // resident sumcheck state (f, b)
-        F128 *df2, *dcb2;
-        CK(ffi_malloc(&df2, len * sizeof(F128))); CK(ffi_malloc(&dcb2, len * sizeof(F128)));
-        F128 *cf = df, *ccb = dcb, *nf = df2, *ncb = dcb2;
-        long long slen = len;
-        F128 u0, u2;
-
-        vector<F128> initial_challenges;
-        auto observe_initial_message = [&](int message, F128 message_u0,
-                                           F128 message_u2) -> cudaError_t {
-            ch.observe_f128(toch(message_u0)); ch.observe_f128(toch(message_u2));
-            sc_transcript.push_back(message_u0); sc_transcript.push_back(message_u2);
-            if (message == P->initial_k) return cudaSuccess;
-            int bits = P->fold_grinding_bits[0] - message;
-            if (bits < 0) bits = 0;
-            if (bits > 0) {
-                uint64_t nonce;
-                cudaError_t err = grind_pow_device(ch, (uint32_t)bits, nonce);
-                if (err != cudaSuccess) return err;
-                fold_grind_nonces.push_back(nonce);
-            }
-            initial_challenges.push_back(frch(ch.sample_f128()));
-            return cudaSuccess;
-        };
-
-        F128 initial_messages[8];
-        CK(cudaMemcpy(initial_messages, d_sc_out, sizeof(initial_messages), cudaMemcpyDeviceToHost));
-        CK(observe_initial_message(0, initial_messages[0], initial_messages[1]));
-        if (P->initial_k > 0) {
-            CK(observe_initial_message(
-                1,
-                interp3(initial_messages[2], initial_messages[3], initial_messages[4],
-                        initial_challenges[0]),
-                interp3(initial_messages[5], initial_messages[6], initial_messages[7],
-                        initial_challenges[0])));
-        }
-
-        int folds = 0;
-        int next_message = 2;
-        while (folds + 2 <= P->initial_k) {
-            launch_sumcheck_lookahead(cf, ccb, nf, ncb, slen / 16,
-                                       initial_challenges[folds], initial_challenges[folds + 1],
-                                       d_sc_part, d_sc_out);
-            CK(cudaGetLastError());
-            { F128* t; t = cf; cf = nf; nf = t; t = ccb; ccb = ncb; ncb = t; }
-            slen /= 4;
-            folds += 2;
-            CK(cudaMemcpy(initial_messages, d_sc_out, sizeof(initial_messages), cudaMemcpyDeviceToHost));
-            CK(observe_initial_message(next_message, initial_messages[0], initial_messages[1]));
-            next_message++;
-            if (next_message <= P->initial_k) {
-                F128 challenge = initial_challenges.back();
-                CK(observe_initial_message(
-                    next_message,
-                    interp3(initial_messages[2], initial_messages[3], initial_messages[4], challenge),
-                    interp3(initial_messages[5], initial_messages[6], initial_messages[7], challenge)));
-                next_message++;
-            }
-        }
-        while (folds < P->initial_k) {
-            long long half = slen / 2;
-            launch_sumcheck_fold(cf, ccb, nf, ncb, half, initial_challenges[folds]);
-            CK(cudaGetLastError());
-            { F128* t; t = cf; cf = nf; nf = t; t = ccb; ccb = ncb; ncb = t; }
-            slen = half;
-            folds++;
-        }
-
-        // scratch for OOD / intro
-        F128 *d_bnew, *ep0, *ep2, *epodd, *eu0, *eu2, *ehnew;
-        long long n1_len = slen;
-        CK(ffi_malloc(&d_bnew, n1_len * sizeof(F128)));
-        CK(ffi_malloc(&ep0, IGL_MAX_BLOCKS * sizeof(F128))); CK(ffi_malloc(&ep2, IGL_MAX_BLOCKS * sizeof(F128)));
-        CK(ffi_malloc(&epodd, IGL_MAX_BLOCKS * sizeof(F128)));
-        CK(ffi_malloc(&eu0, sizeof(F128))); CK(ffi_malloc(&eu2, sizeof(F128))); CK(ffi_malloc(&ehnew, sizeof(F128)));
-
-        F128* d_prev_cw = d_cw0;
-        uint8_t* d_prev_tree = d_tree0;
-        long long prev_bl = l0_bl; int prev_ni = l0_ni;
-
-        // per-level loop: level 0 handles commit-L1 + OOD + L0 queries; then r-1
-        // more middle levels; the last level ships yr.
-        int r_steps = P->recursive_steps;
-        for (int lvl = 0; ; lvl++) {
-            if (lvl > 0) {
-                int k_rec = P->recursive_ks[lvl - 1];
-                for (int j = 0; j < k_rec; j++) {
-                    int bits = P->fold_grinding_bits[lvl] - j; if (bits < 0) bits = 0;
-                    if (bits > 0) {
-                        uint64_t nonce;
-                        CK(grind_pow_device(ch, (uint32_t)bits, nonce));
-                        fold_grind_nonces.push_back(nonce);
-                    }
-                    F128 r = frch(ch.sample_f128());
-                    long long half = slen / 2;
-                    launch_sumcheck_fold_and_message(cf, ccb, nf, ncb, half, r, p0, p2, du0, du2);
-                    CK(cudaGetLastError());
-                    { F128* t; t = cf; cf = nf; nf = t; t = ccb; ccb = ncb; ncb = t; }
-                    slen = half;
-                    CK(cudaMemcpy(&u0, du0, sizeof(F128), cudaMemcpyDeviceToHost));
-                    CK(cudaMemcpy(&u2, du2, sizeof(F128), cudaMemcpyDeviceToHost));
-                    ch.observe_f128(toch(u0)); ch.observe_f128(toch(u2));
-                    sc_transcript.push_back(u0); sc_transcript.push_back(u2);
-                }
-            }
-
-            if (lvl == r_steps) {
-                // final level: yr in clear, grind, queries, open prev
-                yr_out.resize(slen);
-                CK(cudaMemcpy(yr_out.data(), cf, (size_t)slen * sizeof(F128), cudaMemcpyDeviceToHost));
-                for (long long i = 0; i < slen; i++) ch.observe_f128(toch(yr_out[i]));
-                uint64_t nonce;
-                CK(grind_pow_device(ch, (uint32_t)P->grinding_bits[lvl], nonce));
-                grind_nonces.push_back(nonce);
-                std::vector<size_t> q = ch.sample_distinct_queries((size_t)prev_bl, P->queries[lvl]);
-                LevelOpen lo; lo.n_rows = q.size(); lo.row_len = prev_ni;
-                if (copy_codeword_rows(d_prev_cw, q, prev_ni, lo.rows_flat) != 0) return 100;
-                lo.proof = merkle_multi_proof_device(d_prev_tree, (size_t)prev_bl, q);
-                level_opens.push_back(std::move(lo));
-                break;
-            }
-
-            // middle level: commit next, OOD, grind, queries, open prev, induce, intro
-            int n_next = 0; { long long s = slen; while (s > 1) { s >>= 1; n_next++; } }
-            long long nn_len = 1LL << n_next;
-            int k_comm = P->recursive_ks[lvl];   // lanes of the next level's commit
-            int rate_next = P->log_inv_rates[lvl + 1];
-            F128* d_cwn; uint8_t* d_treen; long long bln; int lanesn; uint8_t rn[32];
-            {
-                int k_code = (n_next - k_comm) + rate_next;
-                int num_ntts = 1 << k_comm;
-                bln = 1LL << k_code; lanesn = num_ntts;
-                long long cw_len = bln * num_ntts;
-                const TwiddleTable* tt;
-                F128* d_tw;
-                CK(get_cached_twiddles(k_code, tt, d_tw));
-                CK(ffi_malloc(&d_cwn, cw_len * sizeof(F128)));
-                CK(ffi_malloc(&d_treen, (size_t)(2 * bln - 1) * 32));
-                // Always the replicate path here: the recursive codewords are
-                // tiny, and the fused src read diverges from the Rust commit at
-                // (k_code - rate) == 8 (first hit at m=33's L4; L0 at every
-                // tested m is fine, so L0 keeps the fusion for the big buffer).
-                {
-                    int tpb = 256;
-                    replicate_prover_message<<<(unsigned)((cw_len + tpb - 1) / tpb), tpb>>>(cf, d_cwn, cw_len, nn_len);
-                    launch_ntt(d_cwn, d_tw, *tt, rate_next, k_code, num_ntts);
-                }
-                CK(cudaGetLastError());
-                launch_merkle((const uint8_t*)d_cwn, d_treen, bln, num_ntts * 16);
-                CK(cudaDeviceSynchronize());
-                CK(cudaMemcpy(rn, d_treen + (size_t)(2 * bln - 2) * 32, 32, cudaMemcpyDeviceToHost));
-            }
-            ch.observe_bytes(rn, 32);
-            { MHash h; memcpy(h.b, rn, 32); rec_roots.push_back(h); }
-
-            for (int o = 0; o < P->ood_samples[lvl + 1]; o++) {
-                std::vector<ChF128> zc_(n_next); ch.sample_f128_vec(zc_.data(), n_next);
-                vector<F128> zf(n_next);
-                for (int i = 0; i < n_next; i++) zf[i] = frch(zc_[i]);
-                build_eq_device(d_bnew, zf.data(), n_next);
-                launch_basis_message_evaluation(cf, d_bnew, nn_len / 2, ep0, ep2, epodd, eu0, eu2, ehnew);
-                CK(cudaGetLastError());
-                F128 iu0, iu2, y;
-                CK(cudaMemcpy(&iu0, eu0, sizeof(F128), cudaMemcpyDeviceToHost));
-                CK(cudaMemcpy(&iu2, eu2, sizeof(F128), cudaMemcpyDeviceToHost));
-                CK(cudaMemcpy(&y, ehnew, sizeof(F128), cudaMemcpyDeviceToHost));
-                ch.observe_f128(toch(y));
-                ood_values.push_back(y);
-                ch.observe_f128(toch(iu0)); ch.observe_f128(toch(iu2));
-                sc_transcript.push_back(iu0); sc_transcript.push_back(iu2);
-                ChF128 bc = ch.sample_f128();
-                launch_glue(ccb, d_bnew, frch(bc), nn_len);
-                CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
-            }
-
-            uint64_t nonce;
-            CK(grind_pow_device(ch, (uint32_t)P->grinding_bits[lvl], nonce));
-            grind_nonces.push_back(nonce);
-            std::vector<size_t> q = ch.sample_distinct_queries((size_t)prev_bl, P->queries[lvl]);
-            int al = 0; { int mq = P->queries[lvl] - 1; while (mq) { al++; mq >>= 1; } }
-            if (P->queries[lvl] <= 1) al = 0;
-            std::vector<ChF128> alpha(al); ch.sample_f128_vec(alpha.data(), al);
-            vector<F128> alpha_f(al);
-            for (int i = 0; i < al; i++) alpha_f[i] = frch(alpha[i]);
-
-            LevelOpen lo; lo.n_rows = q.size(); lo.row_len = prev_ni;
-            if (copy_codeword_rows(d_prev_cw, q, prev_ni, lo.rows_flat) != 0) return 100;
-            lo.proof = merkle_multi_proof_device(d_prev_tree, (size_t)prev_bl, q);
-
-            std::vector<unsigned long long> qull(q.size());
-            for (size_t i = 0; i < q.size(); i++) qull[i] = q[i];
-            level_opens.push_back(std::move(lo));
-            static InduceScratch induce_scratch;
-            long long alpha_len = 1LL << al;
-            CK(grow_buffer(induce_scratch.alpha, induce_scratch.alpha_capacity, alpha_len));
-            CK(grow_buffer(induce_scratch.basis, induce_scratch.basis_capacity, prev_bl));
-            CK(grow_query_buffer(induce_scratch, qull.size()));
-            build_eq_device(induce_scratch.alpha, alpha_f.data(), al);
-            CK(cudaGetLastError());
-            CK(cudaMemcpy(induce_scratch.queries, qull.data(),
-                          qull.size() * sizeof(unsigned long long), cudaMemcpyHostToDevice));
-            const TwiddleTable* induce_tt;
-            F128* induce_twiddles;
-            int log_block = 0;
-            for (long long block = prev_bl; block > 1; block >>= 1) log_block++;
-            CK(get_cached_twiddles(log_block, induce_tt, induce_twiddles));
-            clear_field_elements<<<(unsigned)((prev_bl + 255) / 256), 256>>>(induce_scratch.basis, prev_bl);
-            scatter_query_weights<<<(unsigned)((qull.size() + 255) / 256), 256>>>(
-                induce_scratch.basis, induce_scratch.queries, induce_scratch.alpha,
-                (int)qull.size());
-            launch_transpose_ntt(induce_scratch.basis, induce_twiddles, *induce_tt, log_block);
-            CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
-            F128* d_basis = induce_scratch.basis;
-
-            // introduce + glue
-            { long long quads = nn_len / 2;
-              int pblocks = sumcheck_blocks(quads);
-              sumcheck_message_partial<<<pblocks, SMC_TPB>>>(cf, d_basis, quads, p0, p2);
-              combine_sumcheck_message<<<1, SMC_TPB>>>(p0, p2, pblocks, du0, du2);
-              CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
-              CK(cudaMemcpy(&u0, du0, sizeof(F128), cudaMemcpyDeviceToHost));
-              CK(cudaMemcpy(&u2, du2, sizeof(F128), cudaMemcpyDeviceToHost)); }
-            ch.observe_f128(toch(u0)); ch.observe_f128(toch(u2));
-            sc_transcript.push_back(u0); sc_transcript.push_back(u2);
-            ChF128 bi = ch.sample_f128();
-            launch_glue(ccb, d_basis, frch(bi), nn_len);
-            CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
-            ffi_free(d_prev_cw); ffi_free(d_prev_tree);
-            d_prev_cw = d_cwn; d_prev_tree = d_treen;
-            prev_bl = bln; prev_ni = lanesn;
-        }
-
-        ffi_free(d_prev_cw); ffi_free(d_prev_tree);
-
-        ffi_free(dcb); ffi_free(df2); ffi_free(dcb2);
-        ffi_free(p0); ffi_free(p2); ffi_free(du0); ffi_free(du2);
-        ffi_free(d_sc_part); ffi_free(d_sc_out);
-        ffi_free(d_bnew); ffi_free(ep0); ffi_free(ep2); ffi_free(epodd);
-        ffi_free(eu0); ffi_free(eu2); ffi_free(ehnew);
+        F128 *p0, *p2, *du0, *du2;
+        CK(ffi_malloc(&p0, SMC_MAX_BLOCKS * sizeof(F128)));
+        CK(ffi_malloc(&p2, SMC_MAX_BLOCKS * sizeof(F128)));
+        CK(ffi_malloc(&du0, sizeof(F128))); CK(ffi_malloc(&du2, sizeof(F128)));
+        launch_sumcheck_message(df, dcb, len / 2, p0, p2, du0, du2);
+        CK(cudaGetLastError());
+        CK(cudaMemcpy(&first_u0, du0, sizeof(F128), cudaMemcpyDeviceToHost));
+        CK(cudaMemcpy(&first_u2, du2, sizeof(F128), cudaMemcpyDeviceToHost));
+        CK(ffi_free(p0)); CK(ffi_free(p2)); CK(ffi_free(du0)); CK(ffi_free(du2));
     }
-    ffi_free(df);
+    // ring-switch proof section (each claim: s_hat_v + its r'' PoW nonce),
+    // then the γ batching nonce list.
+    W.f128s(shat_ab); W.u64(rsw[0].nonce);
+    W.f128s(shat_c); W.u64(rsw[1].nonce);
+    W.u64(batching_nonces.size());
+    for (uint64_t n : batching_nonces) W.u64(n);
+
+    // ================= ligerito recursion: the F256 fold ladder =============
+    // (ligerito_f256.cuh — port of extension.rs::recursive_prover_with_basis_impl;
+    // capped Merkle, stratified queries, claim/consistency PoW, code switches.)
+    LigF256Proof lig;
+    {
+        LigF256Config LC;
+        LC.log_n = log_n;
+        LC.initial_k = P->initial_k;
+        LC.recursive_steps = P->recursive_steps;
+        LC.log_inv_rates = P->log_inv_rates;
+        LC.recursive_ks = P->recursive_ks;
+        LC.queries = P->queries;
+        LC.grinding_bits = P->grinding_bits;
+        LC.claim_batch_grinding_bits = P->claim_batch_grinding_bits;
+        LC.consistency_batch_grinding_bits = P->consistency_batch_grinding_bits;
+        LC.ood_samples = P->ood_samples;
+        LigAlloc arena{lig_arena_alloc, lig_arena_release};
+        int rc = run_ligerito_f256(LC, ch, target, first_u0, first_u2, df, dcb,
+                                   d_cw0, d_tree0, l0_bl, l0_ni, arena, lig);
+        if (rc != 0) { printf("FFI: ligerito F256 ladder failed (%d)\n", rc); return rc; }
+    }
+    ffi_free(d_cw0); ffi_free(d_tree0);
+    ffi_free(df); ffi_free(dcb);
 
     // ================= ligerito proof section ===============================
-    W.u64(rec_roots.size()); for (auto& h : rec_roots) W.hash(h.b);
-    W.u64(level_opens.size());
-    for (auto& lo : level_opens) { W.rows(lo.rows_flat, lo.n_rows, lo.row_len); W.hashes(lo.proof); }
-    W.f128s(yr_out);
-    W.u64(sc_transcript.size() / 2);
-    for (size_t i = 0; i < sc_transcript.size(); i += 2) { W.f128(sc_transcript[i]); W.f128(sc_transcript[i + 1]); }
-    W.f128s(ood_values);
-    W.u64(grind_nonces.size()); for (auto n : grind_nonces) W.u64(n);
-    W.u64(fold_grind_nonces.size()); for (auto n : fold_grind_nonces) W.u64(n);
+    // recursive caps (levels 1..r), each absorbed flattened.
+    W.u64(lig.recursive_caps.size());
+    for (auto& cap : lig.recursive_caps) W.hashes(cap);
+    // level opens: L0, then trees 1..r-1, then the final tree — each rows +
+    // capped per-query paths.
+    auto write_open = [&](const LigLevelOpen& lo) {
+        W.rows(lo.rows_flat, lo.n_rows, lo.row_len);
+        W.hashes(lo.path);
+    };
+    W.u64(2 + lig.recursive_opens.size());
+    write_open(lig.initial_open);
+    for (auto& lo : lig.recursive_opens) write_open(lo);
+    write_open(lig.final_open);
+    W.f128s(lig.yr);
+    // sumcheck_transcript_f256: (u0.c0, u0.c1, u2.c0, u2.c1) per message.
+    W.u64(lig.transcript.size());
+    for (auto& msg : lig.transcript) {
+        W.f128(msg.u0.c0); W.f128(msg.u0.c1);
+        W.f128(msg.u2.c0); W.f128(msg.u2.c1);
+    }
+    W.f128s(lig.ood_values);
+    W.u64(lig.grinding_nonces.size());
+    for (auto n : lig.grinding_nonces) W.u64(n);
+    W.u64(lig.claim_batch_nonces.size());
+    for (auto n : lig.claim_batch_nonces) W.u64(n);
+    W.u64(lig.consistency_batch_nonces.size());
+    for (auto n : lig.consistency_batch_nonces) W.u64(n);
 
     *out_len = W.buf.size();
     *out = (uint8_t*)malloc(W.buf.size());

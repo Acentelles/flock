@@ -2271,3 +2271,104 @@ inside the commit window (AB-hoist, certified) is catastrophic inside
 the witness window. E-core value is entirely window-boundedness-
 dependent. Reverted; patch (631 lines incl. chunked prep API) in
 scratchpad/streamed_prep.patch.
+
+---
+
+## MAIN-MERGE PHASE (2026-08-28 →)
+
+Directive: adopt main's protocol (676 commits: recursion_circuit, f256
+two-point OOD, ag-union, lagrange-const-denom, legacy-hardening, bloat
+phase 1, tower-split), merging mainline PRs one at a time, keeping our
+kernel/substrate performance work wherever it still has a live call
+path, and re-porting the rest as measured follow-ups.
+
+### Merge step 1: PR #26 recursion_circuit (600a901) — 2026-08-28
+
+**Scope surprise:** the upstream feature branches cross-merged, so
+#26's tip already carries the f256 configs, the two-point-OOD f256
+split opening, the union (lane-major, integer-lane) commit transport,
+per-challenge grinding, and the sparse (M6) zerocheck tail. The
+protocol jump lands HERE; later steps should be much smaller.
+
+**53 conflicts.** Resolution policy: main wins protocol semantics
+(configs, grinding schedule, opening structure, drivers); ours wins
+kernels/substrate. Per-file outcomes:
+
+- 42 config TOMLs: theirs (f256, queries 279, fold_grinding 0,
+  claim/consistency batch grinding, ood_samples). Our blake3 hash
+  default REVERTED to main's sha256 (generator + derivation test are
+  main's; flipping the default is a one-commit DECISION ITEM for
+  later — benches select blake3 via FLOCK_MERKLE_HASH/FLOCK_FS_HASH,
+  which survived). hash.rs default likewise back to Sha256; our two
+  default-hash tests updated.
+- scratch.rs: hand-merged. Theirs' pool upgrades kept (4x capacity
+  window, class-aware eviction, POOL_TRACE, f256 view pool, zero pool,
+  prewarm budget/union) + our provenance-tag API re-applied on top
+  (tagged tuples, take/give_f128_tagged). Their U8_POOL replaces our
+  duplicate POOL_U8.
+- additive_ntt_f128.rs: hand-merged. Theirs' integer-lane + live-lane
+  (dead-lane skip) machinery + parallelism floor kept; our on_sub
+  per-sub-group hook, from_message fusion, ranked radix-8 top and
+  interleaved_n_top helper kept (helper updated to ceil_log2 for
+  integer lanes). Both sides' tests kept.
+- pcs/commit.rs: hand-merged. Theirs' lane-major commit
+  (commit_lane_major, dense_lanes, finalize_commit, cap-based
+  Commitment) + our streaming pipelined commit + stage split kept;
+  pipelined path now emits the cap; pipeline gated to pow2 lanes
+  (integer-lane goes lane-major/staged); pow2 msg-len asserts
+  loosened to msg_len_f128().
+- pcs.rs, ligerito.rs, ring_switch.rs: THEIRS WHOLESALE (f256-split
+  opening is a rewrite; our f128 direct-open, boundary fusion,
+  composed-table sweep, lazy-OOD glue have no call path in it).
+  RE-PORT CANDIDATES, assessed against the new opening.
+- zerocheck.rs: THEIRS WHOLESALE (grinding + sparse-M6 driver).
+  multilinear.rs hand-merged: theirs' generic kernel restructure +
+  runs/sparse machinery kept, our integrated-lookahead round 2 and
+  compact-K section re-appended (adapted to single-run
+  round2_pair_skip). Driver wiring for cascade/compact-K NOT yet
+  re-grafted — RE-GRAFT ITEM (transcript-identical, so it layers
+  cleanly).
+- prover.rs, r1cs_hashes/blake3.rs: THEIRS WHOLESALE (union driver;
+  auto-merge garbled ours in). Lost for now: stripe-C zerocheck entry,
+  AB-hoist (gate returns false with note — its consumer is the
+  stripe-C entry), tagged witness give-backs, streamed full-write
+  witness builder + provenance elision. All RE-GRAFT ITEMS. prove_fast
+  now runs the UNION prover; prove_fast_timed decomposes the legacy
+  direct path (bench labeled accordingly; union breakdown via
+  PCS_TRACE=1).
+
+**Tests:** flock-core 563 green, flock-prover 114 green, ignored
+roundtrips green (batch-major prove_fast, prove_fast_ag, ligerito
+roundtrip, const-pin). Two auto-merge stitch bugs caught at compile
+(fused_2layer_row_op arity, build_b_med_counts arity); one caught by
+tests (pipelined commit cap). Lesson re-confirmed: auto-merged regions
+of co-evolved files are STITCH HAZARDS — the failures were loud, but
+only because main's test additions (derivation test, l0-matches-full)
+covered them.
+
+**Step-1 bench snapshot** (m=32, grind-free, blake3 via env, warm,
+single session — indicative, not certified):
+- Union headline prove_fast: best 879.5 ms (runs 1.13 s / 879.5 ms /
+  1.11 s) vs 465 ms pre-merge = 1.89x. Peak memory 8.93 GB. Proof
+  567.31 KiB (was 427.30).
+- Union phases (PCS_TRACE, warm run): commit 259 ms (staged lane-major
+  — no streaming pipeline on this path yet), boolean zerocheck +
+  lincheck 284–458 ms (noisy; no compact-K/cascade), open 266–297 ms
+  (f256 split: W build ~40, merged sumcheck ~18–37, inner ligerito
+  ~193–222), witgen ~free (batch-major partial + zero pool).
+- Legacy direct path (prove_fast_timed, one cool run): witness 51 ms,
+  commit 193 ms, zerocheck 1.56 s (!!), lincheck 84 ms, open 393 ms.
+  The 1.56 s zc is an OPEN ITEM — smells like the generic run-list
+  (scalar) round-2 kernel or a mis-gated fast path on the direct
+  spec; investigate during the zc re-graft.
+
+**Re-port/re-graft queue** (each as its own measured commit, after the
+remaining merge steps land): (1) zc cascade + compact-K driver wiring
+onto the grinding driver; (2) streaming/pipelined commit for the
+lane-major union L0; (3) stripe-C + AB-hoist onto the union/direct
+drivers; (4) streamed witness builder + provenance elision for the
+batch-major generator; (5) direct-open/boundary-fusion ideas vs the
+f256-split opening (assess — the opening changed shape); (6) direct
+path zc 1.56 s anomaly; (7) DECISION: flip default hash to blake3
+repo-wide (generator + TOMLs + tests) or keep sha256 default with env
+selection for benches.

@@ -67,6 +67,8 @@ impl F128 {
     /// Multiplicative inverse via Fermat: x^{2^128 − 2}.
     /// Used in one-time setup (Lagrange weight computation), not in hot paths.
     pub fn inv(self) -> Self {
+        #[cfg(feature = "mul-count")]
+        op_count::INVS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // x^{2^128 - 2} = ∏_{i=1..127} x^{2^i}
         let mut r = Self::ONE;
         let mut cur = self * self; // x^2
@@ -97,10 +99,84 @@ impl AddAssign for F128 {
     }
 }
 
+/// Global field-operation counters, enabled with `--features mul-count`.
+///
+/// Answers "where does the verifier's arithmetic go", which has **two
+/// different answers** depending on whether you are costing the native
+/// verifier or the recursion circuit:
+///
+/// - *natively* an inversion is `x^(2^128−2)`, i.e. 127 squarings + 127
+///   multiplications — see [`F128::inv`]. It is ~255 muls, and a routine with
+///   many inversions is dominated by them.
+/// - *in-circuit* an inversion is **one constraint**: witness `y`, assert
+///   `x·y = 1`. It costs the same as a multiplication.
+///
+/// So [`Snapshot::native_muls`] and [`Snapshot::circuit_constraints`] can rank
+/// the same routines very differently, and both are reported. Ranking circuit
+/// work by native profiling is precisely the mistake this exists to prevent.
+#[cfg(feature = "mul-count")]
+pub mod op_count {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    /// Every `F128 * F128`, including the ones inside [`super::F128::inv`].
+    pub static MULS: AtomicU64 = AtomicU64::new(0);
+    /// Every [`super::F128::inv`] call.
+    pub static INVS: AtomicU64 = AtomicU64::new(0);
+
+    /// Muls performed inside one `inv`: `cur = self*self`, then 127 iterations
+    /// of `r *= cur; cur = cur*cur`. Pinned by `inv_mul_cost_is_stable`.
+    pub const MULS_PER_INV: u64 = 255;
+
+    pub fn reset() {
+        MULS.store(0, Relaxed);
+        INVS.store(0, Relaxed);
+    }
+
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct Snapshot {
+        /// Multiplications actually executed, inversion internals included.
+        pub native_muls: u64,
+        pub invs: u64,
+    }
+
+    impl Snapshot {
+        /// Multiplications excluding inversion internals — the "real" mul
+        /// count of the algorithm.
+        pub fn muls_excluding_inv(&self) -> u64 {
+            self.native_muls.saturating_sub(self.invs * MULS_PER_INV)
+        }
+
+        /// What this costs the recursion circuit: one element-class
+        /// constraint per multiplication, and one per inversion (witnessed
+        /// reciprocal plus `x·y = 1`).
+        pub fn circuit_constraints(&self) -> u64 {
+            self.muls_excluding_inv() + self.invs
+        }
+    }
+
+    pub fn snapshot() -> Snapshot {
+        Snapshot {
+            native_muls: MULS.load(Relaxed),
+            invs: INVS.load(Relaxed),
+        }
+    }
+
+    /// Reset, run `f`, and report what it cost. Not reentrant and not
+    /// thread-isolated — the counters are global, so measure one thing at a
+    /// time on an otherwise idle process.
+    pub fn measure<T>(f: impl FnOnce() -> T) -> (T, Snapshot) {
+        reset();
+        let out = f();
+        (out, snapshot())
+    }
+}
+
 impl Mul for F128 {
     type Output = Self;
     #[inline]
     fn mul(self, rhs: Self) -> Self {
+        #[cfg(feature = "mul-count")]
+        op_count::MULS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
         {
             // SAFETY: aes target feature is enabled at compile time.
@@ -322,6 +398,25 @@ mod tests {
             assert_eq!(a + F128::ZERO, a);
             assert_eq!(a + a, F128::ZERO);
         }
+    }
+
+    /// `op_count::MULS_PER_INV` is what separates an algorithm's real
+    /// multiplication count from the ones buried inside `inv`, so the whole
+    /// attribution in `benches/verifier_mul_count.rs` rests on it. Pinned
+    /// against the live `inv`, which is where it would silently drift.
+    #[cfg(feature = "mul-count")]
+    #[test]
+    fn inv_mul_cost_is_stable() {
+        let (_, s) =
+            op_count::measure(|| F128::new(0x1234_5678_9ABC_DEF0, 0x0FED_CBA9_8765_4321).inv());
+        assert_eq!(s.invs, 1);
+        assert_eq!(
+            s.native_muls,
+            op_count::MULS_PER_INV,
+            "inv's multiplication count moved; MULS_PER_INV is now wrong"
+        );
+        assert_eq!(s.muls_excluding_inv(), 0);
+        assert_eq!(s.circuit_constraints(), 1, "an inversion is ONE constraint");
     }
 
     #[test]

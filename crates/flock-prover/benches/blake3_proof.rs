@@ -95,11 +95,17 @@ fn bench_one(n_blocks: usize, n_runs: usize) {
         witness_bytes >> 20
     );
 
-    // BLAKE3_BATCH_MAJOR=1 switches the witness layout (WitnessLayout::BatchMajor).
-    let mut setup = if std::env::var_os("BLAKE3_BATCH_MAJOR").is_some() {
-        Blake3Setup::new_batch_major(n_blocks)
-    } else {
-        Blake3Setup::new(n_blocks)
+    // BLAKE3_PROFILE=fast|slim|secure selects the Ligerito profile (default fast).
+    let mut setup = match std::env::var("BLAKE3_PROFILE").as_deref() {
+        Ok("slim") => {
+            Blake3Setup::with_profile(n_blocks, flock_prover::pcs::ligerito::LigeritoProfile::Slim)
+        }
+        Ok("secure") => Blake3Setup::with_profile(
+            n_blocks,
+            flock_prover::pcs::ligerito::LigeritoProfile::Secure,
+        ),
+        Ok("fast") | Err(_) => Blake3Setup::new(n_blocks),
+        Ok(p) => panic!("BLAKE3_PROFILE must be fast, slim, or secure (got {p})"),
     };
     // FLOCK_MERKLE_HASH=sha256|blake3 selects the PCS Merkle hash (default
     // sha256). Setting it on `pcs_params` is enough: the Ligerito prover and
@@ -159,8 +165,6 @@ fn bench_one(n_blocks: usize, n_runs: usize) {
             fmt_ms(elapsed)
         );
     }
-    // The per-phase breakdown below uses the warm-up block set.
-    let blocks = &block_sets[0];
     println!(
         "  best prove_fast: {}  ({:.0} compressions/sec)",
         fmt_ms(best_fast),
@@ -198,10 +202,13 @@ fn bench_one(n_blocks: usize, n_runs: usize) {
         black_box(&bundle);
     }
 
-    // Per-phase breakdown of the *real* Ligerito prover (witness gen + commit +
-    // zerocheck + lincheck + recursive PCS open) via prove_fast_timed, so the
-    // phases decompose exactly the prover the headline number runs.
-    println!("  [prove_fast breakdown]");
+    // Per-phase breakdown NOTE: `prove_fast` now runs the UNION prover, whose
+    // own breakdown prints under `PCS_TRACE=1`; `prove_fast_timed` decomposes
+    // the legacy direct-path prover — a DIFFERENT prover from the headline.
+    // The timed breakdown below is kept for the phase TSV consumers but is
+    // labeled as the direct path. Uses the warm-up block set.
+    let blocks = &block_sets[0];
+    println!("  [prove_fast_timed breakdown — direct path, NOT the union headline]");
     let mut ch = fs();
     let (proof, _commitment, _claim, tm) = setup.prove_fast_timed(blocks, &mut ch);
     println!(

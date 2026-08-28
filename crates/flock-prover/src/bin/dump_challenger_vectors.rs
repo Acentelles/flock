@@ -153,6 +153,84 @@ fn main() -> std::io::Result<()> {
         emit!(&t);
     }
 
+    // 6c. sample_f256 (one two-word vec squeeze — the F256 ladder's fold challenges)
+    for _ in 0..2 {
+        let r = ch.sample_f256();
+        let c = r.coordinates();
+        let mut t = vec![9u8];
+        for w in c {
+            t.extend_from_slice(&w.lo.to_le_bytes());
+            t.extend_from_slice(&w.hi.to_le_bytes());
+        }
+        emit!(&t);
+    }
+    // 6d. observe_f256 (two-coordinate slice observe — ladder message absorbs)
+    {
+        let v = flock_prover::field::F256::new(rng.f128(), rng.f128());
+        ch.observe_f256(v);
+        let c = v.coordinates();
+        let mut t = vec![10u8];
+        for w in c {
+            t.extend_from_slice(&w.lo.to_le_bytes());
+            t.extend_from_slice(&w.hi.to_le_bytes());
+        }
+        emit!(&t);
+    }
+    // 6e. fused grind + scalar squeeze (claim-batch β sites; includes bits=0,
+    // which still absorbs the canonical 0 nonce)
+    for &bits in &[0u32, 6u32] {
+        let (nonce, r) = ch.grind_pow_and_sample_f128(bits);
+        let mut t = vec![11u8];
+        t.extend_from_slice(&bits.to_le_bytes());
+        t.extend_from_slice(&nonce.to_le_bytes());
+        t.extend_from_slice(&r.lo.to_le_bytes());
+        t.extend_from_slice(&r.hi.to_le_bytes());
+        emit!(&t);
+    }
+    // 6f. fused grind + vector squeeze (consistency-α / γ sites)
+    {
+        let (bits, n) = (3u32, 7usize);
+        let (nonce, rs) = ch.grind_pow_and_sample_f128_vec(bits, n);
+        let mut t = vec![12u8];
+        t.extend_from_slice(&bits.to_le_bytes());
+        t.extend_from_slice(&(n as u32).to_le_bytes());
+        t.extend_from_slice(&nonce.to_le_bytes());
+        for v in &rs {
+            t.extend_from_slice(&v.lo.to_le_bytes());
+            t.extend_from_slice(&v.hi.to_le_bytes());
+        }
+        emit!(&t);
+    }
+    // 6g. stratified query phase (grind_and_sample_queries): PoW + ONE
+    // `count`-word squeeze + the schedule mapping. The schedule comes from
+    // the real LevelSchedule::decompose; the word→index mapping mirrors
+    // ligerito.rs::queries_from_words (private — spec inlined here).
+    {
+        use flock_prover::pcs::stratified::LevelSchedule;
+        let (bits, log_block_len, count) = (2u32, 10usize, 279usize);
+        let sched = LevelSchedule::decompose(count, log_block_len);
+        assert_eq!(sched.queries(), count);
+        let (nonce, words) = ch.grind_pow_and_sample_f128_vec(bits, count);
+        let queries: Vec<usize> = sched
+            .query_strata()
+            .zip(&words)
+            .map(|((c, stratum), v)| {
+                let lo_bits = log_block_len - c;
+                let mask = (1usize << lo_bits) - 1;
+                (stratum << lo_bits) | ((v.lo as usize) & mask)
+            })
+            .collect();
+        let mut t = vec![13u8];
+        t.extend_from_slice(&bits.to_le_bytes());
+        t.extend_from_slice(&(log_block_len as u32).to_le_bytes());
+        t.extend_from_slice(&(count as u32).to_le_bytes());
+        t.extend_from_slice(&nonce.to_le_bytes());
+        for &q in &queries {
+            t.extend_from_slice(&(q as u64).to_le_bytes());
+        }
+        emit!(&t);
+    }
+
     // 7. observe a label, then sample again (binds to everything above)
     {
         let label = b"level-1";

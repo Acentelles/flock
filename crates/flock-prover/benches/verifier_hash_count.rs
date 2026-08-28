@@ -46,11 +46,32 @@ fn reset_counters() {
 
 fn report(label: &str, blake3_bytes: u64) {
     let (leaf_calls, leaf_compr, pair_calls) = hash_count::snapshot();
-    let (squeezes, pow) = fs_count::snapshot();
+    let (squeezes, squeezed_bytes, pow) = fs_count::snapshot();
     let sha_total = leaf_compr + 2 * pair_calls + pow;
-    // BLAKE3 estimate: 1 compression per 64-byte block, 1 parent per 1 KiB
-    // chunk, ~2 extra per squeeze for finalization of the pending state.
-    let blake3_est = blake3_bytes.div_ceil(64) + blake3_bytes.div_ceil(1024) + 2 * squeezes;
+
+    // BLAKE3 estimate, broken out because the FS chain table has to be sized
+    // off the parts, not the total — they differ in how they parallelize.
+    //
+    //   absorb blocks : 1 compression per 64-byte input block. Sequential
+    //                   WITHIN a 1 KiB chunk (16 blocks), independent across
+    //                   chunks.
+    //   parent tree   : ~1 parent compression per chunk, combining chunk CVs.
+    //   finalizations : 1 per squeeze, for the pending state at that point.
+    //                   These are what serialize the transcript, since each
+    //                   squeeze's output is re-absorbed.
+    //   xof output    : 1 compression per 64 bytes of squeezed output,
+    //                   counter-mode off the root CV, so mutually INDEPENDENT.
+    //
+    // The old form charged a flat `2 * squeezes`, which silently assumed every
+    // squeeze produced ≤ 64 bytes of output. True while each was a 16-byte
+    // `sample_f128`; wrong by ~60x per level once query sampling became one
+    // batched `sample_f128_vec` (3888 bytes at L0). Hence the explicit split.
+    let absorb_blocks = blake3_bytes.div_ceil(64);
+    let parent_tree = blake3_bytes.div_ceil(1024);
+    let finalizations = squeezes;
+    let xof_output = squeezed_bytes.div_ceil(64);
+    let blake3_est = absorb_blocks + parent_tree + finalizations + xof_output;
+
     println!("  [{label}]");
     println!("    SHA-256 leaf hashes : {leaf_calls:>8} calls = {leaf_compr:>8} compressions");
     println!(
@@ -60,7 +81,10 @@ fn report(label: &str, blake3_bytes: u64) {
     println!("    SHA-256 PoW checks  : {pow:>8} calls = {pow:>8} compressions");
     println!("    SHA-256 TOTAL       : {sha_total:>8} compressions");
     println!(
-        "    BLAKE3 FS transcript: {blake3_bytes:>8} bytes absorbed, {squeezes} squeezes ≈ {blake3_est} compressions"
+        "    BLAKE3 FS transcript: {blake3_bytes:>8} bytes absorbed, {squeezes} squeezes, {squeezed_bytes} bytes squeezed"
+    );
+    println!(
+        "      absorb blocks {absorb_blocks:>5} | parent tree {parent_tree:>4} | finalizations {finalizations:>4} | xof output {xof_output:>5}  ≈ {blake3_est} compressions"
     );
     println!(
         "    GRAND TOTAL (SHA-256 + BLAKE3 est.) ≈ {} compressions",
@@ -83,6 +107,11 @@ fn run(m: usize, rate: usize) {
     let mut ch_p = FsChallenger::new(b"flock-hash-count");
     let (proof, commitment, _) = setup.prove_fast(&blocks, &mut ch_p);
     println!("  (prove: {:.1} s)", t0.elapsed().as_secs_f64());
+    println!(
+        "  PCS open proof: {} B (+ {} cap nodes in the commitment)",
+        proof.pcs_open.ligerito.size_bytes(),
+        commitment.cap.len(),
+    );
 
     reset_counters();
     let mut ch_v = FsChallenger::new(b"flock-hash-count");

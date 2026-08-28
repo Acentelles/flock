@@ -1,0 +1,277 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1.1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{enumitem}
+
+\newtheorem{lemma}{Lemma}
+\newtheorem{theorem}{Theorem}
+\newcommand{\F}{\mathbb{F}}
+\newcommand{\eq}{\mathrm{eq}}
+\newcommand{\code}[1]{\texttt{#1}}
+
+\title{The multipoint twisted evaluation:\\ soundness of the Frobenius-assist replacement}
+\author{flock — recursion track}
+\date{2026-08-02 (v0.2: the two-product grouping)}
+
+\begin{document}
+\maketitle
+
+\section{The statement, and why the assist is replaced}
+
+Let $\F = \F_{2^{128}}$ and let $\bar a_1,\dots,\bar a_K : \{0,1\}^m \to \F$
+be the per-claim weight vectors of the merged opening (each $\bar a_i$ is an
+eq-tensor product determined by the claim's row/column point; the verifier
+knows its MLE $\hat a_i$ symbolically but cannot afford to materialize it).
+Each claim carries an $\F_2$-linear fold map in linearized form,
+$\Phi_i(x) = \sum_{j=0}^{127} c_{i,j}\, x^{2^j}$, and the quantity the merged
+opening needs is the \emph{twisted evaluation}
+\[
+  V \;=\; \widehat W(\rho), \qquad
+  W(d) = \sum_i \Phi_i(\bar a_i(d)),
+\]
+at the sumcheck endpoint $\rho \in \F^m$. Expanding,
+\[
+  V = \sum_{i,j} c_{i,j} \sum_{d\in\{0,1\}^m} \bar a_i(d)^{2^j}\,\eq(\rho,d).
+\]
+The shipped assist proves each inner sum by a per-statement dynamic program;
+a ring-switched claim contributes $128$ statements with \emph{distinct}
+(squared) row points, so they do not group, and the verifier pays
+$O(128\,K\cdot 2^{\kappa}\, m)$ — family~K of the verifier map, the one
+phase with no in-circuit story. The multipoint protocol replaces the $128K$
+statements with: $128K$ \emph{claimed scalars}, one $m$-round product
+sumcheck, one closed-form evaluation, and \emph{one} untwisted assist.
+
+\section{The twisted-eq lemma}
+
+\begin{lemma}[twisted eq]\label{lem:twist}
+Let $f:\{0,1\}^m\to\F$ be any function, $\hat f$ its multilinear extension,
+$\rho\in\F^m$, and $j\ge 0$. Write $\rho^{2^{-j}}$ for the coordinate-wise
+$2^{-j}$-th Frobenius power (well defined: $x\mapsto x^2$ is an automorphism
+of $\F$). Then
+\[
+  \sum_{d\in\{0,1\}^m} f(d)^{2^j}\,\eq(\rho,d)
+  \;=\;
+  \Bigl(\hat f\bigl(\rho^{2^{-j}}\bigr)\Bigr)^{2^j}.
+\]
+\end{lemma}
+
+\begin{proof}
+Frobenius $x\mapsto x^{2^j}$ is additive and multiplicative on $\F$ (char
+2). For Boolean $d$ each coordinate factor of the eq tensor satisfies
+$\eq(\rho_t, d_t) = \rho_t d_t + (1+\rho_t)(1+d_t)$, and since
+$d_t^{2^{-j}} = d_t$ for $d_t \in \{0,1\}$,
+$\eq(\rho_t, d_t) = \bigl(\eq(\rho_t^{2^{-j}}, d_t)\bigr)^{2^j}$.
+Multiplying over $t$ and summing over $d$:
+\[
+  \sum_d f(d)^{2^j} \eq(\rho,d)
+  = \sum_d \bigl(f(d)\,\eq(\rho^{2^{-j}},d)\bigr)^{2^j}
+  = \Bigl(\sum_d f(d)\,\eq(\rho^{2^{-j}},d)\Bigr)^{2^j}
+  = \hat f(\rho^{2^{-j}})^{2^j}. \qedhere
+\]
+\end{proof}
+
+Hence with $A_{i,j} := \hat a_i(\rho^{2^{-j}})$ (the ``dual-form values''),
+$V = \sum_{i,j} c_{i,j}\, A_{i,j}^{2^j}$: the verifier that knows the true
+$A_{i,j}$ recovers $V$ with $128K$ cheap squarings and multiplications, no
+DP per statement.
+
+\section{The protocol}
+
+Implemented as \code{prove\_multipoint\_twisted} /
+\code{verify\_multipoint\_twisted} (\code{jagged.rs}).
+
+\begin{enumerate}[nosep]
+  \item The prover sends the $128K$ claimed values $A'_{i,j}$; all are
+        absorbed. The verifier squeezes $\gamma$ and sets the target
+        $T_0 = \sum_{i,j} \gamma^{128 i + j} A'_{i,j}$.
+  \item Both parties run an $m$-round degree-2 sumcheck
+        (\code{fold\_round\_claim} rounds) for
+        \[
+          T_0 \;\stackrel{?}{=}\; \sum_{d\in\{0,1\}^m} \bar a(d)\, g(d),
+          \qquad
+          \bar a = \sum_i \gamma^{128 i}\,\bar a_i,\quad
+          g(d) = \sum_j \gamma^{j}\,\eq\bigl(\rho^{2^{-j}},d\bigr),
+        \]
+        ending at a point $\rho''\in\F^m$ with running claim $T_m$.
+  \item The verifier evaluates $\hat g(\rho'')$ \emph{in closed form}:
+        $\hat g(\rho'') = \sum_j \gamma^j \prod_t \bigl(\rho''_t\,
+        \rho^{2^{-j}}_t + (1+\rho''_t)(1+\rho^{2^{-j}}_t)\bigr)$ — $128\,m$
+        multiplications, no polynomial materialized.
+  \item $\hat a(\rho'')$ is bound by \emph{one} run of the original
+        (untwisted) assist with coefficient vectors
+        $c_i = \gamma^{128 i}$ at Frobenius index $0$ — the anchor. The
+        verifier accepts iff $T_m = \hat a(\rho'')\cdot \hat g(\rho'')$, and
+        returns $V = \sum_{i,j} c_{i,j} (A'_{i,j})^{2^j}$.
+\end{enumerate}
+
+\section{Soundness}
+
+\begin{theorem}
+Suppose the verifier accepts. Then except with probability at most
+\[
+  \varepsilon \;\le\; \frac{128K - 1}{|\F|} \;+\; \frac{2m}{|\F|}
+  \;+\; \varepsilon_{\mathrm{assist}}(K, m)
+\]
+over the verifier's randomness, $A'_{i,j} = A_{i,j}$ for all $i,j$ — and
+therefore the returned $V$ equals $\widehat W(\rho)$ exactly.
+\end{theorem}
+
+\begin{proof}
+Condition on the anchor being sound (else charge
+$\varepsilon_{\mathrm{assist}}$, the reviewed soundness of the original
+assist, applied once at coefficient index $0$ where its statement is the
+plain evaluation $\hat a(\rho'')$).
+
+\textbf{(i) The sumcheck value is forced.} $g$ is defined by the verifier's
+own $\rho$ and $\gamma$; its endpoint evaluation is computed, not claimed.
+$\hat a(\rho'')$ is bound by the anchor to the $\gamma$-combination of the
+true claim weights. By the standard sumcheck soundness argument (degree 2,
+$m$ rounds, each challenge fresh), if the prover's round messages survive to
+an accepting endpoint then, except with probability $\le 2m/|\F|$,
+\[
+  T_0 = \sum_d \bar a(d)\,g(d)
+      = \sum_{i,j} \gamma^{128i+j} \sum_d \bar a_i(d)\,
+        \eq\bigl(\rho^{2^{-j}},d\bigr)
+      = \sum_{i,j} \gamma^{128i+j} A_{i,j},
+\]
+the last step by definition of the MLE (no twisting is involved here — the
+lemma is needed only to interpret $A_{i,j}$, not to prove this identity).
+
+\textbf{(ii) The batching pins every value.} $T_0$ was \emph{defined} as
+$\sum \gamma^{128i+j} A'_{i,j}$. Subtracting, $\sum_{i,j}
+\gamma^{128i+j}\,(A'_{i,j} - A_{i,j}) = 0$. The left side is a polynomial in
+$\gamma$ of degree $< 128K$ whose coefficients were fixed \emph{before}
+$\gamma$ was squeezed (the $A'$ are absorbed first; the $A$ depend only on
+the statement). If any $A'_{i,j} \ne A_{i,j}$ this polynomial is nonzero
+and vanishes at the random $\gamma$ with probability $\le (128K-1)/|\F|$.
+
+\textbf{(iii) The output.} With all $A'_{i,j} = A_{i,j}$,
+Lemma~\ref{lem:twist} gives $V = \sum c_{i,j} A_{i,j}^{2^j} = \widehat
+W(\rho)$ identically. Union bound over (i)--(iii).
+\end{proof}
+
+Completeness is immediate: an honest prover's $A'$ are the true dual values
+and every identity above holds with probability 1.
+
+Two remarks. First, the exponent schedule $\gamma^{128i+j}$ makes the $128K$
+batching weights \emph{consecutive} powers, so step (ii) is a single
+univariate Schwartz--Zippel — no independence assumptions between claims.
+Second, the anchor's coefficient vectors are $\gamma^{128i}$ at index $0$
+only; nothing about the anchor's own soundness argument changes, it is
+invoked as a black box at one point.
+
+\section{The two-product grouping (v1, shipped)}
+
+The protocol above treats every claim uniformly: $128$ dual values each.
+That is the right shape for a ring-switched claim, whose $\Phi_i$ has
+$128$ live coefficients — but a \emph{packed-direct} claim's fold map is
+the $\F$-scalar $\Phi_i(x) = \gamma_i x$, i.e.\ $c_{i,j} = 0$ past index
+$0$, so $127$ of its values are absorbed, pinned, shipped, and never used.
+A gate-rich circuit union carries $300+$ packed-direct claims (mostly
+gather claims), which made the uniform protocol regress the outer proof
+5$\times$ in prove time and 3$\times$ in size. The shipped v1 protocol
+splits the claim set:
+
+\begin{itemize}[nosep]
+  \item \textbf{RS claims} $i = 0,\dots,R-1$: unchanged — $128$ dual
+        values $A_{i,j}$, batching weights $\gamma^{128 i + j}$.
+  \item \textbf{Scalar groups} $k = 0,\dots,P-1$: packed-direct claims
+        sharing a row point merge — $\Sigma_i \gamma_i\,
+        \eq_{z_i^{\mathrm{row}}}\!\otimes\eq_{z_i^{\mathrm{col}}} =
+        \eq_{z^{\mathrm{row}}}\otimes\bigl(\Sigma_i \gamma_i\,
+        \eq_{z_i^{\mathrm{col}}}\bigr)$, exactly the merged-$W$ build's
+        \code{MergedWeightClaim::Scalar}, with the $\gamma$'s baked into
+        the merged column weights $w_k$ and fold map the \emph{identity}.
+        Group $k$'s weight is $h_k(d) = \eq(z_k^{\mathrm{row}},
+        \mathrm{row}(d))\cdot w_k(\mathrm{col}(d))$; it needs the single
+        \emph{untwisted} value $B_k = \hat h_k(\rho)$, batched at weight
+        $\gamma^{128 R + k}$. All circuit gather claims share $\rho_{\mathrm{row}}$,
+        so they are ONE group.
+\end{itemize}
+
+The batching weights remain the consecutive powers
+$\gamma^0,\dots,\gamma^{128R + P - 1}$, so step (ii) of the soundness
+proof is still a single univariate Schwartz--Zippel, now of degree
+$< 128R + P$. The sumcheck target becomes
+\[
+  T_0 \;\stackrel{?}{=}\; \sum_{d} \bigl[\bar a(d)\,g(d) \;+\;
+  \bar b(d)\,\eq(\rho,d)\bigr],
+  \qquad
+  \bar a = \sum_i \gamma^{128 i} a_i,\quad
+  \bar b = \sum_k \gamma^{128R + k} h_k,
+\]
+with $g$ as before — \emph{two} products, still degree-2 rounds (four
+prover arrays, the second pair being $\bar b$ and the untouched
+$\eq(\rho,\cdot)$ that $g$ is derived from). A group's partner is
+untwisted because its only Frobenius index is $0$, where
+$\rho^{2^{-0}} = \rho$: its ``$g$'' degenerates to $\eq(\rho,\cdot)$.
+
+\textbf{One anchor still suffices.} The endpoint identity is now
+$T_m = \hat g(\rho'')\cdot\hat{\bar a}(\rho'') +
+\eq(\rho,\rho'')\cdot\hat{\bar b}(\rho'')$ — two bound values against two
+closed-form factors. Rather than binding them separately (a second
+assist) or claiming them (two extra scalars plus a mixing challenge),
+the verifier \emph{bakes the closed-form factors into the anchor's
+coefficients}: RS claim $i$ enters at $c_0 = \gamma^{128 i}\,\hat
+g(\rho'')$, group $k$ at coefficient $\gamma^{128R + k}\,\eq(\rho,\rho'')$.
+The anchor's verified output is then exactly the endpoint sum, the
+accept check is the plain equality $T_m = s$, and no additional proof
+data travels. (Both factors are deterministic functions of transcript
+state, available to both parties before the anchor runs; the assist is
+sound for any verifier-chosen coefficients, invoked once as before.)
+
+The soundness theorem is unchanged in structure with
+$\varepsilon \le (128R + P - 1)/|\F| + 2m/|\F| +
+\varepsilon_{\mathrm{assist}}$, and the output becomes
+$V = \sum_{i,j} c_{i,j} (A'_{i,j})^{2^j} + \sum_k B'_k$ — a group's
+$\gamma$'s live inside $w_k$, so its recombination coefficient is $1$.
+
+Costs, against the uniform protocol on the gate-rich shape: values
+absorbed $128K \to 128R + P$ (the proof shrinks by $\sim$16 bytes per
+eliminated value); prover DP sweeps $128K \to 128R + P$ (one per group
+instead of $128$ per raw claim); the anchor is unchanged (it already
+merged same-row statements). An element-only proof has $R = 0$ and
+skips the twisted machinery — inverse-Frobenius points, byte-table
+map, and the $128m$-multiplication closed form — entirely.
+
+\section{Costs, and what this buys the recursion}
+
+Verifier: $128K$ absorbs $+$ $O(128K)$ multiplications for the target and
+the output squarings, $m$ spine-shaped rounds, $128m$ multiplications for
+the closed form, one untwisted assist. Against the shipped per-statement
+assist this collapses family~K's $O(128K \cdot 2^\kappa m)$ to
+$O(128(K{+}m))$ plus a single assist — and, decisively for transcription,
+every piece is a shape the circuit already has: the rounds are
+\code{MergedRoundGate}, the closed form is \code{PrefixGate}-shaped products
+over $\rho''$-wires, the target and output are \code{SpineGate} tr-rows plus
+verifier-side squarings ($\F_2$-linear — family H, free in the boolean
+class), and the anchor is one assist instance instead of $128K$.
+
+Prover: the dual values cost one DP sweep per $(i,j)$ over the
+\emph{columns} only ($\code{multipoint\_values}$), and the sumcheck is a
+product sumcheck over the dense domain with the combined weight built in one
+traversal (\code{build\_combined\_weight\_and\_msg}) — $O(2^m)$ once, not
+per claim.
+
+\section{Integration obligations}
+
+\begin{enumerate}[nosep]
+  \item The wire format changes where the merged opening carries
+        \code{FrobeniusAssistProof}: the replacement transcript is
+        \code{MultipointTwistedProof} $=$ ($128R$ RS values $+$ $P$ group
+        values, $m$ rounds, one anchor). Byte pins re-pin deliberately,
+        with history.
+  \item The transcript ordering must keep the values' absorb \emph{before}
+        the $\gamma$ squeeze (step (ii) depends on it) — the prototype
+        already does.
+  \item MVP-7's claim-POINT joins (deferred from the PIOP spine extension)
+        land here: the anchor consumes the claims' row/column points, so
+        binding them to the PIOP replay becomes load-bearing at the same
+        moment the assist enters the circuit.
+  \item The $\rho^{2^{-j}}$ inverse powers are verifier-side constants of
+        the transcript point $\rho$ ($128$ square roots per coordinate,
+        i.e.\ $127$ squarings each — or one table); in-circuit they are
+        family~H bit-linear maps of the $\rho$ wires.
+\end{enumerate}
+
+\end{document}

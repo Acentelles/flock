@@ -1,0 +1,383 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1.1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{xspace}
+\usepackage{xcolor}
+\usepackage[colorlinks=true,linkcolor=blue!50!black,citecolor=blue!50!black,urlcolor=blue!50!black]{hyperref}
+
+% ---------------------------------------------------------------------------
+% Macros (shared with multi-table-design.tex / circuit-wiring-design.tex)
+% ---------------------------------------------------------------------------
+\newcommand{\F}{\mathbb{F}}
+\newcommand{\Ftwo}{\F_2}
+\newcommand{\eq}{\mathsf{eq}}
+\newcommand{\code}[1]{\texttt{#1}}
+\newcommand{\sid}{s_{\mathrm{id}}}
+\newcommand{\ssig}{s_{\sigma}}
+\newcommand{\live}{\mathsf{live}}
+\newcommand{\Bmu}{\{0,1\}^{\mu}}
+\newcommand{\lv}{\widehat{\live}}
+\newcommand{\Mh}{\widehat{M}}
+
+\newtheorem{lemma}{Lemma}
+\newtheorem{remark}{Remark}
+\theoremstyle{definition}
+\newtheorem{definition}{Definition}
+
+\title{The Padded Permutation Check:\\
+Identity-Padded Dead Cells in the Wiring Grand Product\\[0.6ex]
+\large Design note --- v1 (shipped)}
+\author{Flock}
+\date{August 3, 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+The circuit wiring layer proves its copy constraints with a grand-product
+permutation check over the cell space $\Bmu$. The product-circuit GKR that
+proves it is structured over the full hypercube, so the prover paid for
+every cell --- live or dead --- even though a typical recursion circuit's
+cell space is mostly padding. This note records the fix, inspired by how
+SP1's LogUp GKR pads its fractions with the additive/multiplicative
+identities $(0,1)$: redefine the fingerprint of a \emph{dead} cell to be
+the multiplicative identity $1$, via a statement-derived live-set
+selector. The check's soundness argument is unchanged (the same multiset
+identity, restricted to the live set), \emph{no sumcheck degree or round
+count changes anywhere}, the endpoint checks remain closed-form because
+the witness is already zero on dead cells and the selector multiplies
+only structural terms, and the prover becomes live-proportional. Measured
+on the first real recursion node's outer circuit ($\mu = 24$): the wiring
+prove dropped from ${\sim}46$\,ms (at the smaller $\mu = 23$) to
+${\sim}27$\,ms, and the $\sigma$-aware (root-style) wiring verify from
+25--47\,ms to ${\sim}5$\,ms.
+\end{abstract}
+
+\section{Setting and the problem}
+
+The wiring layer (\code{circuit-wiring-design.tex}) enumerates a
+\emph{cell space} $\Bmu$, $\mu = \nu + c$: cell $x = (\iota, r)$ with the
+$c$ slot bits high and the $\nu$ row bits low, so cell index
+$x = (\iota \ll \nu) \,|\, r$. A cell-slot $\iota$ is one schema word of
+one gate type (or a $2^{\nu}$-word block of the public segment); its rows
+$r < \mathrm{count}_\iota$ are \emph{live} and the tail
+$r \ge \mathrm{count}_\iota$ is \emph{dead}. The witness vector
+$w : \Bmu \to \F$ carries the committed word (or public word) at each
+live cell and is \emph{zero on every dead cell} --- an existing invariant
+(dummy rows are honest zeros; \code{CellSpace} pads with zero cells).
+
+Copy constraints are one permutation $\sigma$ of $\Bmu$ that fixes every
+dead cell, checked by the Plonk-style grand product: for random
+$\alpha, \beta$ drawn after $w$ is bound,
+\begin{equation}
+\label{eq:plain}
+\prod_{x \in \Bmu}\bigl(w(x) + \alpha\,\sid(x) + \beta\bigr)
+\;=\;
+\prod_{x \in \Bmu}\bigl(w(x) + \alpha\,\ssig(x) + \beta\bigr),
+\qquad \ssig = \sid \circ \sigma,
+\end{equation}
+proved by a two-product GKR (batched to a single reduction point $\rho$)
+whose endpoint the verifier checks against $\widehat{w}(\rho)$ (the
+gather recombination), the closed form $\widehat{\sid}(\rho)$, and the
+$\sigma$ table.
+
+The cost problem: a dead cell's factor $\alpha\,\sid(x) + \beta$ is
+neither trivial nor constant, and the product-circuit GKR is a complete
+binary tree over $\Bmu$ --- the prover touches every leaf and every
+internal node whether or not its subtree is padding. There is no
+``sparse arm'' to add to a hypercube product tree: the domain shape
+\emph{is} the cost. On the first real recursion node's outer circuit,
+$2^{24}$ cells carried ${\sim}400$k live ones; the wiring prover and the
+$\sigma$-aware verifier both paid the $40\times$ difference.
+
+\section{The SP1 pattern, and the masked fingerprint}
+
+SP1's LogUp GKR solves the same problem by \emph{choosing} its padding to
+be the identity of the operation being aggregated: padded numerators are
+$0$, padded denominators are $1$, and each sumcheck round tracks a
+closed-form \code{padding\_adjustment} instead of touching padded memory
+(\code{sp1/crates/hypercube/src/logup\_gkr/logup\_poly.rs}). The padded
+region contributes nothing real, so the prover's per-layer work is
+proportional to the real data.
+
+We adopt the same convention for the permutation check. Let
+$\live : \Bmu \to \{0,1\}$ be the live-set indicator --- per slot, the
+aligned row prefix $[0, \mathrm{count}_\iota)$. Redefine the leaves of
+both product circuits as
+\begin{equation}
+\label{eq:masked}
+L(x) \;=\; \live(x)\,\bigl(w(x) + \alpha\,\sid(x) + \beta\bigr)
+\;+\; \bigl(1 - \live(x)\bigr),
+\end{equation}
+and symmetrically with $\ssig$ on the right-hand side. A dead leaf is
+exactly $1$; the products range over the \emph{live fingerprint multiset}
+only.
+
+Two facts make this sound with no new machinery:
+
+\begin{itemize}[leftmargin=2em]
+\item \textbf{The mask is statement-derived.} $\live$ is a function of
+the declared per-type counts and the public-segment length --- both part
+of the circuit encoding whose digest is bound into the transcript before
+$\alpha, \beta$ are drawn (\code{Circuit::live\_mask},
+\code{CellSpace::live\_counts}). No prover freedom enters.
+\item \textbf{$\sigma$ fixes dead cells} (enforced at circuit build; the
+prover \code{debug\_assert}s it, together with $w$'s dead-zero
+invariant). So the two sides' dead factors are the same constant $1$,
+and removing them changes neither side's honest product.
+\end{itemize}
+
+\begin{lemma}[Soundness of the masked check]
+Let $\sigma$ fix every dead cell. For $\alpha, \beta$ uniform in $\F$,
+the masked products
+$\prod_x L(x) = \prod_x L_\sigma(x)$ agree with probability
+$1 - O(2^{\mu})/|\F|$ only if the live multisets agree:
+\[
+\bigl\{\, (w(x), \sid(x)) : x \ \mathrm{live} \,\bigr\}
+\;=\;
+\bigl\{\, (w(x), \ssig(x)) : x \ \mathrm{live} \,\bigr\}.
+\]
+\end{lemma}
+
+\begin{proof}[Proof sketch]
+Dead factors are $1$ on both sides and drop from both products. What
+remains is the standard argument for \eqref{eq:plain} restricted to the
+live set: the two sides are polynomials in $(\alpha, \beta)$ of total
+degree at most the live count, equal as polynomials iff the two multisets
+of linear factors agree; Schwartz--Zippel bounds the failure probability
+for random $(\alpha, \beta)$.
+\end{proof}
+
+Completeness is immediate: an honest witness satisfies the live multiset
+identity, and the dead $1$s multiply to $1$.
+
+\section{No degree changes --- and why the endpoint stays closed-form}
+
+Two places could plausibly pay for the selector; neither does.
+
+\paragraph{The layer sumchecks.} The GKR's round polynomials only ever
+see $\eq(\cdot)\cdot V(y,0)\cdot V(y,1)$ where $V$ is the layer below's
+multilinear extension --- degree $3$ per round \emph{regardless of what
+the leaves are}. The leaf's algebraic form never enters a round
+polynomial; masking changes leaf \emph{values} only. Round counts, proof
+shape, and the verifier's per-round algebra are all unchanged.
+
+\paragraph{The endpoint (input-layer) check.} Here the na\"ive reasoning
+breaks and the structure saves us. The endpoint claim is about the MLE of
+the leaf \emph{vector}, and MLEs do not commute with pointwise products:
+$\widehat{\live \cdot g} \ne \lv \cdot \widehat{g}$ in general. But
+expand \eqref{eq:masked} over the cube using two facts --- $w$ is already
+zero on dead cells (so $\live \cdot w = w$ pointwise), and we are in
+characteristic 2 (so $-1 = +1$):
+\begin{equation}
+\label{eq:affine}
+L \;=\; w \;+\; \alpha\,(\live \odot \sid) \;+\; (\beta + 1)\,\live \;+\; 1 .
+\end{equation}
+This is an \emph{affine combination of vectors} --- $w$, the masked tag
+$\live \odot \sid$, and $\live$ --- and MLEs are linear, so at the GKR's
+reduction point $\rho$:
+\begin{equation}
+\label{eq:endpoint}
+\widehat{V}_{\mathrm{lhs}}(\rho)
+= \widehat{w}(\rho) + \alpha\,\Mh(\rho) + (\beta + 1)\,\lv(\rho) + 1,
+\qquad
+\widehat{V}_{\mathrm{rhs}}(\rho)
+= \widehat{w}(\rho) + \alpha\,\widehat{\live \odot \ssig}(\rho)
+  + (\beta + 1)\,\lv(\rho) + 1,
+\end{equation}
+where $\Mh = \widehat{\live \odot \sid}$. The selector multiplies only
+\emph{structural, verifier-known} functions, and both new terms have
+closed forms over the aligned per-slot prefixes:
+
+\paragraph{$\lv(\rho)$ --- the count-binding prefix $\eq$-sum.} Split
+$\rho = (\rho_{\mathrm{lo}}, \rho_{\mathrm{hi}})$ at $\nu$. Then
+$\lv(\rho) = \sum_\iota \eq(\rho_{\mathrm{hi}}, \iota)\,
+E_{c_\iota}(\rho_{\mathrm{lo}})$ with
+$E_n(p) = \sum_{i < n} \eq(p, i)$. Decompose $[0, n)$ into one aligned
+subcube per set bit $t$ of $n$ (bits above $t$ equal $n$'s, bit $t$
+zero, bits below free); partition of unity collapses each subcube's free
+part to $1$, giving the $O(\nu)$ form
+\[
+E_n(p) \;=\; \sum_{t\,:\,n_t = 1} (1 + p_t) \prod_{j > t} q_j,
+\qquad
+q_j = \begin{cases} p_j & n_j = 1 \\ 1 + p_j & n_j = 0. \end{cases}
+\]
+
+\paragraph{$\Mh(\rho)$ --- the tag-weighted variant.} The tag is
+$\Ftwo$-linear in the cell bits,
+$\sid(\iota \ll \nu \,|\, r) = \mathrm{tag}_{\mathrm{hi}}(\iota) +
+\mathrm{tag}_{\mathrm{lo}}(r)$, so per slot
+\[
+\Mh(\rho) = \sum_\iota \eq(\rho_{\mathrm{hi}}, \iota)
+\Bigl[\, \mathrm{tag}_{\mathrm{hi}}(\iota)\, E_{c_\iota}(\rho_{\mathrm{lo}})
+\;+\; D_{c_\iota}(\rho_{\mathrm{lo}}) \,\Bigr],
+\qquad
+D_n(p) = \sum_{i<n} \eq(p, i)\,\mathrm{tag}_{\mathrm{lo}}(i),
+\]
+and $D_n$ has the same subcube decomposition with each subcube
+contributing its fixed high bits' tags plus $p_j$ per free bit ---
+$O(\nu^2)$ per slot. Both evaluators are
+\code{product\_gkr::LiveMask::\{live\_eval, masked\_id\_eval\}}, pinned
+against explicit-table MLEs by
+\code{live\_mask\_closed\_forms\_and\_masked\_roundtrip}.
+
+The prover reconstructs $f(\rho), g(\rho)$ from the collapsed claims by
+the same affine relation (char 2: subtraction is addition), so the
+surfaced evaluations keep their meaning --- $f(\rho) = g(\rho) =
+\widehat{w}(\rho)$ in the copy-constraint case --- and the gather
+recombination check is untouched.
+
+\section{The \texorpdfstring{$\sigma$}{sigma} side}
+
+The one term with no closed form is
+$\widehat{\live \odot \ssig}(\rho)$. It was already the term the design
+defers (sigma route B, \code{circuit-wiring-design.tex} \S sigma): the
+deferred table simply becomes the \emph{masked} table
+$\live \odot \ssig$ --- \code{SigmaAssertion::matrix} zeroes dead
+entries --- and the accumulator's \code{MatrixClaim} reshape, the
+$2{\to}1$ folds, and the root discharge carry over with no shape change.
+Since $\live$ is circuit-determined, same-circuit children still share
+one table and the merge-node normalisation holds.
+
+Better still, the masked table is \emph{sparse by definition}: dead
+entries are zero. So its evaluation needs no materialisation at all:
+\[
+\widehat{\live \odot \ssig}(\rho)
+= \sum_\iota \eq(\rho_{\mathrm{hi}}, \iota)
+  \sum_{r < c_\iota} \eq(\rho_{\mathrm{lo}}, r)\; \sid(\sigma(\iota \ll \nu | r)),
+\]
+an $O(\mathrm{live} + 2^{\nu} + 2^{c})$ sum
+(\code{sparse\_sigma\_eval}) used by the prover \emph{and} by the
+$\sigma$-known verifier arm. This is what collapsed the root-style
+wiring verify from 25--47\,ms to ${\sim}5$\,ms: the ``sigma v1 root
+cost'' was the dense masked-table build plus a dense MLE fold, both of
+which the sparsity removes.
+
+\section{The live-proportional prover (the grouped pipeline)}
+
+With identity padding in place, the prover can skip dead regions
+structurally. The key observation:
+
+\begin{lemma}[Fold invariance of all-ones regions]
+Both primitives of the product-circuit GKR preserve constant-$1$
+regions: the layer gate maps $(1, 1) \mapsto 1 \cdot 1 = 1$, and the
+sumcheck fold maps $(1, 1) \mapsto 1\cdot(1{+}\rho) + 1\cdot\rho = 1$
+for any $\rho$.
+\end{lemma}
+
+Because the cell index is (slot high, row low), every slot's dead tail
+is an \emph{aligned suffix of an aligned block}, and the lemma means
+this shape survives every pass. A layer is therefore stored in
+\emph{grouped} form (\code{GVec}): per group, a live prefix in a dense
+buffer over an implicit all-ones tail that is never written or read.
+
+\begin{itemize}[leftmargin=2em]
+\item \textbf{Leaves}: only live prefixes are computed
+  ($O(\mathrm{live})$ writes).
+\item \textbf{Layer build} (\code{gv\_build\_prev}): the high-bit
+  pairing merges group $g$ with group $g + G/2$ row-wise; the merged
+  prefix length is the \emph{max} of the pair, and the shorter side's
+  ``multiplication by 1'' is a copy. Below the single-group layer the
+  same rule applies to row halves ($\mathrm{len}' = \min(\mathrm{len}, h)$).
+\item \textbf{Folds} (\code{gv\_fold}): prefixes halve
+  ($\mathrm{len}' = \lceil \mathrm{len}/2 \rceil$); an odd boundary pair
+  mixes in one explicit $1$; once groups are single entries, both-ones
+  pairs stay $1$ without a write.
+\item \textbf{Round messages} (\code{gv\_message}): the live pair extent
+  is summed directly (branch-minimal guarded reads --- a factor beyond
+  its own prefix reads as $1$). An \emph{all-ones tail pair} contributes,
+  for the $\lambda$-batched two-circuit gate,
+  \[
+  v_1 = 1\cdot 1 + \lambda\cdot 1\cdot 1 = 1 + \lambda,
+  \qquad
+  v_\infty = (1{+}1)(1{+}1) + \lambda\,(1{+}1)(1{+}1) = 0,
+  \]
+  (char 2 kills the leading coefficient), so tails add
+  $(1{+}\lambda)\cdot(\text{$\eq$-mass of the tail range})$ to $G(1)$
+  and nothing to $G(\infty)$. The $\eq$-mass of any contiguous range is
+  $O(1)$ from prefix-sum arrays over the split $\eq$ tables
+  (\code{range\_eq\_sum}) --- our per-group analogue of SP1's
+  \code{padding\_adjustment}.
+\end{itemize}
+
+Total prover work: $O(\mathrm{live})$ field operations plus
+$O(\#\mathrm{groups} \cdot \mu)$ bookkeeping and the per-round $\eq$
+tables. One honest caveat on the constant: full public slots are
+\emph{genuinely} live, and the max-merge rule means a fully-live group
+infects its merge partners as layers shrink, so mid-tree layers do not
+thin as fast as the leaf census suggests. The measured residual (below)
+is dominated by that real data, not by padding.
+
+Because $\F_{2^{128}}$ addition is XOR --- exactly associative and
+commutative --- regrouping the sums changes nothing: the grouped
+pipeline is \emph{transcript-identical} to the dense masked one. The
+dense pipeline is kept reachable
+(\code{prove\_batched\_dense\_masked\_for\_tests}) and
+\code{grouped\_matches\_dense\_masked} pins proof-and-claim byte
+equality on random $(f, g, \sigma, \mathrm{mask})$ across several
+$(\nu, c)$ shapes --- a permanent differential oracle.
+
+\section{Verifier and in-circuit deltas}
+
+The verifier's only changes are the endpoint formulas
+\eqref{eq:endpoint} (both arms) and, on the $\sigma$-known arm, the
+sparse masked evaluation. A verifier holding a wrong mask fails the
+input checks (unit-pinned).
+
+In the recursion circuit's GKR transcription, the input-check zero-deltas
+consume $\Mh(\rho)$ and $\lv(\rho)$ as checker-validated advice publics
+(the alpha-expansion trust tier): both are structural functions of the
+published point $\rho$, the checker recomputes them from the circuit's
+own \code{live\_mask}, and the pair is additionally pinned by the two
+published zero-deltas given the bound claim chains. The previous
+in-circuit $\sid$ basis chain ($\mu$ MAC rows and $\mu$ constant
+publics) retires.
+
+\section{Measured}
+
+Swap-outer circuit (the first real recursion node's outer,
+$\nu = 15$, $\mu = 24$, ${\sim}250$ gate cell-slots, ${\sim}400$k live
+cells), M4 Max, cold box (m30 sanity probe ${\sim}117$\,ms first):
+
+\begin{center}
+\begin{tabular}{lrr}
+\toprule
+ & dense (pre-mask) & masked + grouped \\
+\midrule
+wiring prove (build $w$ + GKR + gather) & ${\sim}46$\,ms at $\mu{=}23$ & ${\sim}27$\,ms at $\mu{=}24$ \\
+\quad of which grouped GKR & --- & leaves 3.2 + layers 4.1 + sumchecks 19.1 \\
+wiring verify, $\sigma$-known (root-style) & 25--47\,ms & ${\sim}5$\,ms \\
+wiring verify, deferred (route B) & ${\sim}2$\,ms & ${\sim}2$\,ms \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+No byte fixtures covered circuit-path proofs, so the transcript change
+required no re-pin.
+
+\section{Code map}
+
+\begin{itemize}[leftmargin=2em]
+\item \code{flock-core/src/product\_gkr.rs}: \code{LiveMask}
+  (\code{live\_eval}, \code{masked\_id\_eval}, \code{eq\_prefix\_sum}),
+  \code{prove\_batched(\dots, live, \dots)} dispatching
+  \code{prove\_batched\_grouped}; \code{GVec}/\code{GView},
+  \code{gv\_build\_prev}, \code{gv\_fold}, \code{gv\_message},
+  \code{range\_eq\_sum}, \code{sparse\_sigma\_eval};
+  \code{verify\_batched\{,\_with\_sigma\}(\dots, live, \dots)}.
+\item \code{flock-core/src/circuit.rs}: \code{CellSpace::live\_counts},
+  \code{Circuit::live\_mask}, the wiring prove/verify threading, the
+  masked \code{SigmaAssertion::matrix}.
+\item Tests: \code{grouped\_matches\_dense\_masked} (the differential
+  oracle), \code{live\_mask\_closed\_forms\_and\_masked\_roundtrip}
+  (closed forms vs.\ explicit MLEs; both verify arms; drifted-mask
+  rejection).
+\item SP1 reference: \code{sp1/crates/hypercube/src/logup\_gkr/}
+  (\code{LogupRoundPolynomial::padding\_adjustment}; padded numerators
+  resize with $0$, denominators with $1$).
+\end{itemize}
+
+\end{document}
