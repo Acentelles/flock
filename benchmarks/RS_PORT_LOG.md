@@ -2382,3 +2382,12 @@ tower extension fold machinery + fold-lookahead tests). Suites green
 1.90 / 1.17 / 1.15 s (step 1 same protocol: 1.85 / 1.34 / 1.19) —
 PARITY within session noise; proof size unchanged (567.31 KiB), peak
 8.52 GB.
+
+### Merge step 3: PR #33 ag-union (6ee974f) — 2026-08-28
+
+Clean merge, zero conflicts. +4727/-555 over 20 files: AG-skip union
+integration (genus95 round 1, ag_skip driver, tower.rs expansion,
+union verifier work, 128-bit grinding audit doc). Suites green (core
+572, prover 118). m=32 grind-free blake3 cold-start: 1.66 / 1.12 /
+1.79 s, best 1.12 — parity (run-3 spike looks environmental); proof
+size unchanged.

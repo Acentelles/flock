@@ -89,6 +89,47 @@ pub struct BooleanPiopProof {
     pub lincheck: lincheck::LincheckProof,
 }
 
+/// [`BooleanPiopProof`] with the **AG-skip** zerocheck: the genus-95 AG
+/// multiplication code replaces the RS additive-NTT round 1; the lincheck and
+/// every claim downstream are unchanged (the skip point rides as
+/// [`lincheck::SkipPoint::Ag`]). PADDING CONTRACT (the owning statement —
+/// other sites point here): the AG union entries are run-list READ-EXACT,
+/// exactly like the RS kernels — Dead code blocks are skipped, Partial
+/// blocks are cleansed into zeroed scratch (`zerocheck::cleanse_block`),
+/// and no declared-dead bit is ever read — so dirty pooled padding
+/// (`PooledDirty`) is legal for both flavors. Only the DENSE direct-route
+/// entries (`ag_skip::prove`, `prove_capture_s_hat_v_c`) still sum the
+/// full region and need honestly zero padding.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BooleanPiopProofAg {
+    pub ag: zerocheck::ag_skip::AgProof,
+    pub lincheck: lincheck::LincheckProof,
+}
+
+/// [`R1csProofMergedLigerito`] with the **AG-skip** boolean zerocheck — the
+/// boolean-only union proof over the MERGED transport, AG flavor. Same
+/// transport, same lincheck, same merged opening; only the zerocheck's round
+/// 1 differs.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct R1csProofMergedLigeritoAg {
+    pub boolean: BooleanPiopProofAg,
+    pub pcs_open: pcs::MergedOpenProof,
+}
+
+/// [`R1csProofCircuitMerged`] with the **AG-skip** boolean zerocheck — the
+/// circuit proof, AG flavor. The element class and the wiring argument are
+/// flavor-independent; only the boolean zerocheck's round 1 differs (and the
+/// boolean claim points ride [`lincheck::SkipPoint::Ag`]). MIGRATION shape:
+/// when the RS skip is removed this struct is renamed to primary and
+/// [`R1csProofCircuitMerged`] is deleted (docs/ag-recursion-plan.md).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct R1csProofCircuitMergedAg {
+    pub boolean: Option<BooleanPiopProofAg>,
+    pub element: Option<crate::element_r1cs::union::Proof>,
+    pub wiring: crate::circuit::WiringProof,
+    pub pcs_open: pcs::MergedOpenProof,
+}
+
 /// The claims a verified mixed-class union proof leaves behind, per class.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UnionClassClaims {

@@ -1678,3 +1678,133 @@ fn a_merge_node_folds_two_circuit_proofs() {
         "both children's sigma claims fold through the merge to one root discharge"
     );
 }
+
+/// AG-flavor twin of [`cross_class_hash_into_mult`]: the SAME mixed
+/// boolean+element circuit (SHA-256 gate crossing into an element mult, one
+/// public product) proven and verified through the **AG-skip** circuit
+/// entries — the element class and wiring are flavor-independent, only the
+/// boolean zerocheck's round 1 changes. Plus the AG-specific tamper arms:
+/// the fused r₁ nonce and the fused lincheck skip nonce must reject.
+#[cfg(target_arch = "aarch64")]
+#[test]
+#[ignore] // Heavier — run with `-- --ignored`.
+fn cross_class_circuit_ag_roundtrip() {
+    let (nu, kappa) = (7usize, 2usize);
+    let r1cs = sha2::build_block_r1cs(nu);
+    let registry = Registry::new(
+        vec![
+            mult_ty(kappa),
+            TableType::from_block_r1cs(&r1cs).with_io_schema(sha2_schema()),
+        ],
+        nu,
+    );
+
+    let mut rng = Rng::new(0xA6C2_0001);
+    let m: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+    let h_out = sha2::sha256_compress(&sha2::SHA256_IV, &m);
+    let out_words = pack_u32_words(&h_out);
+    let (o0, o1) = (out_words[0], out_words[1]);
+
+    let mut public = pack_u32_words(&sha2::SHA256_IV);
+    public.extend(pack_u32_words(&m));
+    public.push(o0 * o1);
+
+    const EL: usize = 8;
+    const PUB: usize = 11;
+    let wires = vec![
+        vec![Cell::new(PUB, 0), Cell::new(SHA_H0, 0)],
+        vec![Cell::new(PUB, 1), Cell::new(SHA_H1, 0)],
+        vec![Cell::new(PUB, 2), Cell::new(SHA_M0, 0)],
+        vec![Cell::new(PUB, 3), Cell::new(SHA_M0 + 1, 0)],
+        vec![Cell::new(PUB, 4), Cell::new(SHA_M0 + 2, 0)],
+        vec![Cell::new(PUB, 5), Cell::new(SHA_M0 + 3, 0)],
+        vec![Cell::new(SHA_O0, 0), Cell::new(EL + EL_A, 0)],
+        vec![Cell::new(SHA_O1, 0), Cell::new(EL + EL_B, 0)],
+        vec![Cell::new(EL + EL_C, 0), Cell::new(PUB, 6)],
+    ];
+
+    let counts = vec![1usize, 1];
+    let union = UnionInstance::new(&registry, counts.clone());
+    let pcs_params = union_pcs_params(&union);
+    let circuit = Circuit::new(&registry, counts, public.len(), wires).expect("valid");
+
+    let el_ty = registry.types()[1].element_type().expect("element");
+    let mut z = vec![F128::ZERO; el_ty.width() << nu];
+    z[0 << nu] = o0;
+    z[1 << nu] = o1;
+    z[2 << nu] = o0 * o1;
+    let circuit_lc = r1cs.csc_lincheck_circuit();
+
+    let z_gen = z.clone();
+    let mut ch = FsChallenger::new(DOMAIN);
+    let (proof, commitment, claims) = prover::prove_fast_ligerito_union_circuit_ag(
+        &union,
+        &circuit,
+        &public,
+        &pcs_params,
+        vec![UnionSlotProverInput::new(
+            sha2::generate_witness_batch_major_partial(&[(sha2::SHA256_IV, m)], nu),
+            circuit_lc,
+        )],
+        vec![UnionElementSlotInput::new(move |dst: &mut [F128]| {
+            dst.copy_from_slice(&z_gen)
+        })],
+        &mut ch,
+    );
+    assert!(claims.boolean.is_some() && claims.element.is_some());
+
+    let verify = |p: &flock_core::proof::R1csProofCircuitMergedAg| {
+        let mut ch = FsChallenger::new(DOMAIN);
+        verifier::verify_ligerito_union_circuit_ag(
+            &union,
+            &circuit,
+            &public,
+            &[circuit_lc],
+            &commitment,
+            p,
+            &pcs_params,
+            &mut ch,
+        )
+    };
+    verify(&proof).expect("honest AG cross-class circuit verifies");
+
+    // The DEFERRED twin accepts and returns dischargeable work.
+    let mut ch = FsChallenger::new(DOMAIN);
+    let (_, work, _sigma) = verifier::verify_ligerito_union_circuit_ag_deferred(
+        &union,
+        &circuit,
+        &public,
+        &[circuit_lc],
+        &commitment,
+        &proof,
+        &pcs_params,
+        &mut ch,
+    )
+    .expect("deferred AG verify accepts");
+    work.boolean
+        .expect("boolean assertion present")
+        .check(&union, &[circuit_lc])
+        .expect("deferred boolean matrix work discharges");
+
+    // AG round-1 message tamper.
+    let mut bad = proof.clone();
+    bad.boolean.as_mut().expect("boolean").ag.round1_ab[0] += F128::ONE;
+    assert!(verify(&bad).is_err(), "tampered AG round-1 accepted");
+
+    // Fused r₁ nonce tamper.
+    let mut bad = proof.clone();
+    let n = &mut bad.boolean.as_mut().expect("boolean").ag.r1_nonce;
+    *n = n.wrapping_add(1);
+    assert!(verify(&bad).is_err(), "tampered fused r1 nonce accepted");
+
+    // Fused lincheck skip nonce tamper (the last lincheck nonce).
+    let mut bad = proof.clone();
+    *bad.boolean
+        .as_mut()
+        .expect("boolean")
+        .lincheck
+        .grinding_nonces
+        .last_mut()
+        .expect("AG arm carries a fused skip nonce") ^= 1;
+    assert!(verify(&bad).is_err(), "tampered fused skip nonce accepted");
+}

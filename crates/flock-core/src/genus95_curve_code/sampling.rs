@@ -30,17 +30,9 @@ pub fn sample_random_evaluation_point(
     Err(SampleError::AttemptsExceeded)
 }
 
-/// One attempt from a 32-byte transcript seed and a grinding nonce: the
-/// attempt's DRBG is `FsRng::new(kind, H(seed ‖ LE32(nonce)))` where `H` and
-/// the DRBG follow the transcript hash `kind` (SHA-256 counter mode or BLAKE3
-/// XOF — see [`super::rng::FsRng`]), so each nonce yields an independent
-/// uniform draw and no second primitive enters the soundness argument.
-/// `None` = this nonce is rejected.
-pub fn evaluation_point_from_nonce(
-    seed: &[u8; 32],
-    nonce: u32,
-    kind: crate::hash::HashKind,
-) -> Option<EvaluationPoint> {
+/// The per-nonce DRBG seed `H(seed ‖ LE32(nonce))`, where `H` follows the
+/// transcript hash `kind`. Shared by the plain and PoW-fused nonce attempts.
+fn nonce_seed(seed: &[u8; 32], nonce: u32, kind: crate::hash::HashKind) -> [u8; 32] {
     let mut nonce_seed = [0u8; 32];
     match kind {
         crate::hash::HashKind::Sha256 => {
@@ -56,7 +48,59 @@ pub fn evaluation_point_from_nonce(
             nonce_seed.copy_from_slice(h.finalize().as_bytes());
         }
     }
-    try_evaluation_point(&mut super::rng::FsRng::new(kind, nonce_seed))
+    nonce_seed
+}
+
+/// One attempt from a 32-byte transcript seed and a grinding nonce: the
+/// attempt's DRBG is `FsRng::new(kind, H(seed ‖ LE32(nonce)))` where `H` and
+/// the DRBG follow the transcript hash `kind` (SHA-256 counter mode or BLAKE3
+/// XOF — see [`super::rng::FsRng`]), so each nonce yields an independent
+/// uniform draw and no second primitive enters the soundness argument.
+/// `None` = this nonce is rejected.
+pub fn evaluation_point_from_nonce(
+    seed: &[u8; 32],
+    nonce: u32,
+    kind: crate::hash::HashKind,
+) -> Option<EvaluationPoint> {
+    try_evaluation_point(&mut super::rng::FsRng::new(
+        kind,
+        nonce_seed(seed, nonce, kind),
+    ))
+}
+
+/// [`evaluation_point_from_nonce`] with a FUSED proof-of-work criterion: the
+/// nonce is valid only when its DRBG seed `H(seed ‖ LE32(nonce))` ALSO clears
+/// the PoW target — at least `pow_bits` leading zero bits of the seed's
+/// SECOND 16-byte word (bytes 16..32, MSB-first within each byte: the same
+/// predicate word and bit convention as the transcript PoW and the recursion
+/// circuit's `PowMaskTable`, so the eventual in-circuit check is a gadget
+/// reuse) — both criteria on the same hash, so a prover iterating nonces
+/// pays the PoW lottery on every sampling attempt and vice versa.
+///
+/// Success per nonce is exactly `p · 2^-pow_bits`, where `p` is the sampler's
+/// acceptance probability. `p = (1/32)·(1 ± 2^-56)` PROVABLY: the sampler
+/// weights every reachable cover point at exactly `1/(2^128 · 4 · 8)` (the
+/// `BASE_Y_DEGREE` slot flattening plus the three all-or-nothing
+/// Artin–Schreier choice bits — see [`try_evaluation_point`]), and Hasse–Weil
+/// bounds the genus-95 cover's point count within `2·95·2^64` of `2^128`
+/// (denominator-pole and infinity exclusions are a few hundred points). The
+/// rejection sampling therefore contributes `log2(32) = 5` bits of grinding
+/// on top of `pow_bits` — a protocol constant, not an empirical estimate —
+/// which is how the AG challenge sites reach their strict 128-bit budgets
+/// with small explicit PoW (see `zerocheck::ag_skip::AG_SAMPLING_CREDIT_BITS`
+/// and the guard tests tying the constants together).
+pub fn evaluation_point_from_nonce_pow(
+    seed: &[u8; 32],
+    nonce: u32,
+    kind: crate::hash::HashKind,
+    pow_bits: u32,
+) -> Option<EvaluationPoint> {
+    debug_assert!(pow_bits <= 64);
+    let ns = nonce_seed(seed, nonce, kind);
+    if !crate::challenger::has_leading_zero_bits(&ns[16..32], pow_bits) {
+        return None;
+    }
+    try_evaluation_point(&mut super::rng::FsRng::new(kind, ns))
 }
 
 /// One rejection-sampling attempt: draw `x` and lift `(y, z1, z2, z3)`,

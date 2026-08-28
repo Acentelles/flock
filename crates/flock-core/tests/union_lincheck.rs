@@ -803,7 +803,7 @@ fn matrix_assertion_decomposes_into_foldable_claims() {
     // ---- Decompose into the two per-matrix claims.
     let inner = slot.k_log - K_SKIP;
     let row = Weight::low_eq(
-        lagrange_weights_naive(K_SKIP, assertion.z_skip),
+        assertion.z_skip.weights(K_SKIP),
         assertion.x_inner_rest[..inner].to_vec(),
     );
     let col = Weight::low_eq(assertion.z_partial.clone(), assertion.rr.clone());

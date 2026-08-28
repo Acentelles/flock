@@ -1972,7 +1972,7 @@ fn assemble_jagged_assertion(
 pub fn verify_batch_merged<Ch: Challenger>(
     commitment: &Commitment,
     claims: &[F128],
-    z_skips: &[F128],
+    z_skips: &[crate::lincheck::SkipPoint],
     x_outers: &[&[F128]],
     packed_direct: &[PackedDirectClaimRef<'_>],
     heights: &[u64],
@@ -2008,7 +2008,7 @@ pub fn verify_batch_merged<Ch: Challenger>(
 pub fn verify_batch_merged_deferred<Ch: Challenger>(
     commitment: &Commitment,
     claims: &[F128],
-    z_skips: &[F128],
+    z_skips: &[crate::lincheck::SkipPoint],
     x_outers: &[&[F128]],
     packed_direct: &[PackedDirectClaimRef<'_>],
     heights: &[u64],
@@ -2040,7 +2040,7 @@ pub fn verify_batch_merged_deferred<Ch: Challenger>(
 fn verify_batch_merged_core<Ch: Challenger>(
     commitment: &Commitment,
     claims: &[F128],
-    z_skips: &[F128],
+    z_skips: &[crate::lincheck::SkipPoint],
     x_outers: &[&[F128]],
     packed_direct: &[PackedDirectClaimRef<'_>],
     heights: &[u64],
@@ -2079,7 +2079,7 @@ fn verify_batch_merged_core<Ch: Challenger>(
     let t = std::time::Instant::now();
     let mut rs_outputs = Vec::with_capacity(n_rs);
     for i in 0..n_rs {
-        let skip_w = crate::lincheck::SkipPoint::Phi8(z_skips[i]).weights(LOG_PACKING - 1);
+        let skip_w = z_skips[i].weights(LOG_PACKING - 1);
         let out = ring_switch::verify_succinct_with_grinding(
             claims[i],
             &skip_w,

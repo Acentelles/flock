@@ -17,8 +17,9 @@
 //!     cryptographic primitive enters the soundness argument.
 
 use super::multilinear::{
-    fold_and_compute_round_pair_into, fold_in_place_pair, fold1_lookahead_into,
-    fold2_lookahead_into, lookahead_msg_first, lookahead_msg_second, round_pair_naive,
+    LiveLayout, expand_to_dense, fold_and_compute_round_pair_into, fold_and_round_pair_sparse_into,
+    fold_in_place_pair, fold1_lookahead_into, fold2_lookahead_into, lookahead_msg_first,
+    lookahead_msg_second, round_pair_naive,
 };
 use crate::challenger::Challenger;
 use crate::field::{F128, F256Unreduced, mul_by_x};
@@ -113,6 +114,7 @@ pub fn d_inv() -> F128 {
 // ---------------------------------------------------------------------------
 
 /// The round-1 wire message in canonical (`D⁻¹`-scaled) form, evaluator basis.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Round1Message {
     /// `P^{ab}` fresh coords (158): kernel fresh slot `s` ↦ evaluator product
     /// coord `64 + s`. (Garbage kernel slots 158/159 dropped.)
@@ -320,34 +322,199 @@ pub fn fold_and_first_round(
         .zip(eq_outer.par_iter())
         .enumerate()
         .map(|(outer, ((am, bm), &eo))| {
-            // One fused pass over the 64 pairs (reverse, for the γ²-Horner): fold
-            // the four rows at r₁, write them to a_mlv/b_mlv, AND accumulate the
-            // first message from those just-folded values — no read-back of the
-            // folded array (the two-pass version re-read 2 KB/block). γ² = x², so
-            // each Σ weight is a pure 2-bit shift: a *wide* Horner on a 256-bit
-            // accumulator (no per-step reduction — max degree 2·63+127 = 253 <
-            // 256), reduced once per block.
-            let base = outer * 128;
-            let mut s1 = F256Unreduced::ZERO;
-            let mut s_inf = F256Unreduced::ZERO;
-            for inner in (0..64).rev() {
-                let (i0, i1) = (2 * inner, 2 * inner + 1);
-                let a0 = byte_dot(a_packed, base + i0, &table);
-                let a1 = byte_dot(a_packed, base + i1, &table);
-                let b0 = byte_dot(b_packed, base + i0, &table);
-                let b1 = byte_dot(b_packed, base + i1, &table);
-                am[i0] = a0;
-                am[i1] = a1;
-                bm[i0] = b0;
-                bm[i1] = b1;
-                s1 = shl2_xor(s1, a1 * b1);
-                s_inf = shl2_xor(s_inf, (a0 + a1) * (b0 + b1));
-            }
+            let (s1, s_inf) = fold_block_at(a_packed, b_packed, outer * 128, &table, am, bm);
             let e = eo * d1_inv;
             (e * s1.reduce(), e * s_inf.reduce())
         })
         .reduce(|| (F128::ZERO, F128::ZERO), |(p, q), (r, s)| (p + r, q + s));
     (a_mlv, b_mlv, g1, g_inf)
+}
+
+/// One outer block of the fused fold + first-round accumulation — one fused
+/// pass over the 64 pairs (reverse, for the γ²-Horner): fold the four rows
+/// at `r₁` via the byte-dot `table`, write them to `am`/`bm`, AND
+/// accumulate the first message from those just-folded values — no
+/// read-back of the folded array (the two-pass version re-read 2 KB/block).
+/// γ² = x², so each Σ weight is a pure 2-bit shift: a *wide* Horner on a
+/// 256-bit accumulator (no per-step reduction — max degree 2·63+127 = 253 <
+/// 256), reduced once per block by the caller. `msg_base` is the block's
+/// first 64-bit-message index in `a_src`/`b_src` — a cleansed single-block
+/// scratch buffer passes 0.
+#[inline]
+fn fold_block_at(
+    a_src: &[u8],
+    b_src: &[u8],
+    msg_base: usize,
+    table: &[[F128; 256]],
+    am: &mut [F128],
+    bm: &mut [F128],
+) -> (F256Unreduced, F256Unreduced) {
+    let mut s1 = F256Unreduced::ZERO;
+    let mut s_inf = F256Unreduced::ZERO;
+    for inner in (0..64).rev() {
+        let (i0, i1) = (2 * inner, 2 * inner + 1);
+        let a0 = byte_dot(a_src, msg_base + i0, table);
+        let a1 = byte_dot(a_src, msg_base + i1, table);
+        let b0 = byte_dot(b_src, msg_base + i0, table);
+        let b1 = byte_dot(b_src, msg_base + i1, table);
+        am[i0] = a0;
+        am[i1] = a1;
+        bm[i0] = b0;
+        bm[i1] = b1;
+        s1 = shl2_xor(s1, a1 * b1);
+        s_inf = shl2_xor(s_inf, (a0 + a1) * (b0 + b1));
+    }
+    (s1, s_inf)
+}
+
+/// [`fold_and_first_round`] under a witness run-list ([`BlockCoverage`] at
+/// the 8192-bit code-block grid, one entry per outer block): DEAD blocks
+/// write zero folds and contribute nothing (their honest bits are all
+/// zero), FULL blocks run the in-place fused pass, and PARTIAL blocks are
+/// cleansed into zeroed scratch first — no declared-dead bit is ever read,
+/// so `PooledDirty` witnesses are legal. Value-identical to the dense fold
+/// on an honestly zero-padded witness.
+pub fn fold_and_first_round_padded(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    w: &[F128],
+    r_rest: &[F128],
+    coverage: &[super::BlockCoverage],
+) -> (Vec<F128>, Vec<F128>, F128, F128) {
+    use rayon::prelude::*;
+    assert_eq!(a_packed.len(), b_packed.len());
+    debug_assert_eq!(
+        &r_rest[1..N_INNER],
+        &friendly_challenges()[1..N_INNER],
+        "fold_and_first_round assumes γ-geometric friendly dims"
+    );
+    let n = a_packed.len() / 8;
+    let table = build_w_tables(w);
+    let eq_outer = super::univariate_skip::build_eq(&r_rest[N_INNER..]);
+    let n_outer = eq_outer.len();
+    assert_eq!(n, n_outer * 128, "each outer block is 128 (2^7) messages");
+    assert_eq!(
+        coverage.len(),
+        n_outer,
+        "one coverage entry per outer block"
+    );
+    let mut d1 = F128::ONE;
+    for j in 1..N_INNER {
+        d1 *= F128::ONE + gamma_pow(1usize << j);
+    }
+    let d1_inv = d1.inv();
+
+    let mut a_mlv = crate::scratch::take_f128(n);
+    let mut b_mlv = crate::scratch::take_f128(n);
+    let (g1, g_inf) = a_mlv
+        .par_chunks_mut(128)
+        .zip(b_mlv.par_chunks_mut(128))
+        .zip(eq_outer.par_iter())
+        .enumerate()
+        .map(|(outer, ((am, bm), &eo))| match &coverage[outer] {
+            super::BlockCoverage::Dead => {
+                am.fill(F128::ZERO);
+                bm.fill(F128::ZERO);
+                (F128::ZERO, F128::ZERO)
+            }
+            super::BlockCoverage::Full => {
+                let (s1, s_inf) = fold_block_at(a_packed, b_packed, outer * 128, &table, am, bm);
+                let e = eo * d1_inv;
+                (e * s1.reduce(), e * s_inf.reduce())
+            }
+            super::BlockCoverage::Partial(ranges) => {
+                let mut a_buf = [0u8; 1024];
+                let mut b_buf = [0u8; 1024];
+                super::cleanse_block(a_packed, outer * 1024, ranges, &mut a_buf);
+                super::cleanse_block(b_packed, outer * 1024, ranges, &mut b_buf);
+                let (s1, s_inf) = fold_block_at(&a_buf, &b_buf, 0, &table, am, bm);
+                let e = eo * d1_inv;
+                (e * s1.reduce(), e * s_inf.reduce())
+            }
+        })
+        .reduce(|| (F128::ZERO, F128::ZERO), |(p, q), (r, s)| (p + r, q + s));
+    (a_mlv, b_mlv, g1, g_inf)
+}
+
+/// [`fold_and_first_round_padded`] with LIVE-SPAN output — the AG analog of
+/// RS's `uni_skip_fold_and_round_pair_runs_sparse`: dead blocks get no
+/// storage at all, so the fold's cost AND footprint are count-derived. The
+/// returned [`LiveLayout`] maps the compacted buffers back to the padded
+/// `2^(m−6)` domain: the k-th live block's 128 slots sit at offset `128·k`.
+/// Intervals are 128-aligned by construction — pair-aligned for every tail
+/// round. Message and live values are byte-identical to the dense fold on
+/// an honestly zero-padded witness; a Partial block stores its full 128
+/// slots (the cleansed fold writes honest zeros past its ranges).
+pub fn fold_and_first_round_sparse(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    w: &[F128],
+    r_rest: &[F128],
+    coverage: &[super::BlockCoverage],
+) -> (Vec<F128>, Vec<F128>, F128, F128, LiveLayout) {
+    use rayon::prelude::*;
+    assert_eq!(a_packed.len(), b_packed.len());
+    debug_assert_eq!(
+        &r_rest[1..N_INNER],
+        &friendly_challenges()[1..N_INNER],
+        "fold_and_first_round assumes γ-geometric friendly dims"
+    );
+    let table = build_w_tables(w);
+    let eq_outer = super::univariate_skip::build_eq(&r_rest[N_INNER..]);
+    let n_outer = eq_outer.len();
+    assert_eq!(a_packed.len() / 8, n_outer * 128, "128 messages per block");
+    assert_eq!(
+        coverage.len(),
+        n_outer,
+        "one coverage entry per outer block"
+    );
+    let mut d1 = F128::ONE;
+    for j in 1..N_INNER {
+        d1 *= F128::ONE + gamma_pow(1usize << j);
+    }
+    let d1_inv = d1.inv();
+
+    // The live block list + its 128-aligned mlv-slot intervals.
+    let live: Vec<usize> = (0..n_outer)
+        .filter(|&o| !matches!(coverage[o], super::BlockCoverage::Dead))
+        .collect();
+    debug_assert!(!live.is_empty(), "a witness with no live block");
+    let mut intervals: Vec<(usize, usize)> = Vec::new();
+    for &o in &live {
+        match intervals.last_mut() {
+            Some((_, e)) if *e == 128 * o => *e = 128 * (o + 1),
+            _ => intervals.push((128 * o, 128 * (o + 1))),
+        }
+    }
+    let store = LiveLayout::new(intervals);
+    let n_live = 128 * live.len();
+    let mut a_mlv = crate::scratch::take_f128(n_live);
+    let mut b_mlv = crate::scratch::take_f128(n_live);
+    let (g1, g_inf) = a_mlv
+        .par_chunks_mut(128)
+        .zip(b_mlv.par_chunks_mut(128))
+        .zip(live.par_iter())
+        .map(|((am, bm), &outer)| {
+            let (s1, s_inf) = match &coverage[outer] {
+                super::BlockCoverage::Dead => unreachable!("the live list has no dead entry"),
+                super::BlockCoverage::Full => {
+                    fold_block_at(a_packed, b_packed, outer * 128, &table, am, bm)
+                }
+                super::BlockCoverage::Partial(ranges) => {
+                    let mut a_buf = [0u8; 1024];
+                    let mut b_buf = [0u8; 1024];
+                    super::cleanse_block(a_packed, outer * 1024, ranges, &mut a_buf);
+                    super::cleanse_block(b_packed, outer * 1024, ranges, &mut b_buf);
+                    fold_block_at(&a_buf, &b_buf, 0, &table, am, bm)
+                }
+            };
+            let e = eq_outer[outer] * d1_inv;
+            (e * s1.reduce(), e * s_inf.reduce())
+        })
+        .reduce(|| (F128::ZERO, F128::ZERO), |(p, q), (r, s)| (p + r, q + s));
+    a_mlv.truncate(n_live);
+    b_mlv.truncate(n_live);
+    (a_mlv, b_mlv, g1, g_inf, store)
 }
 
 /// One wide-Horner step with a compile-time shift `S` (the friendly base
@@ -692,6 +859,43 @@ pub fn verify_multilinear(
 // ---------------------------------------------------------------------------
 
 /// A fixed, valid point of `Y`, the fallback for the (≈`2^-289`) chance that
+/// Zero-count bound behind the r₁ grinding budget: a false round-1 message
+/// pair survives at r₁ only if a nonzero PRODUCT-code word (a function in
+/// `L(2D)`, at most `deg 2D = 316` zeros — the ab check) or a nonzero
+/// BASE-code word (`L(D)`, at most `deg D = 158` zeros — the c check)
+/// vanishes there. `316 + 158 = 474` bad points over the ~`2^128` valid
+/// cover points; `bits_for(474) = 9` total bits required.
+pub const R1_ZERO_BOUND: usize = 474;
+
+/// Provable grinding contribution of the rejection sampler itself:
+/// `log2(BASE_Y_DEGREE · 2^3) = log2(32) = 5` bits. The sampler weights
+/// every reachable cover point at exactly `1/(2^128 · 32)` (slot flattening
+/// over the degree-4 base fiber, three all-or-nothing Artin–Schreier levels
+/// with uniform choice bits), and Hasse–Weil pins the genus-95 cover's point
+/// count to `2^128 · (1 ± 2^-56)` — so each valid draw provably costs
+/// ≥ ~32 attempts. A protocol constant (the sampler's shape), NOT an
+/// empirical acceptance estimate; guarded by `credit_constants_are_pinned`.
+pub const AG_SAMPLING_CREDIT_BITS: u32 = 5;
+
+/// Explicit PoW bits on the FUSED r₁ nonce under a strict grinding
+/// schedule: ALL of `bits_for(R1_ZERO_BOUND) = 9` — the sampler's
+/// [`AG_SAMPLING_CREDIT_BITS`] = 5 no longer discount r₁'s explicit bits.
+/// WHY (phase D, docs/ag-recursion-plan.md): the recursion circuit binds
+/// the r₁ decode with RELAXED canonicity — it enforces `x` from the
+/// nonce-seed's XOF and fiber membership for `(y, z₁..z₃)`, but not WHICH
+/// fiber point (the ≤ 32-point fiber = exactly the sampler's 5 flattening
+/// bits). A circuit-side prover may therefore choose among the fiber
+/// points, so those 5 bits are repaid explicitly; the total stays
+/// `bits_for(474)`, the split moves. The sampler's credit still stands
+/// where the decode is canonical end-to-end (the lincheck fresh skip).
+pub const R1_POW_BITS: u32 = 9;
+
+/// Prover-side scan budget for the fused r₁ nonce: success per nonce is
+/// `2^-R1_POW_BITS / 32 = 2^-14`, so exhausting `2^24` nonces has
+/// probability `(1 − 2^-14)^(2^24) ≈ 2^-1477` — a completeness error we
+/// accept (panic). Fits the 4-byte nonce encoding with room.
+pub const R1_FUSED_ATTEMPT_BUDGET: u32 = 1 << 24;
+
 /// rejection sampling exhausts its attempt budget. Baked from one offline sample.
 ///
 /// No longer used by the AG-skip `r₁` derivation (the nonce-grind path panics
@@ -699,8 +903,9 @@ pub fn verify_multilinear(
 /// prover pin `r₁` to this public constant). Still backs
 /// [`crate::lincheck::SkipPoint::sample_fresh`], where BOTH sides replay the
 /// same deterministic loop, so a prover cannot claim failure unilaterally:
-/// forcing it costs `~1/P_fail ≈ 2^289`, far above the `2^128` target. (Keep
-/// linked to the sampler's attempt cap; lowering the cap raises `P_fail`.)
+/// forcing it costs `~1/P_fail ≈ 2^916` (acceptance is 1/32 per attempt, so
+/// `P_fail = (1 − 1/32)^20000`), far above the `2^128` target. (Keep linked
+/// to the sampler's attempt cap; lowering the cap raises `P_fail`.)
 pub(crate) fn fallback_point() -> EvaluationPoint {
     EvaluationPoint {
         x: F128 {
@@ -753,13 +958,19 @@ fn observe_r1_nonce<C: Challenger>(challenger: &mut C, nonce: u32) {
 /// ([`crate::genus95_curve_code::evaluation_point_from_nonce`]); the first
 /// nonce whose attempt lands a valid point is observed into the transcript and
 /// shipped in the proof, so the verifier re-derives `r₁` with a SINGLE attempt
-/// rather than the expected ~100 (worst-case 20 000) replayed ones.
+/// rather than the expected ~32 (worst-case 20 000) replayed ones.
 ///
-/// Per-attempt acceptance is ~1%, so exhausting all
+/// Per-attempt acceptance is 1/32 (measured 3.141% over 10⁶ attempts;
+/// structurally `1/(BASE_Y_DEGREE · 2^3)`), so exhausting all
 /// [`SAMPLE_ATTEMPT_BUDGET`](crate::genus95_curve_code::SAMPLE_ATTEMPT_BUDGET)
-/// nonces has probability ~2⁻²⁸⁹ — a completeness error we accept (panic)
+/// nonces has probability ~2⁻⁹²¹ — a completeness error we accept (panic)
 /// instead of a verifier-side fallback point: an unconditionally accepted
 /// fallback claim would let a cheating prover fix `r₁` to a public constant.
+///
+/// UNGRINDED path only (the direct route / disabled schedules, which make no
+/// 128-bit claim): the verifier's single attempt lets a cheating prover pick
+/// among the ~630 expected valid nonces in the budget — ≤ log₂(20 000) ≈ 14.3
+/// bits of freedom. Strict schedules use [`sample_r1_prover_pow`] instead.
 pub(super) fn sample_r1_prover<C: Challenger>(challenger: &mut C) -> (EvaluationPoint, u32) {
     let seed = r1_seed(challenger);
     let kind = challenger.hash_kind();
@@ -771,15 +982,45 @@ pub(super) fn sample_r1_prover<C: Challenger>(challenger: &mut C) -> (Evaluation
             return (point, nonce);
         }
     }
-    unreachable!("r1 nonce grind exhausted its budget (probability ~2^-289)")
+    unreachable!("r1 nonce grind exhausted its budget (probability ~2^-921)")
+}
+
+/// [`sample_r1_prover`] under a strict grinding schedule: the FUSED nonce —
+/// `H(seed ‖ nonce)` must clear `pow_bits` of PoW AND decode to a valid
+/// cover point, both criteria on the same hash. Every candidate the prover
+/// (or an attacker) evaluates re-enters the PoW, so there is no free choice
+/// among valid nonces; with the sampler's provable
+/// [`AG_SAMPLING_CREDIT_BITS`] = 5 bits on top, `r₁` carries
+/// `pow_bits + 5` grinding bits total against a CANONICAL decode — the
+/// strict schedule sets `pow_bits =` [`R1_POW_BITS`] = 9 so the budget
+/// holds even against the recursion circuit's relaxed-canonicity decode,
+/// which returns the fiber's 5 bits to the prover. Expected prover cost is
+/// `2^pow_bits · 32` hash calls plus `2^pow_bits` point attempts (~1 ms at
+/// 9 bits); the verifier stays ONE-SHOT.
+pub(super) fn sample_r1_prover_pow<C: Challenger>(
+    challenger: &mut C,
+    pow_bits: u32,
+) -> (EvaluationPoint, u32) {
+    let seed = r1_seed(challenger);
+    let kind = challenger.hash_kind();
+    for nonce in 0..R1_FUSED_ATTEMPT_BUDGET {
+        if let Some(point) =
+            crate::genus95_curve_code::evaluation_point_from_nonce_pow(&seed, nonce, kind, pow_bits)
+        {
+            observe_r1_nonce(challenger, nonce);
+            return (point, nonce);
+        }
+    }
+    unreachable!("fused r1 nonce grind exhausted its budget (see R1_FUSED_ATTEMPT_BUDGET)")
 }
 
 /// Verifier: re-derive `r₁` from the proof's nonce — range-check it, run the
 /// single attempt, and reject unless it lands a valid point. The verifier does
 /// NOT check the nonce is the prover's minimal one, so a cheating prover may
-/// pick any of the ~200 expected valid nonces in the budget: ≤ log₂(20 000) ≈
-/// 14.3 bits of grinding over `r₁`, charged to the soundness budget exactly
-/// like a PoW grind.
+/// pick any of the ~630 expected valid nonces in the budget: ≤ log₂(20 000) ≈
+/// 14.3 bits of freedom over `r₁`. UNGRINDED path only — strict schedules
+/// verify the fused nonce via [`replay_r1_verifier_pow`], which has no such
+/// freedom (every candidate carries its own PoW).
 pub(super) fn replay_r1_verifier<C: Challenger>(
     challenger: &mut C,
     nonce: u32,
@@ -791,6 +1032,28 @@ pub(super) fn replay_r1_verifier<C: Challenger>(
     observe_r1_nonce(challenger, nonce);
     crate::genus95_curve_code::evaluation_point_from_nonce(&seed, nonce, challenger.hash_kind())
         .ok_or(AgVerifyError::BadR1Nonce { nonce })
+}
+
+/// Verifier mirror of [`sample_r1_prover_pow`]: ONE hash + ONE point attempt,
+/// rejecting unless the fused nonce clears the PoW target AND lands a valid
+/// point. Constant-shape — no rejection replay, no data-dependent loop.
+pub(super) fn replay_r1_verifier_pow<C: Challenger>(
+    challenger: &mut C,
+    nonce: u32,
+    pow_bits: u32,
+) -> Result<EvaluationPoint, AgVerifyError> {
+    let seed = r1_seed(challenger);
+    if nonce >= R1_FUSED_ATTEMPT_BUDGET {
+        return Err(AgVerifyError::BadR1Nonce { nonce });
+    }
+    observe_r1_nonce(challenger, nonce);
+    crate::genus95_curve_code::evaluation_point_from_nonce_pow(
+        &seed,
+        nonce,
+        challenger.hash_kind(),
+        pow_bits,
+    )
+    .ok_or(AgVerifyError::BadR1Nonce { nonce })
 }
 
 /// All round messages the AG-skip prover sends, in order.
@@ -808,6 +1071,12 @@ pub struct AgProof {
     pub final_a_eval: F128,
     pub final_b_eval: F128,
     pub final_c_eval: F128,
+    /// PoW nonces in transcript order: the initial outer-eq point, then one
+    /// per multilinear round. Empty under [`ZerocheckGrinding::disabled`]
+    /// (the direct-route entries and every pre-grinding proof). `r₁` keeps
+    /// its own rejection-sampling nonce (`r1_nonce`) regardless.
+    #[serde(default)]
+    pub grinding_nonces: Vec<u64>,
 }
 
 /// Evaluation claims the AG-skip zerocheck reduces to (no PCS). `a_eval`, `b_eval`
@@ -844,6 +1113,72 @@ pub enum AgVerifyError {
     },
     CEvalMismatch,
     SumcheckFinalFailed,
+    /// The nonce vector does not match the configured grinding schedule.
+    BadGrindingNonceCount {
+        expected: usize,
+        got: usize,
+    },
+    /// A nonce fails the PoW at the FS position sampling its challenge.
+    InvalidGrindingNonce,
+}
+
+/// Challenger adapter for the multilinear tail under per-round grinding:
+/// every `sample_f128` in the tail IS a round challenge, so the adapter
+/// grinds `bits` before each and records the nonce — the tail's kernels stay
+/// untouched. Framing-sensitive ops delegate verbatim.
+struct RoundGrindProver<'a, C: Challenger> {
+    inner: &'a mut C,
+    bits: u32,
+    nonces: &'a mut Vec<u64>,
+}
+
+impl<C: Challenger> Challenger for RoundGrindProver<'_, C> {
+    fn supports_fused_pow_squeeze(&self) -> bool {
+        self.inner.supports_fused_pow_squeeze()
+    }
+    fn hash_kind(&self) -> crate::merkle::HashKind {
+        self.inner.hash_kind()
+    }
+    fn observe_label(&mut self, label: &[u8]) {
+        self.inner.observe_label(label)
+    }
+    fn observe_f128(&mut self, value: F128) {
+        self.inner.observe_f128(value)
+    }
+    fn observe_f128_slice(&mut self, values: &[F128]) {
+        self.inner.observe_f128_slice(values)
+    }
+    fn observe_bytes(&mut self, bytes: &[u8]) {
+        self.inner.observe_bytes(bytes)
+    }
+    fn sample_f128(&mut self) -> F128 {
+        let (nonce, r) = self.inner.grind_pow_and_sample_f128(self.bits);
+        self.nonces.push(nonce);
+        r
+    }
+    fn sample_f128_vec(&mut self, _n: usize) -> Vec<F128> {
+        // Fail loudly rather than silently skip the per-round grind: a tail
+        // change that vector-squeezes must extend the adapter first.
+        unreachable!("the grinding tail adapter never vector-squeezes")
+    }
+    fn grind_pow(&mut self, bits: u32) -> u64 {
+        self.inner.grind_pow(bits)
+    }
+    fn verify_pow(&mut self, nonce: u64, bits: u32) -> bool {
+        self.inner.verify_pow(nonce, bits)
+    }
+    fn fork_from_seed(&self, _seed: [F128; 2], _label: &'static [u8]) -> Self {
+        unreachable!("the grinding tail adapter is never forked")
+    }
+}
+
+/// Nonce count [`AgProof::grinding_nonces`] must carry for `m` under a
+/// schedule: the initial outer-eq point + one per multilinear round. (`r₁`'s
+/// nonce — fused PoW+sampling under a strict schedule, plain sampling
+/// otherwise — is the separate [`AgProof::r1_nonce`] field.)
+pub fn grinding_nonce_count(grinding: super::ZerocheckGrinding, m: usize) -> usize {
+    usize::from(grinding.initial_bits(m).is_some())
+        + usize::from(grinding.multilinear_round_bits().is_some()) * (m - K_SKIP)
 }
 
 /// Prove `a(y)·b(y) = c(y)` for all `y ∈ {0,1}^m` via the AG-skip zerocheck.
@@ -867,7 +1202,16 @@ pub fn prove<C: Challenger>(
     let eq = crate::zerocheck::univariate_skip::build_eq(&r_outer);
 
     let msg = prove_round1(a_packed, b_packed, c_packed, &eq);
-    prove_from_round1(a_packed, b_packed, msg, &r_outer, challenger)
+    prove_from_round1(
+        a_packed,
+        b_packed,
+        msg,
+        &r_outer,
+        super::ZerocheckGrinding::disabled(),
+        Vec::new(),
+        None,
+        challenger,
+    )
 }
 
 /// [`prove`] that ALSO returns the c-claim's `s_hat_v_c` — the length-128
@@ -901,7 +1245,101 @@ pub fn prove_capture_s_hat_v_c<C: Challenger>(
     let eq = crate::zerocheck::univariate_skip::build_eq(&r_outer);
 
     let (msg, s_hat_v_c) = prove_round1_banks(a_packed, b_packed, c_packed, &eq);
-    let (proof, claim) = prove_from_round1(a_packed, b_packed, msg, &r_outer, challenger);
+    let (proof, claim) = prove_from_round1(
+        a_packed,
+        b_packed,
+        msg,
+        &r_outer,
+        super::ZerocheckGrinding::disabled(),
+        Vec::new(),
+        None,
+        challenger,
+    );
+    (proof, claim, s_hat_v_c)
+}
+
+/// [`prove_capture_s_hat_v_c`] under a Fiat--Shamir grinding schedule — the
+/// UNION route's strict-profile entry. Grinds the initial outer-eq point
+/// (`initial_bits(m)`) and every multilinear round
+/// (`multilinear_round_bits`), mirroring the RS zerocheck's schedule; `r₁`
+/// switches to the FUSED nonce ([`sample_r1_prover_pow`]):
+/// [`R1_POW_BITS`] = 9 explicit PoW bits = `bits_for(474)` for the
+/// product+base code bad set ([`R1_ZERO_BOUND`]) — all explicit, so the
+/// budget survives the recursion circuit's relaxed-canonicity decode —
+/// with a ONE-SHOT verifier.
+///
+/// PADDING CONTRACT: this entry is run-list READ-EXACT — see the owning
+/// statement on [`crate::proof::BooleanPiopProofAg`]. Round 1 and the fold
+/// consult the `padding` spec's block coverage; declared-dead bits are
+/// never read, whatever the pooled buffers hold.
+#[cfg(target_arch = "aarch64")]
+pub fn prove_capture_s_hat_v_c_with_grinding<C: Challenger>(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    c_packed: &[u8],
+    m: usize,
+    padding: &super::PaddingSpec,
+    grinding: super::ZerocheckGrinding,
+    challenger: &mut C,
+) -> (AgProof, AgClaim, Vec<F128>) {
+    assert!(m >= K_SKIP + N_INNER, "m >= 13 required");
+    let expected = (1usize << m) / 8;
+    assert_eq!(a_packed.len(), expected);
+    assert_eq!(b_packed.len(), expected);
+    assert_eq!(c_packed.len(), expected);
+    // The run-list at the kernels' 8192-bit code-block grid — round 1 and
+    // the fold share it. Read-exact (Dead skipped, Partial cleansed), so
+    // the honest-zero witness-mode forcing this entry used to need is gone:
+    // declared-dead bits are never read, whatever they hold.
+    let zc_timing = std::env::var_os("FLOCK_ZC_TIMING").is_some();
+    let t0 = std::time::Instant::now();
+    let coverage = padding.block_coverage(K_SKIP + N_INNER, 1usize << (m - K_SKIP - N_INNER));
+
+    challenger.observe_label(b"flock-ag-skip-v1");
+    let mut grinding_nonces = Vec::with_capacity(grinding_nonce_count(grinding, m));
+    let r_outer = match grinding.initial_bits(m) {
+        Some(bits) => {
+            let (nonce, v) = challenger.grind_pow_and_sample_f128_vec(bits, m - K_SKIP - N_INNER);
+            grinding_nonces.push(nonce);
+            v
+        }
+        None => challenger.sample_f128_vec(m - K_SKIP - N_INNER),
+    };
+    let eq = crate::zerocheck::univariate_skip::build_eq(&r_outer);
+    let t_r1 = std::time::Instant::now();
+    let (msg, s_hat_v_c) = prove_round1_banks_padded(a_packed, b_packed, c_packed, &eq, &coverage);
+    if zc_timing {
+        let (mut full, mut part, mut dead) = (0usize, 0usize, 0usize);
+        for c in &coverage {
+            match c {
+                super::BlockCoverage::Full => full += 1,
+                super::BlockCoverage::Partial(_) => part += 1,
+                super::BlockCoverage::Dead => dead += 1,
+            }
+        }
+        eprintln!(
+            "[ag-zc-timing] m={m} setup+eq {:.2} ms | round1 {:.2} ms (blocks: {full} full / {part} partial / {dead} dead)",
+            (t_r1 - t0).as_secs_f64() * 1e3,
+            t_r1.elapsed().as_secs_f64() * 1e3,
+        );
+    }
+    let t_tail = std::time::Instant::now();
+    let (proof, claim) = prove_from_round1(
+        a_packed,
+        b_packed,
+        msg,
+        &r_outer,
+        grinding,
+        grinding_nonces,
+        Some(&coverage),
+        challenger,
+    );
+    if zc_timing {
+        eprintln!(
+            "[ag-zc-timing] m={m} fold+tail {:.2} ms",
+            t_tail.elapsed().as_secs_f64() * 1e3
+        );
+    }
     (proof, claim, s_hat_v_c)
 }
 
@@ -915,21 +1353,101 @@ fn prove_round1_banks(
     c_packed: &[u8],
     eq: &[F128],
 ) -> (Round1Message, Vec<F128>) {
-    let (res_ab, bank0, bank1) = if ROUND1_UNFUSED.load(Ordering::Relaxed) {
+    let raw = if ROUND1_UNFUSED.load(Ordering::Relaxed) {
         crate::genus95_curve_code::round1::round1_slp_packed_banks(a_packed, b_packed, c_packed, eq)
     } else {
         crate::genus95_curve_code::round1::round1_slp_packed_banks_fused(
             a_packed, b_packed, c_packed, eq,
         )
     };
+    banks_to_message(raw)
+}
+
+/// [`prove_round1_banks`] under a witness run-list. The hot (fused) path
+/// is [`round1_slp_packed_banks_fused_padded`] — ONE parallel pass over
+/// the live-block list, Partial blocks cleansed inline, per-element parity
+/// with the dense kernel. The bench-only unfused arm keeps the
+/// segment-call driver below (correct, but it pays a rayon bridge per
+/// full-run segment — the envelope's per-column run structure has ~450 of
+/// them, which is exactly why the fused arm got its own kernel).
+#[cfg(target_arch = "aarch64")]
+fn prove_round1_banks_padded(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    c_packed: &[u8],
+    eq: &[F128],
+    coverage: &[super::BlockCoverage],
+) -> (Round1Message, Vec<F128>) {
+    use super::BlockCoverage;
+    if !ROUND1_UNFUSED.load(Ordering::Relaxed) {
+        return banks_to_message(
+            crate::genus95_curve_code::round1::round1_slp_packed_banks_fused_padded(
+                a_packed, b_packed, c_packed, eq, coverage,
+            ),
+        );
+    }
+    let kernel = crate::genus95_curve_code::round1::round1_slp_packed_banks;
+    let n = a_packed.len() / 1024;
+    assert_eq!(eq.len(), n, "one eq weight per block");
+    assert_eq!(coverage.len(), n, "one coverage entry per block");
+    let mut res_ab = [F128::ZERO; 160];
+    let mut bank0 = [F128::ZERO; 64];
+    let mut bank1 = [F128::ZERO; 64];
+    let mut acc = |seg: ([F128; 160], [F128; 64], [F128; 64])| {
+        for j in 0..160 {
+            res_ab[j] += seg.0[j];
+        }
+        for k in 0..64 {
+            bank0[k] += seg.1[k];
+            bank1[k] += seg.2[k];
+        }
+    };
+    let mut i = 0usize;
+    while i < n {
+        match &coverage[i] {
+            BlockCoverage::Dead => i += 1,
+            BlockCoverage::Full => {
+                let mut j = i + 1;
+                while j < n && coverage[j] == BlockCoverage::Full {
+                    j += 1;
+                }
+                acc(kernel(
+                    &a_packed[i * 1024..j * 1024],
+                    &b_packed[i * 1024..j * 1024],
+                    &c_packed[i * 1024..j * 1024],
+                    &eq[i..j],
+                ));
+                i = j;
+            }
+            BlockCoverage::Partial(ranges) => {
+                let mut a_buf = [0u8; 1024];
+                let mut b_buf = [0u8; 1024];
+                let mut c_buf = [0u8; 1024];
+                super::cleanse_block(a_packed, i * 1024, ranges, &mut a_buf);
+                super::cleanse_block(b_packed, i * 1024, ranges, &mut b_buf);
+                super::cleanse_block(c_packed, i * 1024, ranges, &mut c_buf);
+                acc(kernel(&a_buf, &b_buf, &c_buf, &eq[i..i + 1]));
+                i += 1;
+            }
+        }
+    }
+    banks_to_message((res_ab, bank0, bank1))
+}
+
+/// The shared banks → wire-message post-processing: `D⁻¹` scaling of the
+/// fresh coords and the recombined `w̄`, plus the canonical `s_hat_v_c`
+/// capture — `s_hat_v_c[skip + b·64] = bank_b[skip] / D₁`, with `γ⁻¹` for
+/// bank 1 (the kernel's odd-i bank carries an extra `γ` from friendly bit
+/// 0 = 1). `1/D₁ = (1+γ)·κ` since `D = (1+γ)·D₁` and `κ = D⁻¹ = d_inv()`.
+#[cfg(target_arch = "aarch64")]
+fn banks_to_message(
+    (res_ab, bank0, bank1): ([F128; 160], [F128; 64], [F128; 64]),
+) -> (Round1Message, Vec<F128>) {
     let di = d_inv();
     let msg = Round1Message {
         ab_fresh: (0..158).map(|s| di * res_ab[s]).collect(),
         c_msg: (0..64).map(|i| di * (bank0[i] + bank1[i])).collect(),
     };
-    // Canonical s_hat_v_c[skip + b·64] = bank_b[skip] / D₁, with γ⁻¹ for bank 1
-    // (the kernel's odd-i bank carries an extra γ from friendly bit 0 = 1).
-    // 1/D₁ = (1+γ)·κ since D = (1+γ)·D₁ and κ = D⁻¹ = d_inv().
     let inv_d1 = (F128::ONE + gamma_pow(1)) * di;
     let gamma_inv = gamma_pow(1).inv();
     let n_skip = 1usize << K_SKIP;
@@ -950,12 +1468,18 @@ fn prove_from_round1<C: Challenger>(
     b_packed: &[u8],
     msg: Round1Message,
     r_outer: &[F128],
+    grinding: super::ZerocheckGrinding,
+    mut grinding_nonces: Vec<u64>,
+    coverage: Option<&[super::BlockCoverage]>,
     challenger: &mut C,
 ) -> (AgProof, AgClaim) {
     challenger.observe_f128_slice(&msg.ab_fresh);
     challenger.observe_f128_slice(&msg.c_msg);
 
-    let (r1, r1_nonce) = sample_r1_prover(challenger);
+    let (r1, r1_nonce) = match grinding.ag_r1_bits() {
+        Some(bits) => sample_r1_prover_pow(challenger, bits),
+        None => sample_r1_prover(challenger),
+    };
     let c_eval = eval_c_at(&msg, &r1);
 
     let bf = base_evaluation_functional(&r1).expect("denominator nonzero at r1");
@@ -963,10 +1487,44 @@ fn prove_from_round1<C: Challenger>(
     let mut r_rest = friendly_challenges().to_vec();
     r_rest.extend_from_slice(r_outer);
 
-    // Round 0: fused fold of a,b at r1 + the first (full-size) multilinear message.
-    let (a_mlv, b_mlv, g1_0, ginf_0) = fold_and_first_round(a_packed, b_packed, &w, &r_rest);
-    let (rounds, rhos, a_eval, b_eval) =
-        mlv_tail_fs(a_mlv, b_mlv, g1_0, ginf_0, &r_rest, challenger);
+    // Round 0 + the tail. The sparse-support decision mirrors the RS
+    // zerocheck's `sparse_from_round2`: when the run-list has dead blocks
+    // and the live fraction clears the gate, the fold emits LIVE-SPAN
+    // buffers and the tail runs support-proportional rounds; otherwise the
+    // padded (or dense) fold feeds the lookahead tail. Byte-identical wire
+    // output on every path.
+    let sparse = coverage.is_some_and(|cov| {
+        let live_blocks = cov
+            .iter()
+            .filter(|c| !matches!(c, super::BlockCoverage::Dead))
+            .count();
+        let n_out = cov.len() * 128;
+        live_blocks < cov.len()
+            && n_out >= 8
+            && live_blocks * 128 * super::sparse_tail_gate() <= n_out
+    });
+    let (a_mlv, b_mlv, g1_0, ginf_0, store) = if sparse {
+        let cov = coverage.expect("sparse implies coverage");
+        let (a, b, g1, gi, st) = fold_and_first_round_sparse(a_packed, b_packed, &w, &r_rest, cov);
+        (a, b, g1, gi, Some(st))
+    } else {
+        let (a, b, g1, gi) = match coverage {
+            Some(cov) => fold_and_first_round_padded(a_packed, b_packed, &w, &r_rest, cov),
+            None => fold_and_first_round(a_packed, b_packed, &w, &r_rest),
+        };
+        (a, b, g1, gi, None)
+    };
+    let (rounds, rhos, a_eval, b_eval) = match grinding.multilinear_round_bits() {
+        Some(bits) => {
+            let mut gch = RoundGrindProver {
+                inner: challenger,
+                bits,
+                nonces: &mut grinding_nonces,
+            };
+            mlv_tail_dispatch(a_mlv, b_mlv, g1_0, ginf_0, store, &r_rest, &mut gch)
+        }
+        None => mlv_tail_dispatch(a_mlv, b_mlv, g1_0, ginf_0, store, &r_rest, challenger),
+    };
 
     let proof = AgProof {
         round1_ab: msg.ab_fresh,
@@ -976,6 +1534,7 @@ fn prove_from_round1<C: Challenger>(
         final_a_eval: a_eval,
         final_b_eval: b_eval,
         final_c_eval: c_eval,
+        grinding_nonces,
     };
     let claim = AgClaim {
         r1,
@@ -1010,6 +1569,109 @@ pub(super) fn mlv_tail_fs<C: Challenger>(
     rhos.push(rho0);
     let (tail_rounds, tail_rhos, a_eval, b_eval) =
         mlv_tail_fs_resume(a_mlv, b_mlv, 1, rho0, None, r_rest, challenger);
+    rounds.extend(tail_rounds);
+    rhos.extend(tail_rhos);
+    (rounds, rhos, a_eval, b_eval)
+}
+
+/// One tail, two storages: dispatch on whether the fold handed over
+/// live-span buffers (+ their [`LiveLayout`]) or a full dense pair.
+fn mlv_tail_dispatch<C: Challenger>(
+    a_mlv: Vec<F128>,
+    b_mlv: Vec<F128>,
+    g1_0: F128,
+    ginf_0: F128,
+    store: Option<LiveLayout>,
+    r_rest: &[F128],
+    challenger: &mut C,
+) -> (Vec<(F128, F128)>, Vec<F128>, F128, F128) {
+    match store {
+        Some(st) => mlv_tail_fs_sparse(a_mlv, b_mlv, g1_0, ginf_0, st, r_rest, challenger),
+        None => mlv_tail_fs(a_mlv, b_mlv, g1_0, ginf_0, r_rest, challenger),
+    }
+}
+
+/// [`mlv_tail_fs`] over LIVE-SPAN buffers (the sparse fold's output): the
+/// tail runs the support-proportional rounds — RS's
+/// [`fold_and_round_pair_sparse_into`], with the friendly constants riding
+/// as ordinary `r_next` weights — while the live set clears the gate and
+/// the domain keeps the fused threshold, then expands to dense ONCE and
+/// resumes the lookahead tail mid-stream. Wire output is bit-identical to
+/// the dense tail: every skipped term carries an `a·b` factor of zero.
+pub(super) fn mlv_tail_fs_sparse<C: Challenger>(
+    mut a_mlv: Vec<F128>,
+    mut b_mlv: Vec<F128>,
+    g1_0: F128,
+    ginf_0: F128,
+    mut store: LiveLayout,
+    r_rest: &[F128],
+    challenger: &mut C,
+) -> (Vec<(F128, F128)>, Vec<F128>, F128, F128) {
+    let n_mlv = r_rest.len();
+    let mut rounds = Vec::with_capacity(n_mlv);
+    let mut rhos = Vec::with_capacity(n_mlv);
+    rounds.push((g1_0, ginf_0));
+    challenger.observe_f128(g1_0);
+    challenger.observe_f128(ginf_0);
+    let mut rho_prev = challenger.sample_f128();
+    rhos.push(rho_prev);
+
+    // The sparse rounds — the RS tail's loop shape: the logical `domain`
+    // halves every round regardless of the compacted buffer length, and
+    // the gate re-checks per round (interval ends round outward, so the
+    // live fraction can cross it mid-tail).
+    let mut domain = 1usize << n_mlv;
+    let (mut a_nxt, mut b_nxt) = (Vec::new(), Vec::new());
+    let mut i = 1usize;
+    while i < n_mlv && domain >= 1024 && store.len() * super::sparse_tail_gate() <= domain {
+        let log_before = domain.trailing_zeros() as usize;
+        let mut r_next = vec![F128::ONE; log_before - 1];
+        r_next[1..].copy_from_slice(&r_rest[i + 1..]);
+        // Output storage is bounded by the input's: shrinking pairs can
+        // only round outward by one slot per interval end.
+        let cap = store.len() + 2 * store.intervals().len() + 2;
+        if a_nxt.len() < cap {
+            crate::scratch::give_f128(a_nxt);
+            crate::scratch::give_f128(b_nxt);
+            a_nxt = crate::scratch::take_f128(cap);
+            b_nxt = crate::scratch::take_f128(cap);
+        }
+        let (m1, mi, store_out) = fold_and_round_pair_sparse_into(
+            &a_mlv,
+            &b_mlv,
+            &mut a_nxt[..cap],
+            &mut b_nxt[..cap],
+            rho_prev,
+            &r_next,
+            &store,
+            domain,
+        );
+        std::mem::swap(&mut a_mlv, &mut a_nxt);
+        std::mem::swap(&mut b_mlv, &mut b_nxt);
+        a_mlv.truncate(store_out.len());
+        b_mlv.truncate(store_out.len());
+        store = store_out;
+        domain /= 2;
+        rounds.push((m1, mi));
+        challenger.observe_f128(m1);
+        challenger.observe_f128(mi);
+        rho_prev = challenger.sample_f128();
+        rhos.push(rho_prev);
+        i += 1;
+    }
+
+    // Back to global indexing: scatter the live span into a full padded
+    // buffer once and resume the lookahead tail mid-stream (the arrays are
+    // folded through every sampled challenge except `rho_prev` — resume's
+    // own invariant).
+    let a_full = expand_to_dense(&a_mlv, &store, domain);
+    let b_full = expand_to_dense(&b_mlv, &store, domain);
+    crate::scratch::give_f128(a_mlv);
+    crate::scratch::give_f128(b_mlv);
+    crate::scratch::give_f128(a_nxt);
+    crate::scratch::give_f128(b_nxt);
+    let (tail_rounds, tail_rhos, a_eval, b_eval) =
+        mlv_tail_fs_resume(a_full, b_full, i, rho_prev, None, r_rest, challenger);
     rounds.extend(tail_rounds);
     rhos.extend(tail_rhos);
     (rounds, rhos, a_eval, b_eval)
@@ -1253,6 +1915,18 @@ pub fn verify<C: Challenger>(
     proof: &AgProof,
     challenger: &mut C,
 ) -> Result<AgClaim, AgVerifyError> {
+    verify_with_grinding(m, proof, super::ZerocheckGrinding::disabled(), challenger)
+}
+
+/// [`verify`] under a grinding schedule — the mirror of
+/// [`prove_capture_s_hat_v_c_with_grinding`]. With a disabled schedule this
+/// accepts exactly the old proofs (an empty nonce vector is required).
+pub fn verify_with_grinding<C: Challenger>(
+    m: usize,
+    proof: &AgProof,
+    grinding: super::ZerocheckGrinding,
+    challenger: &mut C,
+) -> Result<AgClaim, AgVerifyError> {
     if m < K_SKIP + N_INNER {
         return Err(AgVerifyError::LogNTooSmall { log_n: m });
     }
@@ -1277,13 +1951,32 @@ pub fn verify<C: Challenger>(
             got: proof.multilinear_rounds.len(),
         });
     }
+    let expected_nonces = grinding_nonce_count(grinding, m);
+    if proof.grinding_nonces.len() != expected_nonces {
+        return Err(AgVerifyError::BadGrindingNonceCount {
+            expected: expected_nonces,
+            got: proof.grinding_nonces.len(),
+        });
+    }
+    let mut nonces = proof.grinding_nonces.iter().copied();
 
     challenger.observe_label(b"flock-ag-skip-v1");
-    let r_outer = challenger.sample_f128_vec(m - K_SKIP - N_INNER);
+    let r_outer = match grinding.initial_bits(m) {
+        Some(bits) => {
+            let nonce = nonces.next().ok_or(AgVerifyError::InvalidGrindingNonce)?;
+            challenger
+                .verify_pow_and_sample_f128_vec(nonce, bits, m - K_SKIP - N_INNER)
+                .ok_or(AgVerifyError::InvalidGrindingNonce)?
+        }
+        None => challenger.sample_f128_vec(m - K_SKIP - N_INNER),
+    };
     challenger.observe_f128_slice(&proof.round1_ab);
     challenger.observe_f128_slice(&proof.round1_c);
 
-    let r1 = replay_r1_verifier(challenger, proof.r1_nonce)?;
+    let r1 = match grinding.ag_r1_bits() {
+        Some(bits) => replay_r1_verifier_pow(challenger, proof.r1_nonce, bits)?,
+        None => replay_r1_verifier(challenger, proof.r1_nonce)?,
+    };
     let msg = Round1Message {
         ab_fresh: proof.round1_ab.clone(),
         c_msg: proof.round1_c.clone(),
@@ -1296,6 +1989,7 @@ pub fn verify<C: Challenger>(
     let mut r_rest = friendly_challenges().to_vec();
     r_rest.extend_from_slice(&r_outer);
 
+    let mlv_bits = grinding.multilinear_round_bits();
     let mut rhos = Vec::with_capacity(n_mlv);
     for i in 0..n_mlv {
         let (g1, g_inf) = proof.multilinear_rounds[i];
@@ -1303,7 +1997,15 @@ pub fn verify<C: Challenger>(
         let g0 = (c_running + r_eq * g1) * (F128::ONE + r_eq).inv();
         challenger.observe_f128(g1);
         challenger.observe_f128(g_inf);
-        let rho = challenger.sample_f128();
+        let rho = match mlv_bits {
+            Some(bits) => {
+                let nonce = nonces.next().ok_or(AgVerifyError::InvalidGrindingNonce)?;
+                challenger
+                    .verify_pow_and_sample_f128(nonce, bits)
+                    .ok_or(AgVerifyError::InvalidGrindingNonce)?
+            }
+            None => challenger.sample_f128(),
+        };
         rhos.push(rho);
         c_running = g0 * (F128::ONE + rho) + g1 * rho + g_inf * rho * (rho + F128::ONE);
     }
@@ -1988,5 +2690,296 @@ mod tests {
             verify(m, &proof, &mut FsChallenger::new(b"flock-ag-skip-test")).is_err(),
             "must reject a witness violating a*b=c"
         );
+    }
+
+    /// The fused-nonce grinding credit rests on pinned protocol constants —
+    /// this test ties every number in the derivation together so a change to
+    /// the sampler's shape or the code parameters cannot silently invalidate
+    /// the 5-bit credit or the explicit-bit splits.
+    #[test]
+    fn credit_constants_are_pinned() {
+        const GENUS: usize = 95;
+        let bits_for = |n: usize| usize::BITS - n.leading_zeros();
+        // Code degrees from the Riemann–Roch dimensions: deg = dim + g − 1.
+        let base_deg = crate::genus95_curve_code::BASE_MESSAGE_BITS + GENUS - 1;
+        let product_deg = crate::genus95_curve_code::PRODUCT_MESSAGE_BITS + GENUS - 1;
+        assert_eq!(base_deg, 158);
+        assert_eq!(product_deg, 316);
+        assert_eq!(R1_ZERO_BOUND, product_deg + base_deg);
+        // The sampler's per-point weight is 1/(2^128 · BASE_Y_DEGREE · 2^3):
+        // the slot flattening over the base fiber and the three
+        // Artin–Schreier choice bits. log2 of that constant is the credit.
+        let sampler_denom = crate::genus95_curve_code::BASE_Y_DEGREE * 8;
+        assert_eq!(sampler_denom, 32);
+        assert_eq!(AG_SAMPLING_CREDIT_BITS, sampler_denom.trailing_zeros());
+        // r₁: ALL bits explicit — the recursion circuit's relaxed-canonicity
+        // decode (phase D) hands the fiber's 5 flattening bits back to the
+        // prover, so the sampler credit no longer discounts this site.
+        assert_eq!(R1_POW_BITS, bits_for(R1_ZERO_BOUND));
+        assert_eq!(
+            crate::lincheck::AG_LINCHECK_SKIP_POW_BITS + AG_SAMPLING_CREDIT_BITS,
+            bits_for(base_deg)
+        );
+        // The schedule methods expose exactly these constants.
+        let g = crate::zerocheck::ZerocheckGrinding::per_challenge_128();
+        assert_eq!(g.ag_r1_bits(), Some(R1_POW_BITS));
+        assert_eq!(
+            crate::zerocheck::ZerocheckGrinding::disabled().ag_r1_bits(),
+            None
+        );
+    }
+
+    /// The fused predicate really gates on BOTH criteria: a nonce whose
+    /// attempt lands a valid point still rejects under a PoW target its hash
+    /// does not clear, and pow_bits = 0 degenerates to the plain attempt.
+    #[test]
+    fn fused_nonce_gates_on_pow_and_point() {
+        use crate::genus95_curve_code::{
+            evaluation_point_from_nonce, evaluation_point_from_nonce_pow,
+        };
+        use crate::hash::HashKind;
+        let seed = [5u8; 32];
+        let n = (0..20_000u32)
+            .find(|&n| evaluation_point_from_nonce(&seed, n, HashKind::Sha256).is_some())
+            .expect("a valid nonce exists in the budget");
+        // pow_bits = 0: identical to the plain attempt.
+        assert_eq!(
+            evaluation_point_from_nonce_pow(&seed, n, HashKind::Sha256, 0),
+            evaluation_point_from_nonce(&seed, n, HashKind::Sha256)
+        );
+        // A 40-bit target rejects this specific point-valid nonce (its hash
+        // clears 40 zero bits with probability 2^-40 — deterministic here).
+        assert_eq!(
+            evaluation_point_from_nonce_pow(&seed, n, HashKind::Sha256, 40),
+            None,
+            "the PoW gate must reject a point-valid nonce whose hash misses the target"
+        );
+        // And a nonce found UNDER the 4-bit target also passes the plain attempt.
+        let n4 = (0..(1u32 << 20))
+            .find(|&n| evaluation_point_from_nonce_pow(&seed, n, HashKind::Sha256, 4).is_some())
+            .expect("a fused nonce exists in the budget");
+        assert!(evaluation_point_from_nonce(&seed, n4, HashKind::Sha256).is_some());
+    }
+
+    /// The run-list arms are value-identical to the dense kernels on an
+    /// honestly zero-padded witness AND read no declared-dead bit: proving
+    /// over a witness whose dead regions hold garbage (deliberately
+    /// inconsistent garbage — dead `c` bits set where `a·b` is zero) yields
+    /// byte-identical round-1 message, fold, `s_hat_v_c`, and full proof —
+    /// the exactness `PooledDirty` requires.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn padded_arms_match_dense_and_ignore_dirty_padding() {
+        use crate::challenger::FsChallenger;
+        use crate::zerocheck::{PaddingRun, PaddingSpec};
+        let m = 16usize;
+        let spec = PaddingSpec::from_runs(vec![
+            PaddingRun {
+                k_log: 13,
+                useful_bits_per_block: 1 << 13,
+                n_blocks: 2,
+            },
+            PaddingRun {
+                k_log: 13,
+                useful_bits_per_block: 3001,
+                n_blocks: 1,
+            },
+            PaddingRun {
+                k_log: 13,
+                useful_bits_per_block: 0,
+                n_blocks: 2,
+            },
+            PaddingRun {
+                k_log: 14,
+                useful_bits_per_block: 9000,
+                n_blocks: 1,
+            },
+        ]);
+        // LSB-first byte mask of the useful bits.
+        let mut mask = vec![0u8; (1usize << m) / 8];
+        for (s, e) in spec.useful_intervals() {
+            for i in s..e {
+                mask[i / 8] |= 1 << (i % 8);
+            }
+        }
+        let (a0, b0, c0) = random_witness(m, 91);
+        let honest = |v: &[u8]| -> Vec<u8> { v.iter().zip(&mask).map(|(x, k)| x & k).collect() };
+        let dirty = |v: &[u8], g: u8| -> Vec<u8> {
+            v.iter()
+                .zip(&mask)
+                .map(|(x, k)| (x & k) | (g & !k))
+                .collect()
+        };
+        let (ah, bh, ch) = (honest(&a0), honest(&b0), honest(&c0));
+        let (ad, bd, cd) = (dirty(&a0, 0xA5), dirty(&b0, 0x5A), dirty(&c0, 0xFF));
+
+        // Kernel level, round 1: dense-honest vs padded-dirty.
+        let cov = spec.block_coverage(K_SKIP + N_INNER, 1usize << (m - K_SKIP - N_INNER));
+        let mut rng = Sha256Rng::new([7u8; 32]);
+        let r_outer: Vec<F128> = (0..m - K_SKIP - N_INNER)
+            .map(|_| F128::new(rng.next_u64(), rng.next_u64()))
+            .collect();
+        let eq = crate::zerocheck::univariate_skip::build_eq(&r_outer);
+        let dense = prove_round1_banks(&ah, &bh, &ch, &eq);
+        let padded = prove_round1_banks_padded(&ad, &bd, &cd, &eq, &cov);
+        assert_eq!(dense.0, padded.0, "round-1 message");
+        assert_eq!(dense.1, padded.1, "s_hat_v_c capture");
+
+        // Kernel level, the fold + first message, at a decoded point.
+        let seed = [3u8; 32];
+        let pt = (0..u32::MAX)
+            .find_map(|n| {
+                crate::genus95_curve_code::evaluation_point_from_nonce(
+                    &seed,
+                    n,
+                    crate::hash::HashKind::Sha256,
+                )
+            })
+            .expect("a decodable nonce exists");
+        let w: Vec<F128> = base_evaluation_functional(&pt)
+            .expect("functional at a sampled point")
+            .iter()
+            .copied()
+            .collect();
+        let mut r_rest = friendly_challenges().to_vec();
+        r_rest.extend_from_slice(&r_outer);
+        let (af, bf, g1, gi) = fold_and_first_round(&ah, &bh, &w, &r_rest);
+        let (afp, bfp, g1p, gip) = fold_and_first_round_padded(&ad, &bd, &w, &r_rest, &cov);
+        assert_eq!((g1, gi), (g1p, gip), "first multilinear message");
+        assert_eq!(af, afp, "folded a");
+        assert_eq!(bf, bfp, "folded b");
+
+        // End to end under the strict schedule: the padded-dirty proof is
+        // byte-identical to the dense-honest one, and to the padded-honest
+        // one, and verifies.
+        let g = crate::zerocheck::ZerocheckGrinding::per_challenge_128();
+        let mk = || FsChallenger::new(b"flock-ag-padded-test");
+        let (p0, cl0, sv0) = prove_capture_s_hat_v_c_with_grinding(
+            &ah,
+            &bh,
+            &ch,
+            m,
+            &PaddingSpec::dense(m),
+            g,
+            &mut mk(),
+        );
+        let (p1, cl1, sv1) =
+            prove_capture_s_hat_v_c_with_grinding(&ad, &bd, &cd, m, &spec, g, &mut mk());
+        assert_eq!(p0, p1, "proof bytes");
+        assert_eq!(cl0, cl1, "claims");
+        assert_eq!(sv0, sv1, "s_hat_v_c");
+        let (p2, _, sv2) =
+            prove_capture_s_hat_v_c_with_grinding(&ah, &bh, &ch, m, &spec, g, &mut mk());
+        assert_eq!(p0, p2, "padded-honest proof bytes");
+        assert_eq!(sv0, sv2, "padded-honest s_hat_v_c");
+        verify_with_grinding(m, &p1, g, &mut mk()).expect("the padded-dirty proof verifies");
+    }
+
+    /// The SPARSE tail at deep low utilization (3 of 64 code blocks live):
+    /// the live-span fold + four support-proportional rounds + the
+    /// expand-and-resume handoff produce a proof byte-identical to the
+    /// dense-honest one, under both grinding schedules, over a witness
+    /// whose dead regions hold garbage.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn sparse_tail_matches_dense_at_low_utilization() {
+        use crate::challenger::FsChallenger;
+        use crate::zerocheck::{PaddingRun, PaddingSpec};
+        let m = 19usize; // 64 blocks; n_mlv = 13, so the gate holds 4 rounds
+        let spec = PaddingSpec::from_runs(vec![
+            PaddingRun {
+                k_log: 13,
+                useful_bits_per_block: 1 << 13,
+                n_blocks: 2,
+            },
+            PaddingRun {
+                k_log: 13,
+                useful_bits_per_block: 0,
+                n_blocks: 30,
+            },
+            PaddingRun {
+                k_log: 13,
+                useful_bits_per_block: 5000,
+                n_blocks: 1,
+            },
+        ]); // + an implicit 31-block trailing gap
+        let mut mask = vec![0u8; (1usize << m) / 8];
+        for (s, e) in spec.useful_intervals() {
+            for i in s..e {
+                mask[i / 8] |= 1 << (i % 8);
+            }
+        }
+        let (a0, b0, c0) = random_witness(m, 55);
+        let honest = |v: &[u8]| -> Vec<u8> { v.iter().zip(&mask).map(|(x, k)| x & k).collect() };
+        let dirty = |v: &[u8], g: u8| -> Vec<u8> {
+            v.iter()
+                .zip(&mask)
+                .map(|(x, k)| (x & k) | (g & !k))
+                .collect()
+        };
+        let (ah, bh, ch) = (honest(&a0), honest(&b0), honest(&c0));
+        let (ad, bd, cd) = (dirty(&a0, 0xC3), dirty(&b0, 0x3C), dirty(&c0, 0xFF));
+        for g in [
+            crate::zerocheck::ZerocheckGrinding::disabled(),
+            crate::zerocheck::ZerocheckGrinding::per_challenge_128(),
+        ] {
+            let mk = || FsChallenger::new(b"flock-ag-sparse-test");
+            let (p0, cl0, sv0) = prove_capture_s_hat_v_c_with_grinding(
+                &ah,
+                &bh,
+                &ch,
+                m,
+                &PaddingSpec::dense(m),
+                g,
+                &mut mk(),
+            );
+            let (p1, cl1, sv1) =
+                prove_capture_s_hat_v_c_with_grinding(&ad, &bd, &cd, m, &spec, g, &mut mk());
+            assert_eq!(p0, p1, "proof bytes (grinding: {})", g.enabled);
+            assert_eq!(cl0, cl1, "claims");
+            assert_eq!(sv0, sv1, "s_hat_v_c");
+            verify_with_grinding(m, &p1, g, &mut mk()).expect("the sparse-path proof verifies");
+        }
+    }
+
+    /// Full grinding roundtrip on the fused transcript + fused-nonce tamper
+    /// rejection: any change to `r1_nonce` must reject (bad PoW, bad point,
+    /// or — if both criteria fluke — a different r₁ failing the c-eval bind).
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn grinding_roundtrip_rejects_fused_nonce_tampers() {
+        use crate::challenger::FsChallenger;
+        let m = 14usize;
+        let (a, b, c) = random_witness(m, 77);
+        let g = crate::zerocheck::ZerocheckGrinding::per_challenge_128();
+        let mk = || FsChallenger::new(b"flock-ag-grind-test");
+        let (proof, claim, _) = prove_capture_s_hat_v_c_with_grinding(
+            &a,
+            &b,
+            &c,
+            m,
+            &crate::zerocheck::PaddingSpec::dense(m),
+            g,
+            &mut mk(),
+        );
+        let vclaim =
+            verify_with_grinding(m, &proof, g, &mut mk()).expect("honest fused proof verifies");
+        assert_eq!(vclaim, claim);
+
+        for delta in [1u32, 2, 3, 17] {
+            let mut bad = proof.clone();
+            bad.r1_nonce = proof.r1_nonce.wrapping_add(delta);
+            assert!(
+                verify_with_grinding(m, &bad, g, &mut mk()).is_err(),
+                "tampered fused r1 nonce (+{delta}) accepted"
+            );
+        }
+        // The grinding-nonce vector still binds: wrong count rejects.
+        let mut bad = proof.clone();
+        bad.grinding_nonces.push(0);
+        assert!(matches!(
+            verify_with_grinding(m, &bad, g, &mut mk()),
+            Err(AgVerifyError::BadGrindingNonceCount { .. })
+        ));
     }
 }

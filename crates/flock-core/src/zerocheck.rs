@@ -120,6 +120,22 @@ impl ZerocheckGrinding {
         }
     }
 
+    /// Explicit PoW bits on the AG-skip zerocheck's FUSED `r₁` nonce
+    /// ([`ag_skip::sample_r1_prover_pow`]): ALL `bits_for(474) = 9` bits
+    /// required ([`ag_skip::R1_ZERO_BOUND`]) are explicit — the recursion
+    /// circuit binds the decode with RELAXED canonicity (any fiber point
+    /// over the XOF-derived `x`), which returns the sampler's 5 flattening
+    /// bits to the prover, so they are repaid in the PoW target. `None`
+    /// under a disabled schedule (the direct route's plain single-attempt
+    /// nonce, which makes no 128-bit claim).
+    pub const fn ag_r1_bits(self) -> Option<u32> {
+        if self.enabled {
+            Some(ag_skip::R1_POW_BITS)
+        } else {
+            None
+        }
+    }
+
     /// PoW before a standard degree-two tail-round challenge.
     pub const fn multilinear_round_bits(self) -> Option<u32> {
         if self.enabled {
@@ -283,6 +299,41 @@ impl PaddingSpec {
         out
     }
 
+    /// Per-block coverage over `n_blocks` blocks of `2^log2_block` bits —
+    /// the gating map for block-grained kernels (the AG round 1 and fold,
+    /// whose natural tile is the 8192-bit code block). `Dead` blocks may be
+    /// skipped outright (their honest contribution is zero), `Full` blocks
+    /// read in place, and `Partial` blocks carry their block-local useful
+    /// bit ranges so a kernel can cleanse them into a zeroed scratch block
+    /// ([`cleanse_block`]) and never read a declared-dead bit — the
+    /// exactness `PooledDirty` requires.
+    pub fn block_coverage(&self, log2_block: usize, n_blocks: usize) -> Vec<BlockCoverage> {
+        let block_bits = 1usize << log2_block;
+        let mut out = vec![BlockCoverage::Dead; n_blocks];
+        for (s, e) in self.useful_intervals() {
+            let mut blk = s >> log2_block;
+            while blk < n_blocks && (blk << log2_block) < e {
+                let b0 = blk << log2_block;
+                let (cs, ce) = (s.max(b0), e.min(b0 + block_bits));
+                let piece = (cs - b0, ce - b0);
+                out[blk] = match std::mem::replace(&mut out[blk], BlockCoverage::Dead) {
+                    _ if piece == (0, block_bits) => BlockCoverage::Full,
+                    BlockCoverage::Dead => BlockCoverage::Partial(vec![piece]),
+                    BlockCoverage::Partial(mut v) => {
+                        // Intervals are sorted and merged, so pieces arrive
+                        // in order and never touch (a touching pair would
+                        // have merged upstream).
+                        v.push(piece);
+                        BlockCoverage::Partial(v)
+                    }
+                    BlockCoverage::Full => unreachable!("a full block admits no second piece"),
+                };
+                blk += 1;
+            }
+        }
+        out
+    }
+
     /// Sorted, merged list of useful bit intervals `[start, end)` — the
     /// semantic content of the spec (everything outside is declared zero).
     /// Consumed by the general (multi-run) kernel paths and by tests; cost is
@@ -305,6 +356,40 @@ impl PaddingSpec {
             offset += run.extent_bits();
         }
         intervals
+    }
+}
+
+/// One block's standing in a [`PaddingSpec::block_coverage`] map.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BlockCoverage {
+    /// No useful bit — skippable outright (honest contribution zero).
+    Dead,
+    /// Every bit useful — read in place.
+    Full,
+    /// The block-local useful bit ranges `[start, end)`, sorted and
+    /// non-touching — cleanse into zeroed scratch before reading.
+    Partial(Vec<(usize, usize)>),
+}
+
+/// Copy one block's useful bits — block-local bit `ranges` — from `src` at
+/// byte offset `base_byte` into `dst` (zeroed here first). Edge bits of a
+/// non-byte-aligned range are masked, so a declared-dead neighbor bit never
+/// leaks through: after this, `dst` is the block a fully honest prover
+/// would have had, whatever garbage the pooled source carries.
+pub fn cleanse_block(src: &[u8], base_byte: usize, ranges: &[(usize, usize)], dst: &mut [u8]) {
+    dst.fill(0);
+    for &(s, e) in ranges {
+        let (sb, eb) = (s / 8, e.div_ceil(8));
+        for i in sb..eb {
+            let mut mask = 0xFFu8;
+            if i == s / 8 {
+                mask &= 0xFFu8 << (s % 8);
+            }
+            if e % 8 != 0 && i == e / 8 {
+                mask &= !(0xFFu8 << (e % 8));
+            }
+            dst[i] |= src[base_byte + i] & mask;
+        }
     }
 }
 
@@ -1666,6 +1751,91 @@ mod tests {
     // -----------------------------------------------------------------------
     // Run-list PaddingSpec.
     // -----------------------------------------------------------------------
+
+    /// The block-coverage map (the AG kernels' gating grid) classifies
+    /// every 8192-bit block correctly — full runs, bit-granular partial
+    /// tails, dead gaps, runs straddling the grid, mid-block starts, and
+    /// multiple pieces per block — and [`cleanse_block`] reproduces exactly
+    /// the honest block (dead bits zero, edge bits masked) from a dirty
+    /// source.
+    #[test]
+    fn block_coverage_and_cleanse() {
+        let spec = PaddingSpec::from_runs(vec![
+            PaddingRun {
+                k_log: 13,
+                useful_bits_per_block: 1 << 13,
+                n_blocks: 2,
+            },
+            PaddingRun {
+                k_log: 13,
+                useful_bits_per_block: 3001,
+                n_blocks: 1,
+            },
+            PaddingRun {
+                k_log: 13,
+                useful_bits_per_block: 0,
+                n_blocks: 2,
+            },
+            PaddingRun {
+                k_log: 14,
+                useful_bits_per_block: 9000,
+                n_blocks: 1,
+            },
+        ]);
+        let cov = spec.block_coverage(13, 8);
+        assert_eq!(
+            cov,
+            vec![
+                BlockCoverage::Full,
+                BlockCoverage::Full,
+                BlockCoverage::Partial(vec![(0, 3001)]),
+                BlockCoverage::Dead,
+                BlockCoverage::Dead,
+                BlockCoverage::Full,
+                BlockCoverage::Partial(vec![(0, 9000 - 8192)]),
+                BlockCoverage::Dead,
+            ]
+        );
+        // Sub-grid runs: a dead prefix pushes an interval to a mid-block
+        // start, and two disjoint intervals land in ONE grid block.
+        let sub = PaddingSpec::from_runs(vec![
+            PaddingRun {
+                k_log: 12,
+                useful_bits_per_block: 1000,
+                n_blocks: 1,
+            },
+            PaddingRun {
+                k_log: 12,
+                useful_bits_per_block: 2000,
+                n_blocks: 1,
+            },
+        ]);
+        assert_eq!(
+            sub.block_coverage(13, 2),
+            vec![
+                BlockCoverage::Partial(vec![(0, 1000), (4096, 6096)]),
+                BlockCoverage::Dead,
+            ]
+        );
+
+        // Cleanse: a garbage source, block-local ranges — the output holds
+        // the source's bits exactly on the ranges and zero elsewhere.
+        let src: Vec<u8> = (0..2048u32).map(|i| (i * 37 + 11) as u8).collect();
+        let base = 1024usize;
+        let ranges = [(0usize, 1001usize), (4099usize, 6096usize), (8003, 8190)];
+        let mut dst = [0xEEu8; 1024]; // pre-dirty: cleanse must fully own it
+        cleanse_block(&src, base, &ranges, &mut dst);
+        for bit in 0..8192usize {
+            let useful = ranges.iter().any(|&(s, e)| bit >= s && bit < e);
+            let got = (dst[bit / 8] >> (bit % 8)) & 1;
+            let want = if useful {
+                (src[base + bit / 8] >> (bit % 8)) & 1
+            } else {
+                0
+            };
+            assert_eq!(got, want, "bit {bit} (useful: {useful})");
+        }
+    }
 
     /// Run-list construction/accessor sanity: canonical forms, extents,
     /// single-run detection, and useful-interval merging.

@@ -1705,6 +1705,55 @@ impl Blake3Setup {
         )
     }
 
+    /// [`Self::prove_fast`] with the **AG-skip** boolean zerocheck — the SAME
+    /// single-slot union commit, lincheck, and merged opening; only round 1
+    /// of the zerocheck differs. aarch64-only (NEON round-1 kernel). Verify
+    /// with [`Self::verify_union_ag`].
+    #[cfg(target_arch = "aarch64")]
+    pub fn prove_fast_union_ag<Ch: Challenger>(
+        &self,
+        blocks: &[Compression],
+        challenger: &mut Ch,
+    ) -> (
+        flock_core::proof::R1csProofMergedLigeritoAg,
+        Commitment,
+        R1csClaim,
+    ) {
+        assert_eq!(blocks.len(), self.n_blocks);
+        let union = flock_core::union::UnionInstance::new(&self.registry, vec![self.n_blocks]);
+        let slot = crate::prover::UnionSlotProverInput::new(
+            generate_witness_batch_major_partial(blocks, self.n_blocks_log()),
+            self.r1cs.csc_lincheck_circuit(),
+        );
+        crate::prover::prove_fast_ligerito_union_ag(
+            &union,
+            &self.pcs_params,
+            vec![slot],
+            challenger,
+        )
+    }
+
+    /// Verify a [`Self::prove_fast_union_ag`] proof. (Unlike the prove side,
+    /// this runs on every target.)
+    pub fn verify_union_ag<Ch: Challenger>(
+        &self,
+        commitment: &Commitment,
+        proof: &flock_core::proof::R1csProofMergedLigeritoAg,
+        challenger: &mut Ch,
+    ) -> Result<R1csClaim, verifier::VerifyError> {
+        let union = flock_core::union::UnionInstance::new(&self.registry, vec![self.n_blocks]);
+        let circuit = self.r1cs.csc_lincheck_circuit();
+        let circs: [&dyn flock_core::lincheck::LincheckCircuit; 1] = [circuit];
+        verifier::verify_ligerito_union_ag(
+            &union,
+            &circs,
+            commitment,
+            proof,
+            &self.pcs_params,
+            challenger,
+        )
+    }
+
     /// The AG-skip prover runs the DIRECT (dense pow2-lane) commit — the
     /// standard-pack shape its zerocheck and claims are wired for — while
     /// `prove_fast` moved to the single-slot UNION commit (dense stack +
@@ -2429,6 +2478,124 @@ mod tests {
             setup.verify_ag(&commitment, &bad, &mut ch).is_err(),
             "tampered batch-major AG proof accepted"
         );
+    }
+
+    /// UNION-AG e2e: prove_fast_union_ag → verify_union_ag roundtrip +
+    /// tamper rejection — the AG zerocheck inside the single-slot union
+    /// transport (dense stack + integer lanes, union lincheck, merged
+    /// opening on `SkipPoint::Ag` claim points), under the profile's full
+    /// grinding schedule.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    #[ignore] // Heavy — run with `cargo test prove_fast_union_ag_roundtrip -- --ignored`
+    fn prove_fast_union_ag_roundtrip() {
+        use flock_core::challenger::FsChallenger;
+        let setup = Blake3Setup::new(256);
+        let mut rng = Rng::new(0xA9_0110_4A6);
+        let blocks: Vec<Compression> = (0..256)
+            .map(|_| {
+                let cv: [u32; 8] = std::array::from_fn(|_| rng.next_u32());
+                let m: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+                let counter = ((rng.next_u32() as u64) << 32) | (rng.next_u32() as u64);
+                (cv, m, counter, 64u32, 11u32)
+            })
+            .collect();
+        let mut ch_p = FsChallenger::new(b"flock-union-ag-v0");
+        let (proof, commitment, claim_p) = setup.prove_fast_union_ag(&blocks, &mut ch_p);
+        let mut ch_v = FsChallenger::new(b"flock-union-ag-v0");
+        let claim_v = setup
+            .verify_union_ag(&commitment, &proof, &mut ch_v)
+            .unwrap_or_else(|e| panic!("union-AG verify rejected honest proof: {e:?}"));
+        assert_eq!(claim_p, claim_v, "union-AG verifier claim != prover claim");
+
+        // Tampering an AG round-1 message must reject.
+        let mut bad = proof.clone();
+        bad.boolean.ag.round1_ab[0] += flock_core::field::F128::ONE;
+        let mut ch = FsChallenger::new(b"flock-union-ag-v0");
+        assert!(
+            setup.verify_union_ag(&commitment, &bad, &mut ch).is_err(),
+            "must reject a tampered union-AG round-1 message"
+        );
+
+        // A nonce vector off the grinding schedule must reject (count check).
+        let mut bad = proof.clone();
+        bad.boolean.ag.grinding_nonces.push(0);
+        let mut ch = FsChallenger::new(b"flock-union-ag-v0");
+        assert!(
+            setup.verify_union_ag(&commitment, &bad, &mut ch).is_err(),
+            "must reject a proof with an off-schedule nonce count"
+        );
+
+        // If the schedule grinds, a corrupted nonce must reject too.
+        if !proof.boolean.ag.grinding_nonces.is_empty() {
+            let mut bad = proof.clone();
+            bad.boolean.ag.grinding_nonces[0] ^= 1;
+            let mut ch = FsChallenger::new(b"flock-union-ag-v0");
+            assert!(
+                setup.verify_union_ag(&commitment, &bad, &mut ch).is_err(),
+                "must reject a corrupted grinding nonce"
+            );
+        }
+
+        // The FUSED r1 nonce: any change must reject (bad PoW, bad point, or
+        // a diverged r1 failing the c-eval bind).
+        let mut bad = proof.clone();
+        bad.boolean.ag.r1_nonce = bad.boolean.ag.r1_nonce.wrapping_add(1);
+        let mut ch = FsChallenger::new(b"flock-union-ag-v0");
+        assert!(
+            setup.verify_union_ag(&commitment, &bad, &mut ch).is_err(),
+            "must reject a tampered fused r1 nonce"
+        );
+
+        // The lincheck's FUSED AG skip nonce (the last lincheck nonce).
+        let mut bad = proof.clone();
+        *bad.boolean
+            .lincheck
+            .grinding_nonces
+            .last_mut()
+            .expect("the AG arm carries a fused skip nonce") ^= 1;
+        let mut ch = FsChallenger::new(b"flock-union-ag-v0");
+        assert!(
+            setup.verify_union_ag(&commitment, &bad, &mut ch).is_err(),
+            "must reject a tampered fused lincheck skip nonce"
+        );
+    }
+
+    /// UNION-AG at PARTIAL UTILIZATION (200/256 declared rows): the
+    /// count-derived multi-run spec drives the AG run-list arms — round-1
+    /// full/partial/dead segments and the gated fold — through the real
+    /// transport, with the witness buffers eligible for the dirty pool
+    /// (the PooledDirty election no longer excludes the AG flavor). The
+    /// prove runs TWICE: the second draw takes the buffers the first
+    /// returned DIRTY, and byte-identical proofs pin the arms'
+    /// read-exactness in situ (the kernel-level legs live in
+    /// `ag_skip::padded_arms_match_dense_and_ignore_dirty_padding`).
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    #[ignore] // Heavy — run with `-- --ignored`.
+    fn prove_fast_union_ag_partial_utilization_roundtrip() {
+        use flock_core::challenger::FsChallenger;
+        let setup = Blake3Setup::new(200);
+        let mut rng = Rng::new(0xA9_0110_4A7);
+        let blocks: Vec<Compression> = (0..200)
+            .map(|_| {
+                let cv: [u32; 8] = std::array::from_fn(|_| rng.next_u32());
+                let m: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+                let counter = ((rng.next_u32() as u64) << 32) | (rng.next_u32() as u64);
+                (cv, m, counter, 64u32, 11u32)
+            })
+            .collect();
+        let mut ch_p = FsChallenger::new(b"flock-union-ag-part");
+        let (proof, commitment, claim_p) = setup.prove_fast_union_ag(&blocks, &mut ch_p);
+        let mut ch_v = FsChallenger::new(b"flock-union-ag-part");
+        let claim_v = setup
+            .verify_union_ag(&commitment, &proof, &mut ch_v)
+            .unwrap_or_else(|e| panic!("partial-utilization union-AG rejected: {e:?}"));
+        assert_eq!(claim_p, claim_v, "verifier claim != prover claim");
+
+        let mut ch_p2 = FsChallenger::new(b"flock-union-ag-part");
+        let (proof2, _, _) = setup.prove_fast_union_ag(&blocks, &mut ch_p2);
+        assert_eq!(proof, proof2, "re-prove over pooled-dirty buffers");
     }
 
     #[test]
