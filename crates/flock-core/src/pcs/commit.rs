@@ -962,21 +962,21 @@ mod tests {
         let mut params = default_params(22);
         params.log_batch_size = 6;
 
-        assert_eq!(params.merkle_hash, HashKind::Sha256);
+        assert_eq!(params.merkle_hash, HashKind::Blake3);
         assert_eq!(
             params.ligerito_prover_config().unwrap().merkle_hash,
-            HashKind::Sha256
+            HashKind::Blake3
         );
 
-        params.merkle_hash = HashKind::Blake3;
+        params.merkle_hash = HashKind::Sha256;
         assert_eq!(
             params.ligerito_prover_config().unwrap().merkle_hash,
-            HashKind::Blake3,
+            HashKind::Sha256,
             "prover config must follow PcsParams, not the embedded TOML"
         );
         assert_eq!(
             params.ligerito_verifier_config().unwrap().merkle_hash,
-            HashKind::Blake3,
+            HashKind::Sha256,
             "verifier config must follow PcsParams, not the embedded TOML"
         );
     }

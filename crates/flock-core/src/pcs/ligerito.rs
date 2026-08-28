@@ -1740,7 +1740,7 @@ impl LigeritoSecurityConfig {
             target_security_bits,
             analysis_version: "f256_split_no_row_union_over_ben_sasson_2025_cor_1_4".into(),
             field: "f256".into(),
-            hash: "sha256".into(),
+            hash: "blake3".into(),
             grinding_step: GrindingStep::PostCommitPreQueries,
             levels,
             final_block: FinalBlockConfig { yr_log_n },
@@ -2036,7 +2036,7 @@ impl LigeritoSecurityConfig {
             target_security_bits: target_bits,
             analysis_version: analysis_version.into(),
             field: "f256".into(),
-            hash: "sha256".into(),
+            hash: "blake3".into(),
             grinding_step: GrindingStep::PostCommitPreQueries,
             levels,
             final_block: FinalBlockConfig {
@@ -5697,7 +5697,7 @@ mod tests {
         // m29 Fast is the one initial_k-5 config (the recursion-node
         // row-width choice — see `derive_profile`).
         assert_eq!(cfg.initial_k, 5);
-        assert_eq!(cfg.hash, "sha256");
+        assert_eq!(cfg.hash, "blake3");
         assert_eq!(cfg.levels.len(), 5);
         // Fast = JohnsonOod profile: 279 L0 queries put the query term
         // strictly below 2^-128 (no list union bound — single-codeword
@@ -5906,21 +5906,21 @@ mod tests {
     #[test]
     fn ligerito_security_config_hash_field_selects_merkle_hash() {
         let mut cfg = blake3_m29_udr_example();
-        assert_eq!(cfg.hash, "sha256", "example config baseline");
-        let (p, v) = cfg.to_prover_verifier_configs().expect("sha256 configs");
-        assert_eq!(p.merkle_hash, HashKind::Sha256);
-        assert_eq!(v.merkle_hash, HashKind::Sha256);
-
-        cfg.hash = "blake3".into();
+        assert_eq!(cfg.hash, "blake3", "example config baseline");
         let (p, v) = cfg.to_prover_verifier_configs().expect("blake3 configs");
         assert_eq!(p.merkle_hash, HashKind::Blake3);
         assert_eq!(v.merkle_hash, HashKind::Blake3);
 
+        cfg.hash = "sha256".into();
+        let (p, v) = cfg.to_prover_verifier_configs().expect("sha256 configs");
+        assert_eq!(p.merkle_hash, HashKind::Sha256);
+        assert_eq!(v.merkle_hash, HashKind::Sha256);
+
         // Survives a TOML round-trip, so the option is settable from a file.
-        cfg.validate().expect("blake3 config validates");
+        cfg.validate().expect("sha256 config validates");
         let back = LigeritoSecurityConfig::from_toml_str(&cfg.to_toml_string().unwrap())
             .expect("toml roundtrip");
-        assert_eq!(back.merkle_hash().unwrap(), HashKind::Blake3);
+        assert_eq!(back.merkle_hash().unwrap(), HashKind::Sha256);
     }
 
     /// A `hash` we do not implement must fail at validation rather than
@@ -6212,7 +6212,7 @@ mod tests {
             claim_batch_grinding_bits: vec![0; 2],
             consistency_batch_grinding_bits: vec![0; 2],
             ood_samples: vec![0; 2],
-            merkle_hash: Default::default(),
+            merkle_hash: HashKind::Sha256,
             stratified: vec![],
         }
         .with_default_stratified();
@@ -6256,7 +6256,7 @@ mod tests {
             claim_batch_grinding_bits: vec![0; 2],
             consistency_batch_grinding_bits: vec![0; 2],
             ood_samples: vec![0; 2],
-            merkle_hash: Default::default(),
+            merkle_hash: HashKind::Sha256,
             stratified: vec![],
         }
         .with_default_stratified();
@@ -6347,7 +6347,7 @@ mod tests {
                 claim_batch_grinding_bits: vec![0; 2],
                 consistency_batch_grinding_bits: vec![0; 2],
                 ood_samples: vec![0; 2],
-                merkle_hash: Default::default(),
+                merkle_hash: HashKind::Sha256,
                 stratified: vec![],
             }
             .with_default_stratified();
@@ -6365,7 +6365,7 @@ mod tests {
                 claim_batch_grinding_bits: vec![0; 2],
                 consistency_batch_grinding_bits: vec![0; 2],
                 ood_samples: vec![0; 2],
-                merkle_hash: Default::default(),
+                merkle_hash: HashKind::Sha256,
                 stratified: vec![],
             }
             .with_default_stratified();
@@ -6997,7 +6997,7 @@ mod tests {
             claim_batch_grinding_bits: vec![0; 2],
             consistency_batch_grinding_bits: vec![0; 2],
             ood_samples: vec![0; 2],
-            merkle_hash: Default::default(),
+            merkle_hash: HashKind::Sha256,
             stratified: vec![],
         }
         .with_default_stratified();
@@ -7015,7 +7015,7 @@ mod tests {
             claim_batch_grinding_bits: vec![0; 2],
             consistency_batch_grinding_bits: vec![0; 2],
             ood_samples: vec![0; 2],
-            merkle_hash: Default::default(),
+            merkle_hash: HashKind::Sha256,
             stratified: vec![],
         }
         .with_default_stratified();
@@ -7086,7 +7086,7 @@ mod tests {
             claim_batch_grinding_bits: vec![0; r + 1],
             consistency_batch_grinding_bits: vec![0; r + 1],
             ood_samples: vec![0; r + 1],
-            merkle_hash: Default::default(),
+            merkle_hash: HashKind::Sha256,
             stratified: vec![],
         }
         .with_default_stratified();
@@ -7104,7 +7104,7 @@ mod tests {
             claim_batch_grinding_bits: vec![0; r + 1],
             consistency_batch_grinding_bits: vec![0; r + 1],
             ood_samples: vec![0; r + 1],
-            merkle_hash: Default::default(),
+            merkle_hash: HashKind::Sha256,
             stratified: vec![],
         }
         .with_default_stratified();
@@ -7393,7 +7393,7 @@ mod tests {
             claim_batch_grinding_bits: vec![0; 3],
             consistency_batch_grinding_bits: vec![0; 3],
             ood_samples: vec![0; 3],
-            merkle_hash: Default::default(),
+            merkle_hash: HashKind::Sha256,
             stratified: vec![],
         }
         .with_default_stratified();
@@ -7411,7 +7411,7 @@ mod tests {
             claim_batch_grinding_bits: vec![0; 3],
             consistency_batch_grinding_bits: vec![0; 3],
             ood_samples: vec![0; 3],
-            merkle_hash: Default::default(),
+            merkle_hash: HashKind::Sha256,
             stratified: vec![],
         }
         .with_default_stratified();
@@ -7459,7 +7459,7 @@ mod tests {
             claim_batch_grinding_bits: vec![0; 2],
             consistency_batch_grinding_bits: vec![0; 2],
             ood_samples: vec![0; 2],
-            merkle_hash: Default::default(),
+            merkle_hash: HashKind::Sha256,
             stratified: vec![],
         }
         .with_default_stratified();
@@ -7589,7 +7589,7 @@ mod tests {
             claim_batch_grinding_bits: vec![0; 2],
             consistency_batch_grinding_bits: vec![0; 2],
             ood_samples: vec![0; 2],
-            merkle_hash: Default::default(),
+            merkle_hash: HashKind::Sha256,
             stratified: vec![],
         }
         .with_default_stratified();
@@ -7632,7 +7632,7 @@ mod tests {
             claim_batch_grinding_bits: vec![0; 2],
             consistency_batch_grinding_bits: vec![0; 2],
             ood_samples: vec![0; 2],
-            merkle_hash: Default::default(),
+            merkle_hash: HashKind::Sha256,
             stratified: vec![],
         }
         .with_default_stratified();
@@ -8040,7 +8040,7 @@ mod tests {
             claim_batch_grinding_bits: vec![0; 2],
             consistency_batch_grinding_bits: vec![0; 2],
             ood_samples: vec![0; 2],
-            merkle_hash: Default::default(),
+            merkle_hash: HashKind::Sha256,
             stratified: vec![],
         }
         .with_default_stratified();
@@ -8083,7 +8083,7 @@ mod tests {
             claim_batch_grinding_bits: vec![0; 2],
             consistency_batch_grinding_bits: vec![0; 2],
             ood_samples: vec![0; 2],
-            merkle_hash: Default::default(),
+            merkle_hash: HashKind::Sha256,
             stratified: vec![],
         }
         .with_default_stratified();
@@ -8137,7 +8137,7 @@ mod tests {
             claim_batch_grinding_bits: vec![3; r + 1],
             consistency_batch_grinding_bits: vec![4; r + 1],
             ood_samples: ood_samples.clone(),
-            merkle_hash: Default::default(),
+            merkle_hash: HashKind::Sha256,
             stratified: vec![],
         }
         .with_default_stratified();
@@ -8155,7 +8155,7 @@ mod tests {
             claim_batch_grinding_bits: vec![3; r + 1],
             consistency_batch_grinding_bits: vec![4; r + 1],
             ood_samples,
-            merkle_hash: Default::default(),
+            merkle_hash: HashKind::Sha256,
             stratified: vec![],
         }
         .with_default_stratified();
@@ -8341,7 +8341,7 @@ mod tests {
             initial_k,
             1,
             &ntt_0,
-            HashKind::Sha256,
+            p_cfg.merkle_hash,
         );
         let initial_cap =
             |cfg: &VerifierConfig| -> Vec<Hash> { wtns_0.cap(cfg.l0_cap_depth()).to_vec() };
@@ -8393,12 +8393,13 @@ mod tests {
         assert!(!verify(&bad), "mutated coordinate row opening must reject");
     }
 
-    /// End-to-end under BLAKE3: the same recursion, every Merkle commitment
-    /// (L0 and each recursive level) built and checked with the other hash.
-    /// Also pins the failure mode of a hash mismatch — a verifier configured
-    /// for the wrong hash must reject, since the roots commit to the hash.
+    /// End-to-end under SHA-256 (the non-default hash): the same recursion,
+    /// every Merkle commitment (L0 and each recursive level) built and
+    /// checked with the other hash. Also pins the failure mode of a hash
+    /// mismatch — a verifier configured for the wrong hash must reject,
+    /// since the roots commit to the hash.
     #[test]
-    fn ligerito_m22_roundtrip_under_blake3() {
+    fn ligerito_m22_roundtrip_under_sha256() {
         use crate::challenger::Challenger;
         let m = 22usize;
         let log_n = m - crate::pcs::LOG_PACKING;
@@ -8407,11 +8408,11 @@ mod tests {
             .expect("m22 fast prover config");
         let mut v_cfg = verifier_config_for(log_n, initial_k, LigeritoProfile::Fast)
             .expect("m22 fast verifier config");
-        // The embedded configs all declare sha256; override to exercise the
+        // The embedded configs all declare blake3; override to exercise the
         // other arm of the option end to end.
-        assert_eq!(p_cfg.merkle_hash, HashKind::Sha256);
-        p_cfg.merkle_hash = HashKind::Blake3;
-        v_cfg.merkle_hash = HashKind::Blake3;
+        assert_eq!(p_cfg.merkle_hash, HashKind::Blake3);
+        p_cfg.merkle_hash = HashKind::Sha256;
+        v_cfg.merkle_hash = HashKind::Sha256;
 
         let mut rng = crate::challenger::RandomChallenger::new(0xB1A5_E300);
         let poly: Vec<F128> = (0..(1usize << log_n)).map(|_| rng.sample_f128()).collect();
@@ -8431,7 +8432,7 @@ mod tests {
             initial_k,
             1,
             &ntt_0,
-            HashKind::Blake3,
+            p_cfg.merkle_hash,
         );
         let initial_cap =
             |cfg: &VerifierConfig| -> Vec<Hash> { wtns_0.cap(cfg.l0_cap_depth()).to_vec() };
@@ -8461,13 +8462,13 @@ mod tests {
                 },
                 &mut v_ch,
             ),
-            "blake3 Merkle proof must verify"
+            "sha256 Merkle proof must verify"
         );
 
-        // Same proof, verifier configured for SHA-256 → every opening's
+        // Same proof, verifier configured for BLAKE3 → every opening's
         // recomputed root disagrees, so it must reject.
         let mut wrong_cfg = v_cfg.clone();
-        wrong_cfg.merkle_hash = HashKind::Sha256;
+        wrong_cfg.merkle_hash = HashKind::Blake3;
         let mut w_ch = crate::challenger::FsChallenger::new(b"m22-blake3");
         assert!(
             !extension::recursive_verifier_with_basis_succinct(
@@ -8627,7 +8628,7 @@ mod tests {
             claim_batch_grinding_bits: vec![0; 2],
             consistency_batch_grinding_bits: vec![0; 2],
             ood_samples: vec![0; 2],
-            merkle_hash: Default::default(),
+            merkle_hash: HashKind::Sha256,
             stratified: vec![],
         }
         .with_default_stratified();
@@ -8670,7 +8671,7 @@ mod tests {
             claim_batch_grinding_bits: vec![0; 2],
             consistency_batch_grinding_bits: vec![0; 2],
             ood_samples: vec![0; 2],
-            merkle_hash: Default::default(),
+            merkle_hash: HashKind::Sha256,
             stratified: vec![],
         }
         .with_default_stratified();
@@ -8724,7 +8725,7 @@ mod tests {
             claim_batch_grinding_bits: vec![0; 2],
             consistency_batch_grinding_bits: vec![0; 2],
             ood_samples: vec![0; 2],
-            merkle_hash: Default::default(),
+            merkle_hash: HashKind::Sha256,
             stratified: vec![],
         }
         .with_default_stratified();
@@ -8786,7 +8787,7 @@ mod tests {
             claim_batch_grinding_bits: vec![0; 2],
             consistency_batch_grinding_bits: vec![0; 2],
             ood_samples: vec![0; 2],
-            merkle_hash: Default::default(),
+            merkle_hash: HashKind::Sha256,
             stratified: vec![],
         }
         .with_default_stratified();
@@ -8830,7 +8831,7 @@ mod tests {
             claim_batch_grinding_bits: vec![0; 2],
             consistency_batch_grinding_bits: vec![0; 2],
             ood_samples: vec![0; 2],
-            merkle_hash: Default::default(),
+            merkle_hash: HashKind::Sha256,
             stratified: vec![],
         }
         .with_default_stratified();
@@ -8848,7 +8849,7 @@ mod tests {
             claim_batch_grinding_bits: vec![0; 2],
             consistency_batch_grinding_bits: vec![0; 2],
             ood_samples: vec![0; 2],
-            merkle_hash: Default::default(),
+            merkle_hash: HashKind::Sha256,
             stratified: vec![],
         }
         .with_default_stratified();

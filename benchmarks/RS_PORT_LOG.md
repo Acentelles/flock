@@ -2437,3 +2437,21 @@ steps (vs 465 ms pre-merge) — the gap is the re-graft/re-port queue
 from step 1, now re-scoped to the union driver: zc cascade+compact-K,
 streaming lane-major commit, stripe-C/AB-hoist, streamed witness
 builder, direct-open ideas vs the f256 opening.
+
+### Default hash → BLAKE3, repo-wide (Benedikt-directed) — 2026-08-28
+
+Restores our pre-merge default on top of the merged tree, this time
+through main's own machinery: HashKind::default() → Blake3, the
+security-config generator emits hash = "blake3", all 98 embedded
+config TOMLs flipped (derivation test keeps generator and TOMLs
+locked), FsChallenger::new() → Blake3 transcripts. Tests updated to
+be default-agnostic where they pin consistency (23 test cfg literals
+pinned to explicit Sha256) and flipped where they pin the default
+(challenger default pin, params-inherit test, m29 TOML load, m22
+roundtrip now exercises the sha256 arm + blake3-mismatch reject).
+Proof-byte fixtures re-pinned by design (union_element 7,
+union_m6_fixtures 6; two deterministic print runs agreed each).
+Suites green (core 545, prover 124) + ignored roundtrips green with
+grinding on. Bench sanity: defaults print blake3/blake3 with no env;
+times in the machine's current paging-degraded band, hash config
+identical to prior runs.

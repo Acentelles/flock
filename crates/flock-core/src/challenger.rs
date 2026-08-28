@@ -1363,19 +1363,20 @@ mod tests {
         }
     }
 
-    /// `new` must stay SHA-256: 300-odd call sites construct challengers that
-    /// way, and silently moving them to another hash would invalidate every
-    /// proof they produce.
+    /// `new` follows the repo default (BLAKE3): every plain-constructed
+    /// challenger moves with `HashKind::default()`, so this pin makes a
+    /// default flip a deliberate, test-visible event rather than a silent
+    /// transcript change.
     #[test]
-    fn fs_challenger_new_defaults_to_sha256() {
-        assert_eq!(FsChallenger::new(b"d").hash_kind(), HashKind::Sha256);
+    fn fs_challenger_new_defaults_to_blake3() {
+        assert_eq!(FsChallenger::new(b"d").hash_kind(), HashKind::Blake3);
         for kind in KINDS {
             assert_eq!(FsChallenger::with_hash(b"d", kind).hash_kind(), kind);
         }
-        // The default constructor must be exactly the SHA-256 one, transcript
+        // The default constructor must be exactly the BLAKE3 one, transcript
         // and all — not merely tagged the same.
         let mut a = FsChallenger::new(b"d");
-        let mut b = FsChallenger::with_hash(b"d", HashKind::Sha256);
+        let mut b = FsChallenger::with_hash(b"d", HashKind::Blake3);
         assert_eq!(a.sample_f128_vec(4), b.sample_f128_vec(4));
     }
 
