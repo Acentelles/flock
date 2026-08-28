@@ -4783,11 +4783,7 @@ mod tests {
 
     /// `q̂(point)` directly = ⟨q, eq(point, ·)⟩.
     fn mle_eval(q: &[F128], point: &[F128]) -> F128 {
-        let eq = build_eq_table(point);
-        q.iter()
-            .zip(eq.iter())
-            .map(|(&a, &b)| a * b)
-            .fold(F128::ZERO, |s, x| s + x)
+        flock_multilinear::evaluate(q, point, flock_multilinear::IndexOrder::LowToHigh)
     }
 
     /// A small random jagged config + dense data, with total area < 2^m.

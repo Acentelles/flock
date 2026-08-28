@@ -106,23 +106,12 @@ pub(super) fn emit_query_phase(
         // values of the fold challenges past the 8-lane gate's three.
         let le_vars = g.lanes.min(8).trailing_zeros() as usize;
         let le_groups = g.lanes >> le_vars;
-        let hw = {
-            let v_hi: Vec<F256> = lvl.fold_chs[le_vars..]
-                .iter()
-                .map(|&i| F256::new(chals[i], chals[i + 1]))
-                .collect();
-            let mut table = vec![F256::ONE];
-            for r in v_hi {
-                let old = table.len();
-                table.resize(2 * old, F256::ZERO);
-                for i in 0..old {
-                    let x = table[i];
-                    table[i + old] = x * r;
-                    table[i] = x * (F256::ONE + r);
-                }
-            }
-            table
-        };
+        let v_hi: Vec<F256> = lvl.fold_chs[le_vars..]
+            .iter()
+            .map(|&i| F256::new(chals[i], chals[i + 1]))
+            .collect();
+        let hw =
+            flock_multilinear::eq_table(&v_hi, F256::ONE, flock_multilinear::IndexOrder::LowToHigh);
         let zero = cw(sb, vals, consts, F128::ZERO);
         let mut acc = [zero, zero];
         let mut level_positions = Vec::with_capacity(g.q);

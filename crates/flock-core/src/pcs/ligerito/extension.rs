@@ -54,17 +54,7 @@ pub(super) fn split_inner_product(words: &[F128], basis: &[F256]) -> F256 {
 }
 
 fn build_eq_table256(point: &[F256]) -> Vec<F256> {
-    let mut table = vec![F256::ONE];
-    for &r in point {
-        let old = table.len();
-        table.resize(2 * old, F256::ZERO);
-        for i in 0..old {
-            let v = table[i];
-            table[i + old] = v * r;
-            table[i] = v * (F256::ONE + r);
-        }
-    }
-    table
+    flock_multilinear::eq_table(point, F256::ONE, flock_multilinear::IndexOrder::LowToHigh)
 }
 
 #[derive(Clone, Copy, Debug)]

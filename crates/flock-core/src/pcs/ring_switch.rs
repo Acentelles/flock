@@ -303,39 +303,7 @@ pub(crate) fn build_eq_parallel(r: &[F128]) -> Vec<F128> {
 /// merged transport's inner open to materialize `γ·eq(ρ, ·)` directly as
 /// `b_combined`.
 pub(crate) fn build_eq_scaled_parallel(r: &[F128], seed: F128) -> Vec<F128> {
-    use rayon::prelude::*;
-    let n = r.len();
-    // Uninit alloc — at iter `i`, the loop reads from t[..2^i] (always written
-    // by an earlier iter or the t[0] = ONE seed) and writes to t[2^i..2^(i+1)]
-    // (purely written, never read first). So every slot is written before any
-    // read; uninit is safe.
-    let mut t = crate::alloc_uninit_f128_vec(1usize << n);
-    t[0] = seed;
-    // Threshold below which rayon dispatch overhead beats the parallel work.
-    const PAR_THRESHOLD: usize = 1 << 12;
-    for i in 0..n {
-        let r_i = r[i];
-        let one_minus_r = F128::ONE + r_i;
-        let half = 1usize << i;
-        let (lo, hi_rest) = t.split_at_mut(half);
-        let hi = &mut hi_rest[..half];
-        if half < PAR_THRESHOLD {
-            for (lo_x, hi_x) in lo.iter_mut().zip(hi.iter_mut()) {
-                let old = *lo_x;
-                *hi_x = old * r_i;
-                *lo_x = old * one_minus_r;
-            }
-        } else {
-            lo.par_iter_mut()
-                .zip(hi.par_iter_mut())
-                .for_each(|(lo_x, hi_x)| {
-                    let old = *lo_x;
-                    *hi_x = old * r_i;
-                    *lo_x = old * one_minus_r;
-                });
-        }
-    }
-    t
+    flock_multilinear::eq_table_scaled(r, F128::ONE, seed, flock_multilinear::IndexOrder::LowToHigh)
 }
 
 /// Tensor-factored `build_eq`: split the point `r` (length `n`) into a low
@@ -4260,18 +4228,7 @@ mod tests {
     #[test]
     fn eval_rs_eq_matches_dense() {
         fn mle_eval_naive(values: &[F128], r: &[F128]) -> F128 {
-            assert_eq!(values.len(), 1 << r.len());
-            let mut buf = values.to_vec();
-            for &r_i in r.iter().rev() {
-                let half = buf.len() / 2;
-                for i in 0..half {
-                    let lo = buf[i];
-                    let hi = buf[i + half];
-                    buf[i] = lo + r_i * (lo + hi);
-                }
-                buf.truncate(half);
-            }
-            buf[0]
+            flock_multilinear::evaluate(values, r, flock_multilinear::IndexOrder::LowToHigh)
         }
 
         let mut rng = Rng::new(0xDEADBEEF);

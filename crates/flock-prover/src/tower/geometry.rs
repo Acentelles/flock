@@ -273,16 +273,11 @@ pub(super) fn level_geometry(
             .map(|&i| F256::new(chals[i], chals[i + 1]))
             .collect();
         let alpha_vals: Vec<F128> = (0..lvl.a_count).map(|j| chals[lvl.a_ch + j]).collect();
-        let mut eqv = vec![F256::ONE];
-        for &v in &fold_vals {
-            let old = eqv.len();
-            eqv.resize(2 * old, F256::ZERO);
-            for i in 0..old {
-                let x = eqv[i];
-                eqv[i + old] = x * v;
-                eqv[i] = x * (F256::ONE + v);
-            }
-        }
+        let eqv = flock_multilinear::eq_table(
+            &fold_vals,
+            F256::ONE,
+            flock_multilinear::IndexOrder::LowToHigh,
+        );
         let aw = build_eq_table(&alpha_vals);
         let c_min = sched.summand_depths.last().copied().unwrap_or(c);
         let lv = Lvl {

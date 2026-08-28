@@ -11,7 +11,10 @@ that folds proofs into proofs.
 
 ## Layout
 
-Two crates, split along the prove/verify boundary:
+The workspace contains these crates:
+
+- **`crates/flock-multilinear`** — field-generic multilinear evaluation,
+  equality tables, and folds. Index order is an explicit API parameter.
 
 - **`crates/flock-core`** — the protocol library and verifier (field arithmetic,
   NTT, zerocheck, lincheck, PCS, Merkle, R1CS). Carries everything needed to
@@ -19,6 +22,7 @@ Two crates, split along the prove/verify boundary:
 - **`crates/flock-prover`** — the end-to-end prover: prove orchestration, the
   hash R1CS encoders, the Merkle-path statements, and the recursion tower.
   Depends on `flock-core` and re-exports it.
+- **`crates/flock-cuda-ffi`** — the optional interface to CUDA prover kernels.
 
 The heavy NEON kernels live in the shared `flock-core` layer, so the verifier
 runs on the same code as the prover; `flock-core` still compiles off-ARM via the

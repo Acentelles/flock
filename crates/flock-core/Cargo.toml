@@ -28,6 +28,7 @@ mul-count = []
 unsound-challenger = []
 
 [dependencies]
+flock-multilinear = { path = "../flock-multilinear" }
 rayon = { workspace = true }
 sha2 = { workspace = true }
 rand_core = { workspace = true }

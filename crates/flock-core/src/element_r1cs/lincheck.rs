@@ -460,11 +460,7 @@ mod tests {
 
     /// Direct MLE evaluation at `point`, binding the low variable first.
     fn mle_eval(table: &[F128], point: &[F128]) -> F128 {
-        let mut t = table.to_vec();
-        for &p in point {
-            crate::zerocheck::multilinear::fold_in_place_single(&mut t, p);
-        }
-        t[0]
+        flock_multilinear::evaluate(table, point, flock_multilinear::IndexOrder::LowToHigh)
     }
 
     /// `(Âz(r), B̂z(r))` straight from the matrices — the claims the lincheck is

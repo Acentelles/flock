@@ -711,25 +711,7 @@ pub enum VerifyError {
 /// Standard "doubling-in-half" construction: `O(2^d)` F128 muls, no
 /// inversions. Indexing is LSB-first — `bit_j(i)` is the `j`-th LSB of `i`.
 pub fn build_eq_table(point: &[F128]) -> Vec<F128> {
-    let d = point.len();
-    let mut out: Vec<F128> = Vec::with_capacity(1usize << d);
-    out.push(F128::ONE);
-    for j in 0..d {
-        let r_j = point[j];
-        let one_plus_r_j = F128::ONE + r_j;
-        let len = 1usize << j;
-        out.resize(2 * len, F128::ZERO);
-        // For each existing entry i ∈ [0, len), produce two children:
-        //   out[i]       *= (1 + r_j)     ← new bit_j = 0
-        //   out[i + len]  = out[i] * r_j  ← new bit_j = 1
-        // Forward iteration is safe: the [i] and [i+len] slots are disjoint.
-        for i in 0..len {
-            let v = out[i];
-            out[i + len] = v * r_j;
-            out[i] = v * one_plus_r_j;
-        }
-    }
-    out
+    flock_multilinear::eq_table(point, F128::ONE, flock_multilinear::IndexOrder::LowToHigh)
 }
 
 /// Fold a sparse boolean matrix's rows against an eq table at the row

@@ -809,16 +809,12 @@ mod tests {
     use crate::element_r1cs::tests::{Rng, mixed_gate, mixed_witness, mult_gate, mult_witness};
     use crate::element_r1cs::{ElementTableBuilder, ElementTableType};
     use crate::schedule::{Registry, TableType};
-    use crate::zerocheck::multilinear::{eq_eval, fold_in_place_single};
+    use crate::zerocheck::multilinear::eq_eval;
     use std::sync::Arc;
 
     /// Direct MLE evaluation at `point`, binding the low variable first.
     fn mle_eval(table: &[F128], point: &[F128]) -> F128 {
-        let mut t = table.to_vec();
-        for &p in point {
-            fold_in_place_single(&mut t, p);
-        }
-        t[0]
+        flock_multilinear::evaluate(table, point, flock_multilinear::IndexOrder::LowToHigh)
     }
 
     fn bits(v: usize, n: usize) -> Vec<F128> {

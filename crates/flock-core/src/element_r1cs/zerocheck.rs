@@ -888,11 +888,7 @@ mod tests {
     /// Direct MLE evaluation of `table` at `point`, binding the low variable
     /// first — the same order [`fold_low`] uses.
     fn mle_eval(table: &[F128], point: &[F128]) -> F128 {
-        let mut t = table.to_vec();
-        for &p in point {
-            crate::zerocheck::multilinear::fold_in_place_single(&mut t, p);
-        }
-        t[0]
+        flock_multilinear::evaluate(table, point, flock_multilinear::IndexOrder::LowToHigh)
     }
 
     /// `(pa, pb)` for a witness — the same preparation [`super::super::prove`]

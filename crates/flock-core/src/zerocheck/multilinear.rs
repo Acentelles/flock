@@ -267,12 +267,7 @@ pub fn interpolate_at_z_combined(values_on_lambda: &[F128], k_skip: usize, z: F1
 /// Evaluate the multilinear eq polynomial at a point: `eq(r, x) = Π_i (1 + r_i + x_i)`
 /// for `r, x ∈ F_{2^128}^n` (char-2 simplification of `(1-r)(1-x) + r·x`).
 pub fn eq_eval(r: &[F128], x: &[F128]) -> F128 {
-    assert_eq!(r.len(), x.len());
-    let mut acc = F128::ONE;
-    for i in 0..r.len() {
-        acc *= F128::ONE + r[i] + x[i];
-    }
-    acc
+    flock_multilinear::eq_eval(r, x, F128::ONE)
 }
 
 // ---------------------------------------------------------------------------
@@ -1127,15 +1122,7 @@ pub fn uni_skip_fold_and_round_pair_runs_sparse(
 /// Pairs `(a[2x], a[2x+1])` collapse to `a[x] = a[2x] + challenge · (a[2x+1] + a[2x])`.
 /// After the call, `a.len()` is halved.
 pub fn fold_in_place_single(a: &mut Vec<F128>, challenge: F128) {
-    let n = a.len();
-    assert!(n.is_power_of_two() && n >= 2);
-    let half = n / 2;
-    for x in 0..half {
-        let a0 = a[2 * x];
-        let a1 = a[2 * x + 1];
-        a[x] = a0 + challenge * (a1 + a0);
-    }
-    a.truncate(half);
+    flock_multilinear::fold_low(a, challenge);
 }
 
 /// In-place fold of a pair `(a, b)` of multilinear polynomial tables at
