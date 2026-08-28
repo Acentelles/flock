@@ -510,7 +510,7 @@ fn two_type_union_lincheck_matches_brute_force() {
     // ---- Tampers. Each replays the verifier from a fresh transcript.
     let verify_with = |union: &UnionInstance<'_>,
                        proof: &lincheck::LincheckProof|
-     -> Result<lincheck::LincheckClaim, lincheck::VerifyError> {
+     -> Result<lincheck::LincheckClaim, lincheck::LincheckError> {
         let mut ch = FsChallenger::new(DOMAIN);
         let zc = zerocheck::verify(m, &zc_proof, &mut ch).expect("zerocheck side is untampered");
         let x = union.x_ab_from_mlv(SkipPoint::Phi8(zc.z), &zc.mlv_challenges);
@@ -523,7 +523,7 @@ fn two_type_union_lincheck_matches_brute_force() {
     assert!(
         matches!(
             verify_with(&union, &bad),
-            Err(lincheck::VerifyError::ConsistencyFailed { .. })
+            Err(lincheck::LincheckError::ConsistencyFailed { .. })
         ),
         "corrupted round message must be rejected"
     );
@@ -534,7 +534,7 @@ fn two_type_union_lincheck_matches_brute_force() {
     assert!(
         matches!(
             verify_with(&union, &bad),
-            Err(lincheck::VerifyError::ConsistencyFailed { .. })
+            Err(lincheck::LincheckError::ConsistencyFailed { .. })
         ),
         "corrupted z_partial must be rejected"
     );
@@ -546,7 +546,7 @@ fn two_type_union_lincheck_matches_brute_force() {
     assert!(
         matches!(
             verify_with(&union_bad, &lc_proof),
-            Err(lincheck::VerifyError::ConsistencyFailed { .. })
+            Err(lincheck::LincheckError::ConsistencyFailed { .. })
         ),
         "corrupted pinned-slot count must be rejected"
     );
@@ -611,7 +611,7 @@ fn two_type_union_lincheck_matches_brute_force() {
             grinding,
             &mut ch_missing,
         ),
-        Err(lincheck::VerifyError::BadGrindingNonceCount { .. })
+        Err(lincheck::LincheckError::BadGrindingNonceCount { .. })
     ));
 }
 
@@ -701,7 +701,7 @@ fn deferred_lincheck_matches_and_defers_the_matrix_work() {
     assert!(
         matches!(
             lincheck::verify_union(&union, &circuits, &x, va, vb, &bad, &mut ch),
-            Err(lincheck::VerifyError::ConsistencyFailed { .. })
+            Err(lincheck::LincheckError::ConsistencyFailed { .. })
         ),
         "composed verifier must still reject a corrupted round message"
     );
@@ -712,7 +712,7 @@ fn deferred_lincheck_matches_and_defers_the_matrix_work() {
     assert!(
         matches!(
             tampered.check(&union, &circuits),
-            Err(lincheck::VerifyError::ConsistencyFailed { .. })
+            Err(lincheck::LincheckError::ConsistencyFailed { .. })
         ),
         "the assertion is what must catch it"
     );

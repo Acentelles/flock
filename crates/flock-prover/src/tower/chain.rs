@@ -60,7 +60,7 @@ impl MixedProof {
         commitment: &flock_core::pcs::commit::Commitment,
         pcs: &PcsParams,
         ch: &mut Ch,
-    ) -> Result<flock_core::proof::UnionClassClaims, flock_core::verifier::VerifyError> {
+    ) -> Result<flock_core::proof::UnionClassClaims, flock_core::verifier::FlockVerifyError> {
         match self {
             MixedProof::Rs(p) => verifier::verify_ligerito_union_circuit(
                 union, circuit, public, lcs, commitment, p, pcs, ch,
@@ -88,7 +88,7 @@ impl MixedProof {
             flock_core::verifier::DeferredMatrixWork,
             flock_core::circuit::SigmaAssertion,
         ),
-        flock_core::verifier::VerifyError,
+        flock_core::verifier::FlockVerifyError,
     > {
         match self {
             MixedProof::Rs(p) => verifier::verify_ligerito_union_circuit_deferred(
@@ -235,9 +235,9 @@ pub(super) fn chain_probe_boolean_only_wired_union() {
                 &pcs_params,
                 &mut ch,
             ),
-            Err(flock_core::verifier::VerifyError::Wiring(
+            Err(flock_core::verifier::FlockVerifyError::Wiring(
                 flock_core::circuit::WiringError::Gkr(
-                    flock_core::product_gkr::VerifyError::ProductMismatch
+                    flock_core::product_gkr::ProductGkrError::ProductMismatch
                 )
             ))
         ),
@@ -741,9 +741,9 @@ pub(super) fn chain_proof_message_chain_roundtrip_and_tampers() {
         assert!(
             matches!(
                 verify(&built.witness.public, &cm, &MixedProof::Rs(p)),
-                Err(flock_core::verifier::VerifyError::Wiring(
+                Err(flock_core::verifier::FlockVerifyError::Wiring(
                     flock_core::circuit::WiringError::Gkr(
-                        flock_core::product_gkr::VerifyError::ProductMismatch
+                        flock_core::product_gkr::ProductGkrError::ProductMismatch
                     )
                 ))
             ),

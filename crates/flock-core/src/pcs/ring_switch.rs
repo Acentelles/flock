@@ -2263,7 +2263,7 @@ impl RsEqInd {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum VerifyError {
+pub enum RingSwitchError {
     ClaimMismatch,
     InvalidGrinding,
     MalformedProof,
@@ -2853,7 +2853,7 @@ pub fn verify<Ch: Challenger>(
     x_outer: &[F128],
     proof: &RingSwitchProof,
     challenger: &mut Ch,
-) -> Result<RingSwitchOutput, VerifyError> {
+) -> Result<RingSwitchOutput, RingSwitchError> {
     verify_with_grinding(claim, skip_weights, x_outer, proof, 0, challenger)
 }
 
@@ -2865,7 +2865,7 @@ pub fn verify_with_grinding<Ch: Challenger>(
     proof: &RingSwitchProof,
     grinding_bits: u32,
     challenger: &mut Ch,
-) -> Result<RingSwitchOutput, VerifyError> {
+) -> Result<RingSwitchOutput, RingSwitchError> {
     assert!(!x_outer.is_empty());
     let l = 1usize << (x_outer.len() - 1);
     assert_eq!(proof.s_hat_v.len(), 1 << LOG_PACKING);
@@ -2878,7 +2878,7 @@ pub fn verify_with_grinding<Ch: Challenger>(
     // Check the claim against skip ⊗ eq weights.
     let weights = build_claim_weights_from_skip(skip_weights, x_outer[0]);
     if claim_check(&weights, &proof.s_hat_v) != claim {
-        return Err(VerifyError::ClaimMismatch);
+        return Err(RingSwitchError::ClaimMismatch);
     }
 
     // This PoW operation is omitted entirely when disabled, unlike a
@@ -2888,10 +2888,10 @@ pub fn verify_with_grinding<Ch: Challenger>(
     let r_dprime = if grinding_bits != 0 {
         challenger
             .verify_pow_and_sample_f128_vec(proof.grinding_nonce, grinding_bits, LOG_PACKING)
-            .ok_or(VerifyError::InvalidGrinding)?
+            .ok_or(RingSwitchError::InvalidGrinding)?
     } else {
         if proof.grinding_nonce != 0 {
-            return Err(VerifyError::InvalidGrinding);
+            return Err(RingSwitchError::InvalidGrinding);
         }
         challenger.sample_f128_vec(LOG_PACKING)
     };
@@ -2938,7 +2938,7 @@ pub fn verify_succinct_with_grinding<Ch: Challenger>(
     proof: &RingSwitchProof,
     grinding_bits: u32,
     challenger: &mut Ch,
-) -> Result<RingSwitchVerifierOutput, VerifyError> {
+) -> Result<RingSwitchVerifierOutput, RingSwitchError> {
     assert!(!x_outer.is_empty());
     assert_eq!(proof.s_hat_v.len(), 1 << LOG_PACKING);
 
@@ -2947,16 +2947,16 @@ pub fn verify_succinct_with_grinding<Ch: Challenger>(
 
     let weights = build_claim_weights_from_skip(skip_weights, x_outer[0]);
     if claim_check(&weights, &proof.s_hat_v) != claim {
-        return Err(VerifyError::ClaimMismatch);
+        return Err(RingSwitchError::ClaimMismatch);
     }
 
     let r_dprime = if grinding_bits != 0 {
         challenger
             .verify_pow_and_sample_f128_vec(proof.grinding_nonce, grinding_bits, LOG_PACKING)
-            .ok_or(VerifyError::InvalidGrinding)?
+            .ok_or(RingSwitchError::InvalidGrinding)?
     } else {
         if proof.grinding_nonce != 0 {
-            return Err(VerifyError::InvalidGrinding);
+            return Err(RingSwitchError::InvalidGrinding);
         }
         challenger.sample_f128_vec(LOG_PACKING)
     };
@@ -3441,7 +3441,7 @@ mod tests {
         let mut ch_bad = FsChallenger::new(b"flock-ring-grinding-test");
         assert!(matches!(
             verify_with_grinding(claim, &skip_w, &x_outer, &bad, 3, &mut ch_bad),
-            Err(VerifyError::InvalidGrinding)
+            Err(RingSwitchError::InvalidGrinding)
         ));
 
         // Disabled ring-switch grinding emits no `Pow` transcript operation,
@@ -3452,7 +3452,7 @@ mod tests {
         let mut ch_v = FsChallenger::new(b"flock-ring-no-grinding-test");
         assert!(matches!(
             verify(claim, &skip_w, &x_outer, &legacy, &mut ch_v),
-            Err(VerifyError::InvalidGrinding)
+            Err(RingSwitchError::InvalidGrinding)
         ));
     }
 
@@ -3501,7 +3501,7 @@ mod tests {
             &proof,
             &mut ch_v,
         );
-        assert!(matches!(res, Err(VerifyError::ClaimMismatch)));
+        assert!(matches!(res, Err(RingSwitchError::ClaimMismatch)));
     }
 
     /// Tensor-algebra transpose is involutive (applying it twice returns the

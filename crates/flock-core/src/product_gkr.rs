@@ -82,7 +82,7 @@ use crate::zerocheck::univariate_skip::SplitEqGhash;
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum VerifyError {
+pub enum ProductGkrError {
     /// `∏ lhs ≠ ∏ rhs`: the two grand products differ, so the witnesses are
     /// not a valid permuted pair.
     ProductMismatch,
@@ -1840,7 +1840,7 @@ pub fn verify_batched<C: Challenger>(
     proof: &ProductGkrBatchedProof,
     live: Option<&LiveMask>,
     ch: &mut C,
-) -> Result<ProductGkrBatchedClaim, VerifyError> {
+) -> Result<ProductGkrBatchedClaim, ProductGkrError> {
     verify_batched_with_grinding(mu, proof, live, BatchedGrinding::disabled(), ch)
 }
 
@@ -1851,7 +1851,7 @@ pub fn verify_batched_with_grinding<C: Challenger>(
     live: Option<&LiveMask>,
     grinding: BatchedGrinding,
     ch: &mut C,
-) -> Result<ProductGkrBatchedClaim, VerifyError> {
+) -> Result<ProductGkrBatchedClaim, ProductGkrError> {
     verify_batched_core(mu, proof, None, live, grinding, ch)
 }
 
@@ -1878,7 +1878,7 @@ pub fn verify_batched_with_sigma<C: Challenger>(
     sigma: &[usize],
     live: Option<&LiveMask>,
     ch: &mut C,
-) -> Result<ProductGkrBatchedClaim, VerifyError> {
+) -> Result<ProductGkrBatchedClaim, ProductGkrError> {
     assert_eq!(sigma.len(), 1usize << mu, "σ length must be 2^mu");
     verify_batched_with_sigma_and_grinding(mu, proof, sigma, live, BatchedGrinding::disabled(), ch)
 }
@@ -1891,7 +1891,7 @@ pub fn verify_batched_with_sigma_and_grinding<C: Challenger>(
     live: Option<&LiveMask>,
     grinding: BatchedGrinding,
     ch: &mut C,
-) -> Result<ProductGkrBatchedClaim, VerifyError> {
+) -> Result<ProductGkrBatchedClaim, ProductGkrError> {
     assert_eq!(sigma.len(), 1usize << mu, "σ length must be 2^mu");
     verify_batched_core(mu, proof, Some(sigma), live, grinding, ch)
 }
@@ -1903,22 +1903,22 @@ fn verify_batched_core<C: Challenger>(
     live: Option<&LiveMask>,
     grinding: BatchedGrinding,
     ch: &mut C,
-) -> Result<ProductGkrBatchedClaim, VerifyError> {
+) -> Result<ProductGkrBatchedClaim, ProductGkrError> {
     if proof.layers.len() != mu {
-        return Err(VerifyError::MalformedProof);
+        return Err(ProductGkrError::MalformedProof);
     }
     let n = 1usize << mu;
     let live_entries = live.map_or(n, |m| m.counts.iter().sum());
     if proof.grinding_nonces.len() != grinding.nonce_count(mu, live_entries) {
-        return Err(VerifyError::InvalidGrinding);
+        return Err(ProductGkrError::InvalidGrinding);
     }
     let mut nonce_idx = 0usize;
-    let mut verify_grind_sample = |ch: &mut C, bits: u32| -> Result<F128, VerifyError> {
+    let mut verify_grind_sample = |ch: &mut C, bits: u32| -> Result<F128, ProductGkrError> {
         if bits != 0 {
             let nonce = proof.grinding_nonces[nonce_idx];
             nonce_idx += 1;
             ch.verify_pow_and_sample_f128(nonce, bits)
-                .ok_or(VerifyError::InvalidGrinding)
+                .ok_or(ProductGkrError::InvalidGrinding)
         } else {
             Ok(ch.sample_f128())
         }
@@ -1931,7 +1931,7 @@ fn verify_batched_core<C: Challenger>(
     ch.observe_f128(proof.top_lhs);
     ch.observe_f128(proof.top_rhs);
     if proof.top_lhs != proof.top_rhs {
-        return Err(VerifyError::ProductMismatch);
+        return Err(ProductGkrError::ProductMismatch);
     }
 
     let mut claim_l = proof.top_lhs;
@@ -1939,7 +1939,7 @@ fn verify_batched_core<C: Challenger>(
     let mut r_pt: Vec<F128> = Vec::new();
     for (k, layer) in proof.layers.iter().enumerate() {
         if layer.rounds.len() != k {
-            return Err(VerifyError::MalformedProof);
+            return Err(ProductGkrError::MalformedProof);
         }
         let lambda = verify_grind_sample(ch, grinding.lambda_bits)?;
         let mut c_run = claim_l + lambda * claim_r;
@@ -1962,7 +1962,7 @@ fn verify_batched_core<C: Challenger>(
         }
         let gate = vl0 * vl1 + lambda * (vr0 * vr1);
         if c_run != gate {
-            return Err(VerifyError::LayerCheckFailed);
+            return Err(ProductGkrError::LayerCheckFailed);
         }
         let c_k = verify_grind_sample(ch, grinding.close_bits)?;
         let one_plus_c = F128::ONE + c_k;
@@ -2019,7 +2019,7 @@ fn verify_batched_core<C: Challenger>(
         }
     };
     if claim_l != lhs_in || claim_r != rhs_in {
-        return Err(VerifyError::InputMismatch);
+        return Err(ProductGkrError::InputMismatch);
     }
 
     observe_evals(ch, &[proof.f_eval, proof.g_eval, s_sigma]);
@@ -2336,7 +2336,7 @@ mod tests {
         bind(&mut chv, &f, &g, &sigma);
         assert_eq!(
             verify_batched_with_grinding(mu, &missing, None, policy, &mut chv),
-            Err(VerifyError::InvalidGrinding)
+            Err(ProductGkrError::InvalidGrinding)
         );
     }
 
@@ -2395,17 +2395,20 @@ mod tests {
         // Wrong layer count (both directions).
         let mut short = batched.clone();
         short.layers.pop();
-        assert_eq!(verify_shape(&short, mu), Err(VerifyError::MalformedProof));
+        assert_eq!(
+            verify_shape(&short, mu),
+            Err(ProductGkrError::MalformedProof)
+        );
         assert_eq!(
             verify_shape(&batched, mu - 1),
-            Err(VerifyError::MalformedProof)
+            Err(ProductGkrError::MalformedProof)
         );
         // Right layer count, wrong round count inside a layer.
         let mut bad_rounds = batched.clone();
         bad_rounds.layers[mu - 1].rounds.pop();
         assert_eq!(
             verify_shape(&bad_rounds, mu),
-            Err(VerifyError::MalformedProof)
+            Err(ProductGkrError::MalformedProof)
         );
     }
 
@@ -2536,7 +2539,7 @@ mod tests {
         bind(&mut chv, &f, &g, &sigma);
         assert_eq!(
             verify_batched_with_sigma(mu, &forged, &sigma, None, &mut chv),
-            Err(VerifyError::InputMismatch),
+            Err(ProductGkrError::InputMismatch),
         );
 
         // ...and still accepts the honest proof.

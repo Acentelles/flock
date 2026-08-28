@@ -48,7 +48,7 @@ use flock_prover::prover::{self, UnionElementSlotInput, UnionSlotProverInput};
 use flock_prover::r1cs_hashes::sha2;
 use flock_prover::schedule::{IoWord, Registry, TableType};
 use flock_prover::union::UnionInstance;
-use flock_prover::verifier::{self, VerifyError};
+use flock_prover::verifier::{self, FlockVerifyError};
 use std::sync::Arc;
 
 const DOMAIN: &[u8] = b"flock-circuit-wiring-v0";
@@ -341,8 +341,8 @@ fn sha256_binary_tree_circuit() {
         assert!(
             matches!(
                 verify(&tree.public, &cm, &p),
-                Err(VerifyError::Wiring(WiringError::Gkr(
-                    product_gkr::VerifyError::ProductMismatch
+                Err(FlockVerifyError::Wiring(WiringError::Gkr(
+                    product_gkr::ProductGkrError::ProductMismatch
                 )))
             ),
             "a broken wiring equality must be rejected by the product identity"
@@ -383,7 +383,7 @@ fn sha256_binary_tree_circuit() {
                 &bad_params,
                 &mut ch,
             ),
-            Err(VerifyError::CircuitMismatch)
+            Err(FlockVerifyError::CircuitMismatch)
         );
         // A circuit rebuilt at the wrong count is a different statement.
         let bad_circuit = Circuit::new(
@@ -472,7 +472,7 @@ fn sha256_binary_tree_circuit() {
         bad.wiring.gather[0] += F128::ONE;
         assert_eq!(
             verify(&tree.public, &commitment, &bad),
-            Err(VerifyError::Wiring(WiringError::Recombination))
+            Err(FlockVerifyError::Wiring(WiringError::Recombination))
         );
 
         let bytes = bincode::serialize(&proof).expect("serialize");
@@ -960,7 +960,7 @@ fn cross_class_hash_into_mult() {
                 &pcs_params,
                 &mut ch,
             ),
-            Err(VerifyError::Wiring(_))
+            Err(FlockVerifyError::Wiring(_))
         ),
         "a self-consistent element gate on the WRONG operands must be rejected"
     );
@@ -1040,7 +1040,7 @@ fn gather_claims_are_bound_by_the_opening() {
     spliced.wiring = fake_wiring;
     let err = verify(&spliced).expect_err("a fabricated-witness wiring proof must be rejected");
     assert!(
-        matches!(err, VerifyError::PcsOpen(_)),
+        matches!(err, FlockVerifyError::PcsOpen(_)),
         "the OPENING must be what rejects it, not the wiring layer — got {err:?}"
     );
 }

@@ -298,11 +298,11 @@ pub struct MerklePathProofLigerito {
 #[derive(Debug)]
 pub enum MerklePathVerifyError {
     /// Base R1CS replay failed.
-    R1cs(flock_core::verifier::VerifyError),
+    R1cs(flock_core::verifier::FlockVerifyError),
     /// Merkle-path shift sumcheck check failed.
     Shift(MerklePathError),
     /// The batched PCS opening failed.
-    Pcs(flock_core::pcs::VerifyError),
+    Pcs(flock_core::pcs::PcsError),
 }
 
 // ---------------------------------------------------------------------------

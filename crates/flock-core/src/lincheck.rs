@@ -659,7 +659,7 @@ pub struct LincheckClaim {
 
 /// Reasons the verifier may reject.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum VerifyError {
+pub enum LincheckError {
     /// One of the proof vectors has the wrong length (expected `2^k_log`).
     BadVectorLength {
         which: &'static str,
@@ -2022,7 +2022,7 @@ pub fn verify<Ch: Challenger>(
     v_b: F128,
     proof: &LincheckProof,
     challenger: &mut Ch,
-) -> Result<LincheckClaim, VerifyError> {
+) -> Result<LincheckClaim, LincheckError> {
     verify_with_grinding(
         m,
         k_log,
@@ -2049,32 +2049,32 @@ pub fn verify_with_grinding<Ch: Challenger>(
     proof: &LincheckProof,
     grinding: LincheckGrinding,
     challenger: &mut Ch,
-) -> Result<LincheckClaim, VerifyError> {
+) -> Result<LincheckClaim, LincheckError> {
     let k = 1usize << k_log;
     let n_log = m - k_log;
 
     if k_skip > k_log {
-        return Err(VerifyError::KSkipExceedsKLog { k_skip, k_log });
+        return Err(LincheckError::KSkipExceedsKLog { k_skip, k_log });
     }
     let inner_rest_len = k_log - k_skip;
     let n_skip = 1usize << k_skip;
 
     if x_ab.x_inner_rest.len() != inner_rest_len {
-        return Err(VerifyError::BadInnerRestLength {
+        return Err(LincheckError::BadInnerRestLength {
             which: "x_ab",
             expected: inner_rest_len,
             got: x_ab.x_inner_rest.len(),
         });
     }
     if x_ab.x_outer.len() != n_log {
-        return Err(VerifyError::BadOuterLength {
+        return Err(LincheckError::BadOuterLength {
             which: "x_ab",
             expected: n_log,
             got: x_ab.x_outer.len(),
         });
     }
     if circuit.n_cols() != k {
-        return Err(VerifyError::BadMatrixShape {
+        return Err(LincheckError::BadMatrixShape {
             which: "circuit",
             expected: k,
             got_rows: k,
@@ -2082,14 +2082,14 @@ pub fn verify_with_grinding<Ch: Challenger>(
         });
     }
     if proof.rounds.len() != inner_rest_len {
-        return Err(VerifyError::BadVectorLength {
+        return Err(LincheckError::BadVectorLength {
             which: "rounds",
             expected: inner_rest_len,
             got: proof.rounds.len(),
         });
     }
     if proof.z_partial.len() != n_skip {
-        return Err(VerifyError::BadVectorLength {
+        return Err(LincheckError::BadVectorLength {
             which: "z_partial",
             expected: n_skip,
             got: proof.z_partial.len(),
@@ -2101,7 +2101,7 @@ pub fn verify_with_grinding<Ch: Challenger>(
         k_skip,
     );
     if proof.grinding_nonces.len() != expected_nonces {
-        return Err(VerifyError::BadGrindingNonceCount {
+        return Err(LincheckError::BadGrindingNonceCount {
             expected: expected_nonces,
             got: proof.grinding_nonces.len(),
         });
@@ -2124,7 +2124,7 @@ pub fn verify_with_grinding<Ch: Challenger>(
     let alpha = if let Some(bits) = grinding.alpha_bits() {
         let alpha = challenger
             .verify_pow_and_sample_f128(proof.grinding_nonces[nonce_idx], bits)
-            .ok_or(VerifyError::InvalidGrindingNonce { which: "alpha" })?;
+            .ok_or(LincheckError::InvalidGrindingNonce { which: "alpha" })?;
         nonce_idx += 1;
         alpha
     } else {
@@ -2164,7 +2164,7 @@ pub fn verify_with_grinding<Ch: Challenger>(
         let beta = if let Some(bits) = grinding.beta_bits() {
             let beta = challenger
                 .verify_pow_and_sample_f128(proof.grinding_nonces[nonce_idx], bits)
-                .ok_or(VerifyError::InvalidGrindingNonce { which: "beta" })?;
+                .ok_or(LincheckError::InvalidGrindingNonce { which: "beta" })?;
             nonce_idx += 1;
             beta
         } else {
@@ -2181,7 +2181,7 @@ pub fn verify_with_grinding<Ch: Challenger>(
         let r = if let Some(bits) = grinding.multilinear_round_bits() {
             let r = challenger
                 .verify_pow_and_sample_f128(proof.grinding_nonces[nonce_idx], bits)
-                .ok_or(VerifyError::InvalidGrindingNonce {
+                .ok_or(LincheckError::InvalidGrindingNonce {
                     which: "sumcheck-round",
                 })?;
             nonce_idx += 1;
@@ -2214,7 +2214,7 @@ pub fn verify_with_grinding<Ch: Challenger>(
     //    Small (length 2^k_skip = 64); sequential.
     let final_sum = inner_product(&comb_vec, &proof.z_partial);
     if running != final_sum {
-        return Err(VerifyError::ConsistencyFailed {
+        return Err(LincheckError::ConsistencyFailed {
             which: "sumcheck-final",
         });
     }
@@ -2225,7 +2225,7 @@ pub fn verify_with_grinding<Ch: Challenger>(
             Some(bits) => {
                 let r = challenger
                     .verify_pow_and_sample_f128(proof.grinding_nonces[nonce_idx], bits)
-                    .ok_or(VerifyError::InvalidGrindingNonce {
+                    .ok_or(LincheckError::InvalidGrindingNonce {
                         which: "inner-skip",
                     })?;
                 nonce_idx += 1;
@@ -2239,7 +2239,7 @@ pub fn verify_with_grinding<Ch: Challenger>(
                 nonce_idx += 1;
                 x_ab.z_skip
                     .sample_fresh_pow_verifier(challenger, nonce, bits)
-                    .ok_or(VerifyError::InvalidGrindingNonce {
+                    .ok_or(LincheckError::InvalidGrindingNonce {
                         which: "inner-skip",
                     })?
             }
@@ -2882,7 +2882,7 @@ mod tests {
                 grinding,
                 &mut ch_missing,
             ),
-            Err(VerifyError::BadGrindingNonceCount { .. })
+            Err(LincheckError::BadGrindingNonceCount { .. })
         ));
 
         // One-bit PoW means a fixed mutation can itself be valid with
@@ -2910,7 +2910,7 @@ mod tests {
                     grinding,
                     &mut ch_bad,
                 ),
-                Err(VerifyError::InvalidGrindingNonce { which: "alpha" })
+                Err(LincheckError::InvalidGrindingNonce { which: "alpha" })
             ) {
                 saw_invalid_alpha = true;
                 break;
@@ -2985,7 +2985,7 @@ mod tests {
             let mut ch = FsChallenger::new(b"flock-test-v0");
             let res = verify(m, k_log, k_skip, &circuit, &x_ab, v_a, v_b, &bad, &mut ch);
             assert!(
-                matches!(res, Err(VerifyError::ConsistencyFailed { .. })),
+                matches!(res, Err(LincheckError::ConsistencyFailed { .. })),
                 "verify did not reject {label}: got {res:?}"
             );
         }
@@ -3019,7 +3019,7 @@ mod tests {
         let mut ch = FsChallenger::new(b"flock-test-v0");
         assert!(matches!(
             verify(m, k_log, k_skip, &circuit, &x_ab, v_a, v_b, &bad, &mut ch),
-            Err(VerifyError::BadVectorLength { .. })
+            Err(LincheckError::BadVectorLength { .. })
         ));
 
         // Wrong x_inner_rest length.
@@ -3033,7 +3033,7 @@ mod tests {
             verify(
                 m, k_log, k_skip, &circuit, &bad_x_ab, v_a, v_b, &proof, &mut ch
             ),
-            Err(VerifyError::BadInnerRestLength { .. })
+            Err(LincheckError::BadInnerRestLength { .. })
         ));
 
         // k_skip > k_log.
@@ -3050,7 +3050,7 @@ mod tests {
                 &proof,
                 &mut ch,
             ),
-            Err(VerifyError::KSkipExceedsKLog { .. })
+            Err(LincheckError::KSkipExceedsKLog { .. })
         ));
     }
 }

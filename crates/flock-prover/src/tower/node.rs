@@ -2525,9 +2525,9 @@ pub fn build_node_outer_app(
                 assert!(
                     matches!(
                         vres,
-                        Err(flock_core::verifier::VerifyError::Wiring(
+                        Err(flock_core::verifier::FlockVerifyError::Wiring(
                             flock_core::circuit::WiringError::Gkr(
-                                flock_core::product_gkr::VerifyError::ProductMismatch
+                                flock_core::product_gkr::ProductGkrError::ProductMismatch
                             )
                         ))
                     ),

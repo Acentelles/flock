@@ -944,7 +944,7 @@ impl KeccakSetup {
         commitment: &Commitment,
         proof: &flock_core::proof::R1csProofMergedLigerito,
         challenger: &mut Ch,
-    ) -> Result<R1csClaim, verifier::VerifyError> {
+    ) -> Result<R1csClaim, verifier::FlockVerifyError> {
         let n_slots = self.n_keccak_slots();
         let union = flock_core::union::UnionInstance::new(&self.registry, vec![n_slots]);
         let circs: [&dyn flock_core::lincheck::LincheckCircuit; 1] = [&KeccakLincheckCircuit];
@@ -1686,7 +1686,10 @@ mod tests {
         let mut ch_v = FsChallenger::new(b"poc");
         let res = setup.verify(&commitment, &proof, &mut ch_v);
         assert!(
-            matches!(res, Err(flock_core::verifier::VerifyError::Lincheck(_))),
+            matches!(
+                res,
+                Err(flock_core::verifier::FlockVerifyError::Lincheck(_))
+            ),
             "all-zero witness must be rejected by the constant-wire pin; got {res:?}"
         );
     }

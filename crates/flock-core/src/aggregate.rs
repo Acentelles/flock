@@ -46,7 +46,7 @@ use serde::{Deserialize, Serialize};
 use crate::challenger::Challenger;
 use crate::element_r1cs::union::ElementAssertion;
 use crate::field::F128;
-use crate::lincheck::{MatrixAssertion, VerifyError};
+use crate::lincheck::{LincheckError, MatrixAssertion};
 use crate::matrix_fold::{self, FoldProof, MatrixClaim};
 use crate::r1cs::SparseBinaryMatrix;
 use crate::schedule::Registry;
@@ -183,9 +183,9 @@ pub enum AggregateError {
     Malformed,
     /// An assertion's reported matrix evaluations do not reproduce its
     /// target (`MatrixAssertion::check_reported`).
-    Reported(VerifyError),
+    Reported(LincheckError),
     /// Likewise on the element side.
-    ReportedElement(crate::element_r1cs::union::VerifyError),
+    ReportedElement(crate::element_r1cs::union::ElementUnionError),
     /// A fold did not verify.
     Fold(matrix_fold::FoldError),
     /// The accumulated claims did not hold against the real matrices.

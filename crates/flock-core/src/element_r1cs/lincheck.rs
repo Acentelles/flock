@@ -139,7 +139,7 @@ pub(crate) fn column_sumcheck_replay<C: Challenger>(
     grinding_nonces: &[u64],
     nonce_idx: &mut usize,
     ch: &mut C,
-) -> Result<(F128, Vec<F128>), VerifyError> {
+) -> Result<(F128, Vec<F128>), ElementLincheckError> {
     let mut running = target;
     let mut challenges = Vec::with_capacity(rounds.len());
     for &(e1, einf) in rounds {
@@ -148,7 +148,7 @@ pub(crate) fn column_sumcheck_replay<C: Challenger>(
         let rho = if let Some(bits) = grinding.round_bits() {
             let rho = ch
                 .verify_pow_and_sample_f128(grinding_nonces[*nonce_idx], bits)
-                .ok_or(VerifyError::InvalidGrindingNonce { which: "round" })?;
+                .ok_or(ElementLincheckError::InvalidGrindingNonce { which: "round" })?;
             *nonce_idx += 1;
             rho
         } else {
@@ -197,7 +197,7 @@ pub struct Claim {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum VerifyError {
+pub enum ElementLincheckError {
     /// Wrong number of round messages (expected `kappa`).
     BadRoundCount {
         expected: usize,
@@ -307,7 +307,7 @@ pub fn verify<C: Challenger>(
     vb: F128,
     proof: &Proof,
     ch: &mut C,
-) -> Result<Claim, VerifyError> {
+) -> Result<Claim, ElementLincheckError> {
     verify_with_grinding(ty, n_log, r, va, vb, proof, Grinding::disabled(), ch)
 }
 
@@ -321,23 +321,23 @@ pub fn verify_with_grinding<C: Challenger>(
     proof: &Proof,
     grinding: Grinding,
     ch: &mut C,
-) -> Result<Claim, VerifyError> {
+) -> Result<Claim, ElementLincheckError> {
     let kappa = ty.kappa();
     let m_words = kappa + n_log;
     if r.len() != m_words {
-        return Err(VerifyError::BadPointLength {
+        return Err(ElementLincheckError::BadPointLength {
             expected: m_words,
             got: r.len(),
         });
     }
     if proof.rounds.len() != kappa {
-        return Err(VerifyError::BadRoundCount {
+        return Err(ElementLincheckError::BadRoundCount {
             expected: kappa,
             got: proof.rounds.len(),
         });
     }
     if proof.grinding_nonces.len() != grinding.lincheck_nonce_count(kappa) {
-        return Err(VerifyError::BadGrindingNonceCount {
+        return Err(ElementLincheckError::BadGrindingNonceCount {
             expected: grinding.lincheck_nonce_count(kappa),
             got: proof.grinding_nonces.len(),
         });
@@ -348,7 +348,7 @@ pub fn verify_with_grinding<C: Challenger>(
     let alpha = if let Some(bits) = grinding.alpha_bits() {
         let alpha = ch
             .verify_pow_and_sample_f128(proof.grinding_nonces[nonce_idx], bits)
-            .ok_or(VerifyError::InvalidGrindingNonce { which: "alpha" })?;
+            .ok_or(ElementLincheckError::InvalidGrindingNonce { which: "alpha" })?;
         nonce_idx += 1;
         alpha
     } else {
@@ -379,7 +379,7 @@ pub fn verify_with_grinding<C: Challenger>(
         .zip(&eq_col)
         .fold(F128::ZERO, |acc, (c, e)| acc + *c * *e);
     if running != base * proof.z_eval {
-        return Err(VerifyError::SumcheckFinalFailed);
+        return Err(ElementLincheckError::SumcheckFinalFailed);
     }
 
     Ok(Claim {

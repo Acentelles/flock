@@ -41,7 +41,7 @@ use flock_core::proof::{R1csClaim, R1csProofMergedLigerito};
 use flock_core::r1cs::BlockR1cs;
 use flock_core::schedule::{Registry, TableType};
 use flock_core::union::UnionInstance;
-use flock_core::verifier::{self, VerifyError};
+use flock_core::verifier::{self, FlockVerifyError};
 use serde::{Deserialize, Serialize};
 
 use crate::prover::{self, UnionSlotProverInput};
@@ -285,7 +285,7 @@ impl MixedSetup {
         commitment: &Commitment,
         proof: &R1csProofMergedLigerito,
         challenger: &mut Ch,
-    ) -> Result<R1csClaim, VerifyError> {
+    ) -> Result<R1csClaim, FlockVerifyError> {
         let union = self.union(counts);
         let pcs_params = self.pcs_params(counts, expected_profile);
         let circuits: [&dyn LincheckCircuit; 2] = [
@@ -439,7 +439,7 @@ impl MerkleMixedSetup {
         commitment: &Commitment,
         proof: &R1csProofMergedLigerito,
         challenger: &mut Ch,
-    ) -> Result<R1csClaim, VerifyError> {
+    ) -> Result<R1csClaim, FlockVerifyError> {
         let union = self.union(counts);
         let pcs_params = self.pcs_params(counts, expected_profile);
         verifier::verify_ligerito_union(

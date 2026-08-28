@@ -448,7 +448,7 @@ pub struct ZerocheckProof {
 
 /// Reasons the verifier may reject a proof.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum VerifyError {
+pub enum ZerocheckError {
     /// `log_n` doesn't satisfy `log_n >= K_SKIP`.
     LogNTooSmall { log_n: usize, k_skip: usize },
     /// Round-1 messages have the wrong length (expected `2^K_SKIP`).
@@ -1017,12 +1017,12 @@ fn prove_packed_padded_inner<C: Challenger>(
 ///
 /// On accept: returns the [`ZerocheckClaim`] the caller must check against
 /// its PCS opening of `â`, `b̂`, `ĉ`.
-/// On reject: returns a [`VerifyError`] indicating which check failed.
+/// On reject: returns a [`ZerocheckError`] indicating which check failed.
 pub fn verify<C: Challenger>(
     log_n: usize,
     proof: &ZerocheckProof,
     challenger: &mut C,
-) -> Result<ZerocheckClaim, VerifyError> {
+) -> Result<ZerocheckClaim, ZerocheckError> {
     verify_with_grinding(log_n, proof, ZerocheckGrinding::disabled(), challenger)
 }
 
@@ -1034,38 +1034,38 @@ pub fn verify_with_grinding<C: Challenger>(
     proof: &ZerocheckProof,
     grinding: ZerocheckGrinding,
     challenger: &mut C,
-) -> Result<ZerocheckClaim, VerifyError> {
+) -> Result<ZerocheckClaim, ZerocheckError> {
     let m = log_n;
     let k_skip = K_SKIP;
     const N_INNER: usize = 7;
 
     if m < k_skip + N_INNER {
-        return Err(VerifyError::LogNTooSmall { log_n: m, k_skip });
+        return Err(ZerocheckError::LogNTooSmall { log_n: m, k_skip });
     }
     let n_mlv = m - k_skip;
     let ell = 1usize << k_skip;
 
     // ---- Shape checks ----
     if proof.round1_ab.len() != ell {
-        return Err(VerifyError::BadRound1Length {
+        return Err(ZerocheckError::BadRound1Length {
             expected: ell,
             got: proof.round1_ab.len(),
         });
     }
     if proof.round1_c.len() != ell {
-        return Err(VerifyError::BadRound1Length {
+        return Err(ZerocheckError::BadRound1Length {
             expected: ell,
             got: proof.round1_c.len(),
         });
     }
     if proof.multilinear_rounds.len() != n_mlv {
-        return Err(VerifyError::BadMultilinearRoundsLength {
+        return Err(ZerocheckError::BadMultilinearRoundsLength {
             expected: n_mlv,
             got: proof.multilinear_rounds.len(),
         });
     }
     if proof.grinding_nonces.len() != grinding.nonce_count(m) {
-        return Err(VerifyError::BadGrindingNonceCount {
+        return Err(ZerocheckError::BadGrindingNonceCount {
             expected: grinding.nonce_count(m),
             got: proof.grinding_nonces.len(),
         });
@@ -1078,7 +1078,7 @@ pub fn verify_with_grinding<C: Challenger>(
     let r_skip = if let Some(bits) = grinding.initial_bits(m) {
         let r_skip = challenger
             .verify_pow_and_sample_f128_vec(proof.grinding_nonces[nonce_idx], bits, k_skip)
-            .ok_or(VerifyError::InvalidGrindingNonce { which: "initial" })?;
+            .ok_or(ZerocheckError::InvalidGrindingNonce { which: "initial" })?;
         nonce_idx += 1;
         r_skip
     } else {
@@ -1101,7 +1101,7 @@ pub fn verify_with_grinding<C: Challenger>(
     let z = if let Some(bits) = grinding.skip_bits() {
         let z = challenger
             .verify_pow_and_sample_f128(proof.grinding_nonces[nonce_idx], bits)
-            .ok_or(VerifyError::InvalidGrindingNonce { which: "skip" })?;
+            .ok_or(ZerocheckError::InvalidGrindingNonce { which: "skip" })?;
         nonce_idx += 1;
         z
     } else {
@@ -1116,7 +1116,7 @@ pub fn verify_with_grinding<C: Challenger>(
     // `ĉ(z, r_rest) = P^C(z)` directly.
     let computed_c_eval = interpolate_at_z_on_lambda(&proof.round1_c, k_skip, z);
     if computed_c_eval != proof.final_c_eval {
-        return Err(VerifyError::CEvalMismatch);
+        return Err(ZerocheckError::CEvalMismatch);
     }
 
     // ---- Reconstruct the initial AB running claim ----
@@ -1177,7 +1177,7 @@ pub fn verify_with_grinding<C: Challenger>(
         let rho = if let Some(bits) = grinding.multilinear_round_bits() {
             let rho = challenger
                 .verify_pow_and_sample_f128(proof.grinding_nonces[nonce_idx], bits)
-                .ok_or(VerifyError::InvalidGrindingNonce {
+                .ok_or(ZerocheckError::InvalidGrindingNonce {
                     which: "multilinear",
                 })?;
             nonce_idx += 1;
@@ -1203,7 +1203,7 @@ pub fn verify_with_grinding<C: Challenger>(
     let r_rest: Vec<F128> = r[k_skip..].to_vec();
     let expected_final = proof.final_a_eval * proof.final_b_eval;
     if c_running != expected_final {
-        return Err(VerifyError::SumcheckFinalFailed);
+        return Err(ZerocheckError::SumcheckFinalFailed);
     }
 
     // ---- Fiat–Shamir: bind the final â, b̂ claims (mirrors `prove_packed_padded_inner`) ----
@@ -1361,7 +1361,7 @@ mod tests {
         let mut ch_bad = FsChallenger::new(b"flock-zc-grinding-v0");
         assert!(matches!(
             verify_with_grinding(m, &missing, grinding, &mut ch_bad),
-            Err(VerifyError::BadGrindingNonceCount { .. })
+            Err(ZerocheckError::BadGrindingNonceCount { .. })
         ));
     }
 
@@ -1463,7 +1463,7 @@ mod tests {
         let mut ch = FsChallenger::new(b"flock-test-v0");
         assert!(matches!(
             verify(m, &bad, &mut ch),
-            Err(VerifyError::BadRound1Length { .. })
+            Err(ZerocheckError::BadRound1Length { .. })
         ));
 
         // Truncate multilinear rounds.
@@ -1472,14 +1472,14 @@ mod tests {
         let mut ch = FsChallenger::new(b"flock-test-v0");
         assert!(matches!(
             verify(m, &bad, &mut ch),
-            Err(VerifyError::BadMultilinearRoundsLength { .. })
+            Err(ZerocheckError::BadMultilinearRoundsLength { .. })
         ));
 
         // log_n too small.
         let mut ch = FsChallenger::new(b"flock-test-v0");
         assert!(matches!(
             verify(K_SKIP + 6, &proof, &mut ch),
-            Err(VerifyError::LogNTooSmall { .. })
+            Err(ZerocheckError::LogNTooSmall { .. })
         ));
     }
 

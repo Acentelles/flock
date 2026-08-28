@@ -9,7 +9,7 @@ use flock_prover::pcs::ligerito::LigeritoProfile;
 use flock_prover::pcs::{self, PcsParams};
 use flock_prover::prover::prove_ligerito;
 use flock_prover::r1cs::{BlockR1cs, SparseBinaryMatrix, WitnessLayout};
-use flock_prover::verifier::{self, VerifyError};
+use flock_prover::verifier::{self, FlockVerifyError};
 
 struct Rng(u64);
 impl Rng {
@@ -101,7 +101,7 @@ fn r1cs_prove_verify_roundtrip_ligerito() {
         let mut ch = FsChallenger::new(b"flock-lig-r1cs-v0");
         let res =
             verifier::verify_ligerito(&r1cs, &commitment, &bad, &lc_circuit, &pcs_params, &mut ch);
-        assert!(matches!(res, Err(VerifyError::Lincheck(_))));
+        assert!(matches!(res, Err(FlockVerifyError::Lincheck(_))));
     }
 
     // Tamper 2: corrupt a ring-switch s_hat_v → the PCS open rejects.
@@ -111,7 +111,7 @@ fn r1cs_prove_verify_roundtrip_ligerito() {
         let mut ch = FsChallenger::new(b"flock-lig-r1cs-v0");
         let res =
             verifier::verify_ligerito(&r1cs, &commitment, &bad, &lc_circuit, &pcs_params, &mut ch);
-        assert!(matches!(res, Err(VerifyError::PcsAb(_))));
+        assert!(matches!(res, Err(FlockVerifyError::PcsAb(_))));
     }
 }
 
@@ -175,8 +175,8 @@ fn strict_fast_profile_grinds_boolean_piops() {
             &pcs_params,
             &mut ch_bad,
         ),
-        Err(VerifyError::Zerocheck(
-            flock_prover::zerocheck::VerifyError::BadGrindingNonceCount { .. }
+        Err(FlockVerifyError::Zerocheck(
+            flock_prover::zerocheck::ZerocheckError::BadGrindingNonceCount { .. }
         ))
     ));
 
@@ -192,8 +192,8 @@ fn strict_fast_profile_grinds_boolean_piops() {
             &pcs_params,
             &mut ch_bad,
         ),
-        Err(VerifyError::Lincheck(
-            flock_prover::lincheck::VerifyError::BadGrindingNonceCount { .. }
+        Err(FlockVerifyError::Lincheck(
+            flock_prover::lincheck::LincheckError::BadGrindingNonceCount { .. }
         ))
     ));
 }
@@ -281,7 +281,7 @@ fn r1cs_prove_verify_roundtrip_ligerito_ag() {
                     &pcs_params,
                     &mut ch
                 ),
-                Err(VerifyError::Ag(_))
+                Err(FlockVerifyError::Ag(_))
             ),
             "must reject a tampered c-eval"
         );

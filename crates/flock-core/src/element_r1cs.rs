@@ -746,7 +746,7 @@ pub struct ElementProof {
 
 /// Why an element proof was rejected.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum VerifyError {
+pub enum ElementR1csError {
     /// `m_words` is below Ligerito's feasibility floor ([`MIN_M_WORDS`]).
     TooSmall {
         m_words: usize,
@@ -757,10 +757,10 @@ pub enum VerifyError {
         n: usize,
         n_log: usize,
     },
-    Zerocheck(zerocheck::VerifyError),
-    Lincheck(lincheck::VerifyError),
+    Zerocheck(zerocheck::ElementZerocheckError),
+    Lincheck(lincheck::ElementLincheckError),
     /// The packed-direct opening rejected.
-    Open(pcs::VerifyError),
+    Open(pcs::PcsError),
 }
 
 /// The claims a verified element proof leaves behind: the two witness
@@ -870,7 +870,7 @@ pub fn verify<C: Challenger>(
     stmt: &ElementStatement<'_>,
     proof: &ElementProof,
     ch: &mut C,
-) -> Result<ElementClaim, VerifyError> {
+) -> Result<ElementClaim, ElementR1csError> {
     verify_with_grinding(stmt, proof, Grinding::disabled(), ch)
 }
 
@@ -881,16 +881,16 @@ pub fn verify_with_grinding<C: Challenger>(
     proof: &ElementProof,
     grinding: Grinding,
     ch: &mut C,
-) -> Result<ElementClaim, VerifyError> {
+) -> Result<ElementClaim, ElementR1csError> {
     let m_words = stmt.m_words();
     if m_words < MIN_M_WORDS {
-        return Err(VerifyError::TooSmall {
+        return Err(ElementR1csError::TooSmall {
             m_words,
             min: MIN_M_WORDS,
         });
     }
     if stmt.n > 1usize << stmt.n_log {
-        return Err(VerifyError::CountExceedsCapacity {
+        return Err(ElementR1csError::CountExceedsCapacity {
             n: stmt.n,
             n_log: stmt.n_log,
         });
@@ -905,7 +905,7 @@ pub fn verify_with_grinding<C: Challenger>(
     stmt.bind(&commitment.cap, ch);
 
     let zc_claim = zerocheck::verify_with_grinding(m_words, &proof.zerocheck, grinding, ch)
-        .map_err(VerifyError::Zerocheck)?;
+        .map_err(ElementR1csError::Zerocheck)?;
     let (va, vb) = strip_constants(stmt.ty, &zc_claim);
     let lc_claim = lincheck::verify_with_grinding(
         stmt.ty,
@@ -917,7 +917,7 @@ pub fn verify_with_grinding<C: Challenger>(
         grinding,
         ch,
     )
-    .map_err(VerifyError::Lincheck)?;
+    .map_err(ElementR1csError::Lincheck)?;
 
     let points = [zc_claim.r.as_slice(), lc_claim.r_prime.as_slice()];
     let values = [zc_claim.ec, lc_claim.z_eval];
@@ -937,7 +937,7 @@ pub fn verify_with_grinding<C: Challenger>(
         commitment.params.opening_grinding(),
         ch,
     )
-    .map_err(VerifyError::Open)?;
+    .map_err(ElementR1csError::Open)?;
 
     Ok(ElementClaim {
         r: zc_claim.r,
@@ -1333,7 +1333,7 @@ mod e2e_tests {
     fn run_verify(
         stmt: &ElementStatement<'_>,
         proof: &ElementProof,
-    ) -> Result<ElementClaim, VerifyError> {
+    ) -> Result<ElementClaim, ElementR1csError> {
         let mut ch = FsChallenger::new(TRANSCRIPT);
         verify(stmt, proof, &mut ch)
     }
@@ -1377,8 +1377,8 @@ mod e2e_tests {
         let mut ch_v = FsChallenger::new(TRANSCRIPT);
         assert!(matches!(
             verify_with_grinding(&stmt, &missing_zc, grinding, &mut ch_v),
-            Err(VerifyError::Zerocheck(
-                zerocheck::VerifyError::BadGrindingNonceCount { .. }
+            Err(ElementR1csError::Zerocheck(
+                zerocheck::ElementZerocheckError::BadGrindingNonceCount { .. }
             ))
         ));
 
@@ -1387,7 +1387,7 @@ mod e2e_tests {
         let mut ch_v = FsChallenger::new(TRANSCRIPT);
         assert!(matches!(
             verify_with_grinding(&stmt, &missing_open, grinding, &mut ch_v),
-            Err(VerifyError::Open(_))
+            Err(ElementR1csError::Open(_))
         ));
 
         // Pick a different nonce that fails the *initial* PoW predicate.
@@ -1400,8 +1400,8 @@ mod e2e_tests {
             let mut ch_v = FsChallenger::new(TRANSCRIPT);
             if matches!(
                 verify_with_grinding(&stmt, &bad, grinding, &mut ch_v),
-                Err(VerifyError::Zerocheck(
-                    zerocheck::VerifyError::InvalidGrindingNonce { which: "initial" }
+                Err(ElementR1csError::Zerocheck(
+                    zerocheck::ElementZerocheckError::InvalidGrindingNonce { which: "initial" }
                 ))
             ) {
                 rejected_bad_nonce = true;
@@ -1418,8 +1418,8 @@ mod e2e_tests {
         let mut ch_v = FsChallenger::new(TRANSCRIPT);
         assert!(matches!(
             verify_with_grinding(&stmt, &missing_lc, grinding, &mut ch_v),
-            Err(VerifyError::Lincheck(
-                lincheck::VerifyError::BadGrindingNonceCount { .. }
+            Err(ElementR1csError::Lincheck(
+                lincheck::ElementLincheckError::BadGrindingNonceCount { .. }
             ))
         ));
     }
@@ -1494,8 +1494,8 @@ mod e2e_tests {
             let (proof, _) = run_prove(&stmt, &z);
             assert_eq!(
                 run_verify(&stmt, &proof),
-                Err(VerifyError::Zerocheck(
-                    zerocheck::VerifyError::SumcheckFinalFailed
+                Err(ElementR1csError::Zerocheck(
+                    zerocheck::ElementZerocheckError::SumcheckFinalFailed
                 )),
                 "row {bad_row}"
             );
@@ -1568,8 +1568,8 @@ mod e2e_tests {
         bad_ec.zerocheck.ec += F128::ONE;
         assert_eq!(
             run_verify(&stmt, &bad_ec),
-            Err(VerifyError::Zerocheck(
-                zerocheck::VerifyError::SumcheckFinalFailed
+            Err(ElementR1csError::Zerocheck(
+                zerocheck::ElementZerocheckError::SumcheckFinalFailed
             )),
             "wrong ec"
         );
@@ -1578,8 +1578,8 @@ mod e2e_tests {
         bad_z.lincheck.z_eval += F128::ONE;
         assert_eq!(
             run_verify(&stmt, &bad_z),
-            Err(VerifyError::Lincheck(
-                lincheck::VerifyError::SumcheckFinalFailed
+            Err(ElementR1csError::Lincheck(
+                lincheck::ElementLincheckError::SumcheckFinalFailed
             )),
             "wrong z_eval"
         );
@@ -1655,7 +1655,7 @@ mod e2e_tests {
         };
         assert!(matches!(
             run_verify(&bad, &proof),
-            Err(VerifyError::CountExceedsCapacity { .. })
+            Err(ElementR1csError::CountExceedsCapacity { .. })
         ));
     }
 

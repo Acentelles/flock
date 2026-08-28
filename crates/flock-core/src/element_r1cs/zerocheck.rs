@@ -70,7 +70,7 @@ pub struct Claim {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum VerifyError {
+pub enum ElementZerocheckError {
     /// Wrong number of round messages.
     BadRoundCount {
         expected: usize,
@@ -429,7 +429,7 @@ pub fn verify<C: Challenger>(
     m_words: usize,
     proof: &Proof,
     ch: &mut C,
-) -> Result<Claim, VerifyError> {
+) -> Result<Claim, ElementZerocheckError> {
     verify_with_grinding(m_words, proof, Grinding::disabled(), ch)
 }
 
@@ -439,7 +439,7 @@ pub fn verify_with_grinding<C: Challenger>(
     proof: &Proof,
     grinding: Grinding,
     ch: &mut C,
-) -> Result<Claim, VerifyError> {
+) -> Result<Claim, ElementZerocheckError> {
     verify_with_label_and_grinding(LABEL, m_words, proof, grinding, ch)
 }
 
@@ -450,7 +450,7 @@ pub fn verify_with_label<C: Challenger>(
     m_words: usize,
     proof: &Proof,
     ch: &mut C,
-) -> Result<Claim, VerifyError> {
+) -> Result<Claim, ElementZerocheckError> {
     verify_with_label_and_grinding(label, m_words, proof, Grinding::disabled(), ch)
 }
 
@@ -461,15 +461,15 @@ pub fn verify_with_label_and_grinding<C: Challenger>(
     proof: &Proof,
     grinding: Grinding,
     ch: &mut C,
-) -> Result<Claim, VerifyError> {
+) -> Result<Claim, ElementZerocheckError> {
     if proof.rounds.len() != m_words {
-        return Err(VerifyError::BadRoundCount {
+        return Err(ElementZerocheckError::BadRoundCount {
             expected: m_words,
             got: proof.rounds.len(),
         });
     }
     if proof.grinding_nonces.len() != grinding.zerocheck_nonce_count(m_words) {
-        return Err(VerifyError::BadGrindingNonceCount {
+        return Err(ElementZerocheckError::BadGrindingNonceCount {
             expected: grinding.zerocheck_nonce_count(m_words),
             got: proof.grinding_nonces.len(),
         });
@@ -480,7 +480,7 @@ pub fn verify_with_label_and_grinding<C: Challenger>(
     let tau = if let Some(bits) = grinding.initial_bits(m_words) {
         let tau = ch
             .verify_pow_and_sample_f128_vec(proof.grinding_nonces[nonce_idx], bits, m_words)
-            .ok_or(VerifyError::InvalidGrindingNonce { which: "initial" })?;
+            .ok_or(ElementZerocheckError::InvalidGrindingNonce { which: "initial" })?;
         nonce_idx += 1;
         tau
     } else {
@@ -503,7 +503,7 @@ pub fn verify_with_label_and_grinding<C: Challenger>(
         let rho = if let Some(bits) = grinding.round_bits() {
             let rho = ch
                 .verify_pow_and_sample_f128(proof.grinding_nonces[nonce_idx], bits)
-                .ok_or(VerifyError::InvalidGrindingNonce { which: "round" })?;
+                .ok_or(ElementZerocheckError::InvalidGrindingNonce { which: "round" })?;
             nonce_idx += 1;
             rho
         } else {
@@ -519,7 +519,7 @@ pub fn verify_with_label_and_grinding<C: Challenger>(
     // The eq factors never accumulated into the running claim, so what is left
     // is the bare summand at `r`: `(Az+a_const)·(Bz+b_const) + z`.
     if running != proof.ea * proof.eb + proof.ec {
-        return Err(VerifyError::SumcheckFinalFailed);
+        return Err(ElementZerocheckError::SumcheckFinalFailed);
     }
 
     // Same transcript position as the prover — before Phase 2's α.
@@ -1044,7 +1044,7 @@ mod tests {
         let mut ch_v = FsChallenger::new(b"element-zc-bad");
         assert_eq!(
             verify(n_log + 2, &proof, &mut ch_v),
-            Err(VerifyError::SumcheckFinalFailed)
+            Err(ElementZerocheckError::SumcheckFinalFailed)
         );
     }
 
@@ -1163,7 +1163,7 @@ mod tests {
         let mut ch = FsChallenger::new(b"element-zc-shape");
         assert!(matches!(
             verify(n_log + kappa, &proof, &mut ch),
-            Err(VerifyError::BadRoundCount { .. })
+            Err(ElementZerocheckError::BadRoundCount { .. })
         ));
     }
 

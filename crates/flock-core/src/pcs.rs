@@ -55,15 +55,15 @@ pub struct BatchOpeningProofLigerito {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum VerifyError {
-    RingSwitch(ring_switch::VerifyError),
+pub enum PcsError {
+    RingSwitch(ring_switch::RingSwitchError),
     /// The Ligerito recursive verifier rejected the proof.
     Ligerito,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum VerifyErrorOpen {
-    RingSwitch(ring_switch::VerifyError),
+pub enum PcsOpenError {
+    RingSwitch(ring_switch::RingSwitchError),
     /// The virtual-opening sumcheck rejected (wrong round count, or the final
     /// round does not match `b̂_combined(ρ) · f_eval`).
     VirtualOpen,
@@ -1136,22 +1136,22 @@ pub fn verify_opening_batch_ligerito_mixed_with_grinding<Ch: Challenger>(
     lig_config: &ligerito::VerifierConfig,
     grinding: OpeningGrinding,
     challenger: &mut Ch,
-) -> Result<(), VerifyError> {
+) -> Result<(), PcsError> {
     let n_rs = claims.len();
     let n_pd = packed_direct.len();
     assert_eq!(skip_weights.len(), n_rs);
     assert_eq!(x_outers.len(), n_rs);
     if proof.ring_switches.len() != n_rs {
-        return Err(VerifyError::RingSwitch(
-            ring_switch::VerifyError::MalformedProof,
+        return Err(PcsError::RingSwitch(
+            ring_switch::RingSwitchError::MalformedProof,
         ));
     }
     assert!(n_rs + n_pd > 0);
     let batch_bits = grinding.claim_batch_bits_for(n_rs + n_pd);
     let expected_batch_nonces = usize::from(batch_bits != 0);
     if proof.batching_nonces.len() != expected_batch_nonces {
-        return Err(VerifyError::RingSwitch(
-            ring_switch::VerifyError::InvalidGrinding,
+        return Err(PcsError::RingSwitch(
+            ring_switch::RingSwitchError::InvalidGrinding,
         ));
     }
     // Lane-major (integer-lane) commitments: supported only for the merged
@@ -1180,7 +1180,7 @@ pub fn verify_opening_batch_ligerito_mixed_with_grinding<Ch: Challenger>(
             grinding.ring_switch_bits,
             challenger,
         )
-        .map_err(VerifyError::RingSwitch)?;
+        .map_err(PcsError::RingSwitch)?;
         rs_outputs.push(out);
     }
     // 2. Bind every PD value, then protect the whole mixed linear batching
@@ -1192,8 +1192,8 @@ pub fn verify_opening_batch_ligerito_mixed_with_grinding<Ch: Challenger>(
     let gammas = if batch_bits != 0 {
         challenger
             .verify_pow_and_sample_f128_vec(proof.batching_nonces[0], batch_bits, n_rs + n_pd)
-            .ok_or(VerifyError::RingSwitch(
-                ring_switch::VerifyError::InvalidGrinding,
+            .ok_or(PcsError::RingSwitch(
+                ring_switch::RingSwitchError::InvalidGrinding,
             ))?
     } else {
         challenger.sample_f128_vec(n_rs + n_pd)
@@ -1317,7 +1317,7 @@ pub fn verify_opening_batch_ligerito_mixed_with_grinding<Ch: Challenger>(
         challenger,
     );
     if !ok {
-        return Err(VerifyError::Ligerito);
+        return Err(PcsError::Ligerito);
     }
     Ok(())
 }
@@ -1980,7 +1980,7 @@ pub fn verify_batch_merged<Ch: Challenger>(
     lig_config: &ligerito::VerifierConfig,
     grinding: OpeningGrinding,
     challenger: &mut Ch,
-) -> Result<(), VerifyErrorOpen> {
+) -> Result<(), PcsOpenError> {
     verify_batch_merged_core(
         commitment,
         claims,
@@ -2016,7 +2016,7 @@ pub fn verify_batch_merged_deferred<Ch: Challenger>(
     lig_config: &ligerito::VerifierConfig,
     grinding: OpeningGrinding,
     challenger: &mut Ch,
-) -> Result<crate::matrix_fold::JaggedAssertion, VerifyErrorOpen> {
+) -> Result<crate::matrix_fold::JaggedAssertion, PcsOpenError> {
     let mut out = None;
     verify_batch_merged_core(
         commitment,
@@ -2049,18 +2049,18 @@ fn verify_batch_merged_core<Ch: Challenger>(
     grinding: OpeningGrinding,
     challenger: &mut Ch,
     defer: Option<&mut Option<crate::matrix_fold::JaggedAssertion>>,
-) -> Result<(), VerifyErrorOpen> {
+) -> Result<(), PcsOpenError> {
     let n_rs = claims.len();
     let n_pd = packed_direct.len();
     assert_eq!(z_skips.len(), n_rs);
     assert_eq!(x_outers.len(), n_rs);
     if proof.ring_switches.len() != n_rs {
-        return Err(VerifyErrorOpen::Assist);
+        return Err(PcsOpenError::Assist);
     }
     let batch_bits = grinding.claim_batch_bits_for(n_rs + n_pd);
     let expected_batch_nonces = usize::from(batch_bits != 0);
     if proof.batching_nonces.len() != expected_batch_nonces {
-        return Err(VerifyErrorOpen::Assist);
+        return Err(PcsOpenError::Assist);
     }
     // `VERIFY_TRACE` phase split. The Ligerito inner verify has its own
     // `LIG_VERIFY_TRACE`, but it is a small tail here — the jagged Frobenius
@@ -2087,7 +2087,7 @@ fn verify_batch_merged_core<Ch: Challenger>(
             grinding.ring_switch_bits,
             challenger,
         )
-        .map_err(VerifyErrorOpen::RingSwitch)?;
+        .map_err(PcsOpenError::RingSwitch)?;
         rs_outputs.push(out);
     }
     if trace {
@@ -2107,7 +2107,7 @@ fn verify_batch_merged_core<Ch: Challenger>(
     let gammas_all = if batch_bits != 0 {
         challenger
             .verify_pow_and_sample_f128_vec(proof.batching_nonces[0], batch_bits, n_rs + n_pd)
-            .ok_or(VerifyErrorOpen::Assist)?
+            .ok_or(PcsOpenError::Assist)?
     } else {
         challenger.sample_f128_vec(n_rs + n_pd)
     };
@@ -2122,7 +2122,7 @@ fn verify_batch_merged_core<Ch: Challenger>(
 
     let dense_log = commitment.params.m - LOG_PACKING;
     if proof.merged_rounds.len() != dense_log {
-        return Err(VerifyErrorOpen::VirtualOpen);
+        return Err(PcsOpenError::VirtualOpen);
     }
     let expected_merged_nonces = if grinding.merged_round_bits == 0 {
         0
@@ -2130,7 +2130,7 @@ fn verify_batch_merged_core<Ch: Challenger>(
         dense_log
     };
     if proof.merged_round_nonces.len() != expected_merged_nonces {
-        return Err(VerifyErrorOpen::VirtualOpen);
+        return Err(PcsOpenError::VirtualOpen);
     }
     let mut running = target;
     let mut rho = Vec::with_capacity(dense_log);
@@ -2143,7 +2143,7 @@ fn verify_batch_merged_core<Ch: Challenger>(
                     proof.merged_round_nonces[round],
                     grinding.merged_round_bits,
                 )
-                .ok_or(VerifyErrorOpen::VirtualOpen)?
+                .ok_or(PcsOpenError::VirtualOpen)?
         } else {
             challenger.sample_f128()
         };
@@ -2189,7 +2189,7 @@ fn verify_batch_merged_core<Ch: Challenger>(
     // so it carries one dual value and no 128-coefficient vector at all.
     for c in packed_direct.iter() {
         if c.point.len() != n_log + k_cols {
-            return Err(VerifyErrorOpen::Assist);
+            return Err(PcsOpenError::Assist);
         }
     }
     let pd_groups = scalar_claim_groups(
@@ -2229,7 +2229,7 @@ fn verify_batch_merged_core<Ch: Challenger>(
             grinding.multipoint,
             &mut ch_a,
         )
-        .ok_or(VerifyErrorOpen::Assist)?;
+        .ok_or(PcsOpenError::Assist)?;
         mp_defer = Some(mp);
         v
     } else {
@@ -2242,7 +2242,7 @@ fn verify_batch_merged_core<Ch: Challenger>(
             grinding.multipoint,
             &mut ch_a,
         )
-        .ok_or(VerifyErrorOpen::Assist)?
+        .ok_or(PcsOpenError::Assist)?
     };
     if let (Some(out), Some(mp)) = (defer, mp_defer) {
         *out = Some(assemble_jagged_assertion(
@@ -2289,13 +2289,13 @@ fn verify_batch_merged_core<Ch: Challenger>(
         grinding,
         challenger,
     )
-    .map_err(|_| VerifyErrorOpen::Ligerito)?;
+    .map_err(|_| PcsOpenError::Ligerito)?;
     challenger.merge_child(ch_a);
     // The assist's claim against the merged sumcheck's folded target. A pure
     // arithmetic check — it consumes no challenges, so the fork moved it here
     // without touching the transcript.
     if running != proof.q_eval * v {
-        return Err(VerifyErrorOpen::VirtualOpen);
+        return Err(PcsOpenError::VirtualOpen);
     }
     if trace {
         eprintln!(
@@ -2438,8 +2438,8 @@ mod tests {
                 OpeningGrinding::disabled(),
                 &mut ch_v,
             ),
-            Err(VerifyError::RingSwitch(
-                ring_switch::VerifyError::MalformedProof
+            Err(PcsError::RingSwitch(
+                ring_switch::RingSwitchError::MalformedProof
             ))
         ));
     }

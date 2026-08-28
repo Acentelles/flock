@@ -174,8 +174,8 @@ pub struct Claims {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum VerifyError {
-    Zerocheck(zerocheck::VerifyError),
+pub enum ElementUnionError {
+    Zerocheck(zerocheck::ElementZerocheckError),
     /// Wrong number of lincheck round messages (expected `E − nu`).
     LincheckRoundCount {
         expected: usize,
@@ -300,7 +300,7 @@ pub fn verify<C: Challenger>(
     union: &UnionInstance<'_>,
     proof: &Proof,
     ch: &mut C,
-) -> Result<Claims, VerifyError> {
+) -> Result<Claims, ElementUnionError> {
     verify_with_grinding(union, proof, Grinding::disabled(), ch)
 }
 
@@ -309,7 +309,7 @@ pub fn verify_with_grinding<C: Challenger>(
     proof: &Proof,
     grinding: Grinding,
     ch: &mut C,
-) -> Result<Claims, VerifyError> {
+) -> Result<Claims, ElementUnionError> {
     let (claims, assertion) = verify_deferred_with_grinding(union, proof, grinding, ch)?;
     assertion.check_reported(union)?;
     Ok(claims)
@@ -321,7 +321,7 @@ pub fn verify_deferred<C: Challenger>(
     union: &UnionInstance<'_>,
     proof: &Proof,
     ch: &mut C,
-) -> Result<(Claims, ElementAssertion), VerifyError> {
+) -> Result<(Claims, ElementAssertion), ElementUnionError> {
     verify_deferred_with_grinding(union, proof, Grinding::disabled(), ch)
 }
 
@@ -330,7 +330,7 @@ pub fn verify_deferred_with_grinding<C: Challenger>(
     proof: &Proof,
     grinding: Grinding,
     ch: &mut C,
-) -> Result<(Claims, ElementAssertion), VerifyError> {
+) -> Result<(Claims, ElementAssertion), ElementUnionError> {
     let slots = region_slots(union);
     let (nu, e_vars) = (union.n_log(), union.m_elem() - 7);
     assert!(
@@ -339,7 +339,7 @@ pub fn verify_deferred_with_grinding<C: Challenger>(
     );
     let lc_rounds = e_vars - nu;
     if proof.lincheck.rounds.len() != lc_rounds {
-        return Err(VerifyError::LincheckRoundCount {
+        return Err(ElementUnionError::LincheckRoundCount {
             expected: lc_rounds,
             got: proof.lincheck.rounds.len(),
         });
@@ -347,13 +347,13 @@ pub fn verify_deferred_with_grinding<C: Challenger>(
 
     let zc =
         zerocheck::verify_with_label_and_grinding(ZC_LABEL, e_vars, &proof.zerocheck, grinding, ch)
-            .map_err(VerifyError::Zerocheck)?;
+            .map_err(ElementUnionError::Zerocheck)?;
     let (va, vb, a_const_eval, b_const_eval) = strip_constants(&slots, nu, &zc);
 
     ch.observe_label(LC_LABEL);
     let expected_nonces = grinding.lincheck_nonce_count(lc_rounds);
     if proof.lincheck.grinding_nonces.len() != expected_nonces {
-        return Err(VerifyError::LincheckGrindingNonceCount {
+        return Err(ElementUnionError::LincheckGrindingNonceCount {
             expected: expected_nonces,
             got: proof.lincheck.grinding_nonces.len(),
         });
@@ -362,7 +362,7 @@ pub fn verify_deferred_with_grinding<C: Challenger>(
     let alpha = if let Some(bits) = grinding.alpha_bits() {
         let alpha = ch
             .verify_pow_and_sample_f128(proof.lincheck.grinding_nonces[nonce_idx], bits)
-            .ok_or(VerifyError::LincheckGrindingInvalid { which: "alpha" })?;
+            .ok_or(ElementUnionError::LincheckGrindingInvalid { which: "alpha" })?;
         nonce_idx += 1;
         alpha
     } else {
@@ -377,10 +377,10 @@ pub fn verify_deferred_with_grinding<C: Challenger>(
         ch,
     )
     .map_err(|err| match err {
-        super::lincheck::VerifyError::InvalidGrindingNonce { which } => {
-            VerifyError::LincheckGrindingInvalid { which }
+        super::lincheck::ElementLincheckError::InvalidGrindingNonce { which } => {
+            ElementUnionError::LincheckGrindingInvalid { which }
         }
-        _ => VerifyError::LincheckFinalFailed,
+        _ => ElementUnionError::LincheckFinalFailed,
     })?;
     debug_assert_eq!(nonce_idx, proof.lincheck.grinding_nonces.len());
 
@@ -607,11 +607,11 @@ impl ElementAssertion {
 
     /// Check the reported values reproduce the target — scalars only, no
     /// matrix read.
-    pub fn check_reported(&self, union: &UnionInstance<'_>) -> Result<(), VerifyError> {
+    pub fn check_reported(&self, union: &UnionInstance<'_>) -> Result<(), ElementUnionError> {
         let nu = union.n_log();
         let slots = region_slots(union);
         if self.evals.len() != slots.len() {
-            return Err(VerifyError::LincheckFinalFailed);
+            return Err(ElementUnionError::LincheckFinalFailed);
         }
         let mut acc = F128::ZERO;
         for (s, &(va, vb)) in slots.iter().zip(&self.evals) {
@@ -621,7 +621,7 @@ impl ElementAssertion {
             acc += w_r * w_col * (va + self.alpha * vb);
         }
         if acc * self.z_eval != self.target {
-            return Err(VerifyError::LincheckFinalFailed);
+            return Err(ElementUnionError::LincheckFinalFailed);
         }
         Ok(())
     }
@@ -1300,7 +1300,7 @@ mod tests {
         let mut ch_v = FsChallenger::new(b"element-region-grinding");
         assert!(matches!(
             verify_with_grinding(&union, &bad, grinding, &mut ch_v),
-            Err(VerifyError::LincheckGrindingNonceCount { .. })
+            Err(ElementUnionError::LincheckGrindingNonceCount { .. })
         ));
 
         // The α nonce is checked before alpha is squeezed.  The scan finds a
@@ -1314,7 +1314,7 @@ mod tests {
             let mut ch_v = FsChallenger::new(b"element-region-grinding");
             if matches!(
                 verify_with_grinding(&union, &bad, grinding, &mut ch_v),
-                Err(VerifyError::LincheckGrindingInvalid { which: "alpha" })
+                Err(ElementUnionError::LincheckGrindingInvalid { which: "alpha" })
             ) {
                 rejected_bad_nonce = true;
                 break;
@@ -1357,8 +1357,8 @@ mod tests {
             let mut ch_v = FsChallenger::new(b"element-region-bad");
             assert_eq!(
                 verify(&union, &proof, &mut ch_v),
-                Err(VerifyError::Zerocheck(
-                    zerocheck::VerifyError::SumcheckFinalFailed
+                Err(ElementUnionError::Zerocheck(
+                    zerocheck::ElementZerocheckError::SumcheckFinalFailed
                 )),
                 "slot {bad_slot}"
             );

@@ -1310,7 +1310,7 @@ impl Sha256HybridSetup {
         commitment: &flock_core::pcs::Commitment,
         proof: &flock_core::proof::R1csProofMergedLigerito,
         challenger: &mut Ch,
-    ) -> Result<flock_core::proof::R1csClaim, flock_core::verifier::VerifyError> {
+    ) -> Result<flock_core::proof::R1csClaim, flock_core::verifier::FlockVerifyError> {
         let union =
             flock_core::union::UnionInstance::new(&self.registry, vec![self.n_compressions]);
         let circuit = self.r1cs.csc_lincheck_circuit();
@@ -2306,7 +2306,10 @@ mod tests {
         let mut ch_v = FsChallenger::new(b"poc");
         let res = setup.verify(&commit, &proof, &mut ch_v);
         assert!(
-            matches!(res, Err(flock_core::verifier::VerifyError::Lincheck(_))),
+            matches!(
+                res,
+                Err(flock_core::verifier::FlockVerifyError::Lincheck(_))
+            ),
             "all-zero witness must be rejected by the constant-wire pin; got {res:?}"
         );
     }

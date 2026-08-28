@@ -1689,7 +1689,7 @@ impl Blake3Setup {
         commitment: &Commitment,
         proof: &flock_core::proof::R1csProofMergedLigerito,
         challenger: &mut Ch,
-    ) -> Result<R1csClaim, verifier::VerifyError> {
+    ) -> Result<R1csClaim, verifier::FlockVerifyError> {
         let union = flock_core::union::UnionInstance::new(&self.registry, vec![self.n_blocks]);
         let circuit = self.r1cs.csc_lincheck_circuit();
         let circs: [&dyn flock_core::lincheck::LincheckCircuit; 1] = [circuit];
@@ -1738,7 +1738,7 @@ impl Blake3Setup {
         commitment: &Commitment,
         proof: &flock_core::proof::R1csProofMergedLigeritoAg,
         challenger: &mut Ch,
-    ) -> Result<R1csClaim, verifier::VerifyError> {
+    ) -> Result<R1csClaim, verifier::FlockVerifyError> {
         let union = flock_core::union::UnionInstance::new(&self.registry, vec![self.n_blocks]);
         let circuit = self.r1cs.csc_lincheck_circuit();
         let circs: [&dyn flock_core::lincheck::LincheckCircuit; 1] = [circuit];
@@ -1813,7 +1813,7 @@ impl Blake3Setup {
         commitment: &Commitment,
         proof: &flock_core::proof::R1csProofLigeritoAg,
         challenger: &mut Ch,
-    ) -> Result<R1csClaim, verifier::VerifyError> {
+    ) -> Result<R1csClaim, verifier::FlockVerifyError> {
         let lc_circuit = self.r1cs.csc_lincheck_circuit();
         verifier::verify_ligerito_ag(
             &self.r1cs,
@@ -2902,7 +2902,10 @@ mod tests {
         let mut ch_v = FsChallenger::new(b"poc");
         let res = setup.verify(&commitment, &proof, &mut ch_v);
         assert!(
-            matches!(res, Err(flock_core::verifier::VerifyError::Lincheck(_))),
+            matches!(
+                res,
+                Err(flock_core::verifier::FlockVerifyError::Lincheck(_))
+            ),
             "all-zero witness must be rejected by the constant-wire pin; got {res:?}"
         );
     }

@@ -681,7 +681,7 @@ pub enum WiringError {
     /// Wrong number of gather values for this circuit's cell space.
     MalformedProof,
     /// The product-GKR rejected (products differ, layer check, input check).
-    Gkr(product_gkr::VerifyError),
+    Gkr(product_gkr::ProductGkrError),
     /// The gather values do not recombine to `ŵ(ρ)` — the gather
     /// factorization's check, which is what binds the GKR's `f`-side input to
     /// the committed witness and the public words.
@@ -1697,7 +1697,9 @@ mod tests {
         bad[cells.gate_word_addr(0, 1)] += F128::ONE;
         assert_eq!(
             roundtrip(&circuit, &bad, &public),
-            Err(WiringError::Gkr(product_gkr::VerifyError::ProductMismatch))
+            Err(WiringError::Gkr(
+                product_gkr::ProductGkrError::ProductMismatch
+            ))
         );
         // Break a WIRED public word instead (public slot 0, row 4 — the cell
         // `Cell::new(8, 4)` above). An unwired public word is unconstrained by
@@ -1706,7 +1708,9 @@ mod tests {
         bad_public[4] += F128::ONE;
         assert_eq!(
             roundtrip(&circuit, &packed, &bad_public),
-            Err(WiringError::Gkr(product_gkr::VerifyError::ProductMismatch))
+            Err(WiringError::Gkr(
+                product_gkr::ProductGkrError::ProductMismatch
+            ))
         );
     }
 

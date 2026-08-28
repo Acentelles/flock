@@ -23,11 +23,11 @@
 use flock_core::field::F128;
 use flock_core::lincheck::LincheckCircuit;
 use flock_core::pcs::ligerito::LigeritoProfile;
-use flock_core::pcs::{PcsParams, VerifyErrorOpen};
+use flock_core::pcs::{PcsOpenError, PcsParams};
 use flock_core::proof::R1csProofMergedLigerito;
 use flock_core::r1cs::BlockR1cs;
 use flock_core::union::SlotWitness;
-use flock_core::verifier::VerifyError;
+use flock_core::verifier::FlockVerifyError;
 use flock_prover::challenger::FsChallenger;
 use flock_prover::prover::{self, UnionSlotProverInput};
 use flock_prover::r1cs_hashes::{blake3, sha2};
@@ -317,9 +317,9 @@ fn mixed_blake3_sha256_roundtrip_and_tamper() {
         let mut bad = proof.clone();
         bad.lincheck.rounds[0].0.lo ^= 1;
         match verify(&union, &bad) {
-            Err(VerifyError::Lincheck(flock_core::lincheck::VerifyError::ConsistencyFailed {
-                ..
-            })) => {}
+            Err(FlockVerifyError::Lincheck(
+                flock_core::lincheck::LincheckError::ConsistencyFailed { .. },
+            )) => {}
             other => panic!(
                 "tampered lincheck round: expected Lincheck(ConsistencyFailed), got {other:?}"
             ),
@@ -333,7 +333,7 @@ fn mixed_blake3_sha256_roundtrip_and_tamper() {
         let mut bad = proof.clone();
         bad.pcs_open.q_eval.lo ^= 1;
         match verify(&union, &bad) {
-            Err(VerifyError::PcsOpen(VerifyErrorOpen::VirtualOpen)) => {}
+            Err(FlockVerifyError::PcsOpen(PcsOpenError::VirtualOpen)) => {}
             other => panic!("tampered q_eval: expected PcsOpen(VirtualOpen), got {other:?}"),
         }
     }

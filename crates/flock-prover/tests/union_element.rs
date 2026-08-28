@@ -1010,13 +1010,13 @@ fn mixed_boolean_element_roundtrip_and_tamper() {
         bad.element = None;
         assert!(matches!(
             verify(&union, &pcs_params, &commitment, &bad),
-            Err(verifier::VerifyError::ClassMismatch)
+            Err(verifier::FlockVerifyError::ClassMismatch)
         ));
         let mut bad = proof.clone();
         bad.boolean = None;
         assert!(matches!(
             verify(&union, &pcs_params, &commitment, &bad),
-            Err(verifier::VerifyError::ClassMismatch)
+            Err(verifier::FlockVerifyError::ClassMismatch)
         ));
     }
 
