@@ -2401,3 +2401,12 @@ branches); this merge added only the fmt commit's merkle_path.rs delta
 like memory-pressure churn from back-to-back 8.5 GB bench sessions
 (the certified comparison comes after the re-grafts, with proper
 alternation).
+
+### Merge step 5: PR #34 legacy-hardening (2bb04a9) — 2026-08-28
+
+Clean merge, zero conflicts (+186/-1: verifier/r1cs hardening checks,
+small blake3/sha2 additions). Suites green (core 574, prover 122).
+First bench session read 2.26/2.32/2.28 s across the board — rerun
+gave 1.85/1.07/0.970 s: the slow session was machine state (788K
+pageouts; back-to-back 8.5 GB bench sessions), not the PR. PARITY,
+best 970 ms.
