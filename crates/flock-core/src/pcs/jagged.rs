@@ -79,6 +79,7 @@
 use crate::challenger::Challenger;
 use crate::field::F128;
 use crate::lincheck::build_eq_table;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 /// Configuration of a jagged function: the (zero-padded to `2^k`) column
@@ -296,7 +297,6 @@ fn generate_f_and_claim(
     z_row: &[F128],
     z_col: &[F128],
 ) -> (Vec<F128>, F128, F128, F128) {
-    use rayon::prelude::*;
     let len = 1usize << params.m;
     let area = params.area() as usize;
     let eq_row = build_eq_table(z_row);
@@ -824,7 +824,6 @@ fn assist_suffix_rows_blocked(
     m: usize,
     par: bool,
 ) -> Vec<[F128; 4]> {
-    use rayon::prelude::*;
     #[inline]
     fn step(
         dst: &mut [F128; 4],
@@ -890,7 +889,6 @@ fn assist_shared_tail_blocked(
     m: usize,
     lo: usize,
 ) -> Vec<[F128; 4]> {
-    use rayon::prelude::*;
     debug_assert!(lo >= 1 && lo <= m + 1);
     let base = blocks.off[lo];
     let mut rows = vec![[F128::ZERO; 4]; blocks.total() - base];
@@ -934,7 +932,6 @@ fn assist_suffix_low_blocked(
     tail: &[[F128; 4]],
     par: bool,
 ) -> Vec<[F128; 4]> {
-    use rayon::prelude::*;
     #[inline]
     fn step(
         dst: &mut [F128; 4],
@@ -1022,7 +1019,6 @@ fn fold_partials(
     ch4: &[F128; 4],
     par: bool,
 ) {
-    use rayon::prelude::*;
     let (cd, kids) = (&blocks.cd[layer], &blocks.first_child[layer]);
     let n_child = blocks.n_blocks(layer);
     debug_assert_eq!(p.len(), n_child);
@@ -1071,7 +1067,6 @@ fn assist_buckets(
     layer: usize,
     par: bool,
 ) -> [[F128; 4]; 4] {
-    use rayon::prelude::*;
     let pbase = blocks.off[layer + 1];
     // The parent layer's suffix slots: the statement's own store below the
     // shared boundary (`lo_off = off[lo]`), the statement-independent tail
@@ -1515,7 +1510,6 @@ pub(crate) fn build_merged_weight_and_prime(
     claims: &[MergedWeightClaim<'_>],
     q: &[F128],
 ) -> (Vec<F128>, (F128, F128)) {
-    use rayon::prelude::*;
     let area = params.area() as usize;
     let n_total = 1usize << params.m;
     enum ColSide<'a> {
@@ -1709,7 +1703,6 @@ fn frobenius_statements(
     bounds: &[(u64, u64, u32)],
     prover: Option<(&AssistBlocks, &[[F128; 4]], usize)>,
 ) -> Vec<FrobeniusStatement> {
-    use rayon::prelude::*;
     let m = params.m;
     let sparse = assist_sparse_transitions();
     enum SpecCols<'b> {
@@ -1857,7 +1850,6 @@ pub fn prove_frobenius_assist_with_grinding<C: Challenger>(
     round_grinding_bits: u32,
     challenger: &mut C,
 ) -> FrobeniusAssistProof {
-    use rayon::prelude::*;
     let m = params.m;
     assert_eq!(rho.len(), m);
     let trace = std::env::var("PCS_TRACE").is_ok();
@@ -2067,7 +2059,6 @@ fn verify_frobenius_assist_core<C: Challenger>(
     challenger: &mut C,
     defer: Option<&mut Option<AssistDefer>>,
 ) -> Option<F128> {
-    use rayon::prelude::*;
     let m = params.m;
     if proof.rounds.len() != 2 * (m + 1) {
         return None;
@@ -2541,7 +2532,6 @@ fn multipoint_values(
     claims: &[FrobeniusClaim<'_>],
     rho_pows: &[Vec<F128>],
 ) -> Vec<Vec<F128>> {
-    use rayon::prelude::*;
     let m = params.m;
     let sparse = assist_sparse_transitions();
     claims
@@ -2581,7 +2571,6 @@ fn multipoint_group_values(
     groups: &[ScalarGroupClaim<'_>],
     rho: &[F128],
 ) -> Vec<F128> {
-    use rayon::prelude::*;
     let m = params.m;
     let sparse = assist_sparse_transitions();
     let bounds = assist_boundaries(params);
@@ -2724,7 +2713,6 @@ fn build_combined_weight_and_msg(
     partner: &Partner,
     eq: &SplitEq,
 ) -> (Vec<F128>, (F128, F128)) {
-    use rayon::prelude::*;
     let mut a = vec![F128::ZERO; 1usize << params.m];
     let pfx = &params.col_prefix_sums;
     let n_cols = pfx.len() - 1;
@@ -3724,7 +3712,6 @@ fn fold_and_round_virtual_par(
     partner: &Partner,
     eq: &SplitEq,
 ) -> (F128, F128) {
-    use rayon::prelude::*;
     debug_assert_eq!(a.len(), 2 * ao.len());
     debug_assert!(a.len() >= 4 && a.len().is_multiple_of(4));
     const CO: usize = 1 << 13;
@@ -4689,7 +4676,6 @@ mod round_test_support {
 /// Parallel out-of-place fold (no message), `ao/bo` length `a.len()/2`. Used for
 /// the final round (size 2 → 1), where there is no successor message.
 pub(crate) fn fold_oop_par(a: &[F128], b: &[F128], r: F128, ao: &mut [F128], bo: &mut [F128]) {
-    use rayon::prelude::*;
     ao.par_iter_mut()
         .zip(bo.par_iter_mut())
         .enumerate()
@@ -4712,7 +4698,6 @@ pub(crate) fn fold_and_round_oop_par(
     ao: &mut [F128],
     bo: &mut [F128],
 ) -> (F128, F128) {
-    use rayon::prelude::*;
     debug_assert_eq!(a.len(), 2 * ao.len());
     debug_assert!(a.len() >= 4);
     // Output chunk of `CO`; the aligned input chunk is `2*CO` (output is half

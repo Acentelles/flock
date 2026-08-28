@@ -121,6 +121,7 @@ use crate::field::F128;
 use crate::genus95_curve_code::{EvaluationPoint, base_evaluation_functional};
 use crate::r1cs::SparseBinaryMatrix;
 use crate::zerocheck::multilinear::lagrange_weights_naive;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::AtomicBool;
 
@@ -854,8 +855,6 @@ pub fn partial_fold_packed_z_fast_padded(
     useful_bits: usize,
     eq_outer: &[F128],
 ) -> Vec<F128> {
-    use rayon::prelude::*;
-
     let n_log = m - k_log;
     let k = 1usize << k_log;
     let n_outer = 1usize << n_log;
@@ -917,8 +916,6 @@ pub fn partial_fold_packed_z_rows_padded(
     eq_outer: &[F128],
     n_rows: usize,
 ) -> Vec<F128> {
-    use rayon::prelude::*;
-
     let n_log = m - k_log;
     let k = 1usize << k_log;
     let n_outer = 1usize << n_log;
@@ -1141,7 +1138,6 @@ pub fn pack_z_lincheck_from_packed(
     m: usize,
     k_log: usize,
 ) -> Vec<u8> {
-    use rayon::prelude::*;
     let k = 1usize << k_log;
     let n_total = 1usize << m;
     assert_eq!(z_packed_f128.len(), n_total / 128);
@@ -1384,7 +1380,6 @@ fn sparse_row_fold_alpha_batched(
     b_0: &SparseBinaryMatrix,
     eq_table: &[F128],
 ) -> Vec<F128> {
-    use rayon::prelude::*;
     let n_cols = a_0.num_cols;
     debug_assert_eq!(b_0.num_cols, n_cols);
     debug_assert_eq!(eq_table.len(), a_0.num_rows);
@@ -1459,7 +1454,6 @@ fn sparse_row_fold_alpha_batched(
 /// `(Σ c_hi·z_hi, Σ (c_hi+c_lo)·(z_hi+z_lo))` over the top-bit split. The
 /// `len()` of `c` and `z` is even; `half = len/2`.
 pub(crate) fn sumcheck_round_eval_par(c: &[F128], z: &[F128]) -> (F128, F128) {
-    use rayon::prelude::*;
     let half = c.len() / 2;
     debug_assert_eq!(z.len(), c.len());
     let (clo, chi) = c.split_at(half);
@@ -1486,7 +1480,6 @@ pub(crate) fn sumcheck_round_eval_par(c: &[F128], z: &[F128]) -> (F128, F128) {
 /// Bind the top remaining variable of `v` at challenge `r`: `v[i] ← v[i] +
 /// r·(v[i+half] + v[i])` for `i ∈ [0, half)`, then truncate to `half`. In-place.
 pub(crate) fn sumcheck_bind_top_in_place_par(v: &mut Vec<F128>, r: F128) {
-    use rayon::prelude::*;
     let half = v.len() / 2;
     if half < SUMCHECK_PAR_THRESHOLD {
         for i in 0..half {
@@ -1534,7 +1527,6 @@ pub(crate) fn sumcheck_bind_both_and_eval_next(
     z: &mut Vec<F128>,
     r: F128,
 ) -> (F128, F128) {
-    use rayon::prelude::*;
     let len = comb.len();
     debug_assert_eq!(z.len(), len);
     let half = len / 2;

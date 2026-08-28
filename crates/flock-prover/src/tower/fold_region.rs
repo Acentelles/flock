@@ -22,16 +22,16 @@ pub(super) struct ClaimLoc {
 /// bridge, mus, row rounds and output value.
 pub(super) struct FoldLoc {
     pub(super) claims: Vec<ClaimLoc>,
-    pub(super) lam_ch0: usize,
+    lam_ch0: usize,
     pub(super) col_v: usize,
-    pub(super) col_ch0: usize,
+    col_ch0: usize,
     pub(super) k_col: usize,
-    pub(super) bridge_v: usize,
-    pub(super) mu_ch0: usize,
-    pub(super) row_v: usize,
-    pub(super) row_ch0: usize,
+    bridge_v: usize,
+    mu_ch0: usize,
+    row_v: usize,
+    row_ch0: usize,
     pub(super) k_row: usize,
-    pub(super) out_v: usize,
+    out_v: usize,
 }
 
 /// (public index, fold, row side, h) of one boundary-expanded low-fold eq
@@ -748,16 +748,16 @@ pub(super) struct JaggedFoldLoc {
     /// The group's `(k_row, n_claims)` shape header word.
     pub(super) hdr_v: usize,
     pub(super) claims: Vec<JClaimLoc>,
-    pub(super) lam_ch0: usize,
+    lam_ch0: usize,
     pub(super) col_v: usize,
-    pub(super) col_ch0: usize,
+    col_ch0: usize,
     pub(super) n_col: usize,
-    pub(super) bridge_v: usize,
-    pub(super) mu_ch0: usize,
-    pub(super) row_v: usize,
-    pub(super) row_ch0: usize,
+    bridge_v: usize,
+    mu_ch0: usize,
+    row_v: usize,
+    row_ch0: usize,
     pub(super) k_row: usize,
-    pub(super) out_v: usize,
+    out_v: usize,
 }
 
 /// The jagged groups' op tape: per key, the group label + digest payload,

@@ -11,7 +11,6 @@
 //! coordinate bit and removes only `k - 1` variables from the extension table.
 
 use super::*;
-use rayon::prelude::*;
 
 /// Split extension values into the base-field table `g(b, x)`, with adjacent
 /// `(b=0, b=1)` values for every `x`.

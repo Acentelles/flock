@@ -37,6 +37,7 @@ use crate::merkle::{self, Hash, HashKind};
 use crate::ntt::additive_ntt_f128::AdditiveNttF128;
 use crate::pcs::LOG_PACKING;
 use crate::pcs::stratified;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 pub(crate) mod extension;
@@ -2563,7 +2564,6 @@ pub(crate) fn induce_sumcheck_evaluate_at_residual(
     yr_log_n: usize,
 ) -> Vec<F128> {
     use crate::lincheck::build_eq_table;
-    use rayon::prelude::*;
     assert_eq!(ris_for_basis.len() + yr_log_n, log_msg_cols);
     let n_queries = queries.len();
     let yr_len = 1usize << yr_log_n;
@@ -2681,7 +2681,6 @@ pub fn induce_sumcheck_poly(
     queries: &[usize],
     alpha: &[F128],
 ) -> (Vec<F128>, F128) {
-    use rayon::prelude::*;
     let n = 1usize << log_msg_cols;
     let n_queries = queries.len();
     assert_eq!(opened_rows.len(), n_queries);
@@ -2774,7 +2773,6 @@ pub fn induce_sumcheck_poly(
 /// `s=a+b; top=s; bot=t·s+b`, applied in **reverse** layer order. (Baseline:
 /// one parallel sweep per layer.)
 fn transpose_forward_ntt(ntt: &AdditiveNttF128, data: &mut [F128], log_d: usize) {
-    use rayon::prelude::*;
     debug_assert_eq!(data.len(), 1usize << log_d);
     debug_assert!(log_d <= ntt.log_domain_size());
     let n_threads = rayon::current_num_threads().max(1);
@@ -2926,7 +2924,6 @@ fn transpose_forward_ntt_sparse(
     values: &[F128],
     log_d: usize,
 ) -> Vec<F128> {
-    use rayon::prelude::*;
     use std::collections::HashMap;
     let n = 1usize << log_d;
     // No prefix for small domains — just scatter + full dense transpose.
@@ -3202,7 +3199,6 @@ impl RoundQuad {
 /// Uses a SINGLE combined basis poly. (Previously took `&[Vec<F128>]` and
 /// summed at every pair index; collapsing to one basis happens at glue time.)
 fn round_msg_lsb(f: &[F128], b: &[F128]) -> SumcheckMessage {
-    use rayon::prelude::*;
     let n = f.len();
     debug_assert!(n.is_power_of_two() && n >= 2);
     debug_assert_eq!(b.len(), n);
@@ -3252,7 +3248,6 @@ fn round_msg_lsb(f: &[F128], b: &[F128]) -> SumcheckMessage {
 /// pair. Bit-identical to the unfused path: F128 sums are exact and order-
 /// independent, so `y == mle_eval_inline(f, z)`.
 fn round_msg_and_eval_lsb(f: &[F128], b: &[F128]) -> (SumcheckMessage, F128) {
-    use rayon::prelude::*;
     let n = f.len();
     debug_assert!(n.is_power_of_two() && n >= 2);
     debug_assert_eq!(b.len(), n);
@@ -3294,7 +3289,6 @@ fn round_msg_and_eval_lsb(f: &[F128], b: &[F128]) -> (SumcheckMessage, F128) {
 /// ordinary LSB order; `d > 1` pairs corresponding entries in adjacent
 /// `d`-word blocks, as required by a lane-major L0 fold.
 fn round_msg_and_eval_blocked(f: &[F128], b: &[F128], d: usize) -> (SumcheckMessage, F128) {
-    use rayon::prelude::*;
     debug_assert!(d.is_power_of_two());
     debug_assert_eq!(f.len(), b.len());
     debug_assert!(f.len().is_multiple_of(2 * d));
@@ -3329,7 +3323,6 @@ fn round_msg_and_eval_blocked(f: &[F128], b: &[F128], d: usize) -> (SumcheckMess
 /// production path uses `fold_and_msg_lsb` instead.
 #[cfg(test)]
 fn partial_eval_lsb_one(evals: &mut Vec<F128>, r: F128) {
-    use rayon::prelude::*;
     let n = evals.len();
     debug_assert!(n.is_power_of_two() && n >= 2);
     let half = n / 2;
@@ -3371,7 +3364,6 @@ fn partial_eval_lsb_one(evals: &mut Vec<F128>, r: F128) {
 /// (folded_f, folded_b)`. Bit-identical to the unfused sequence.
 fn fold_and_msg_lsb(f: &[F128], b: &[F128], r: F128) -> (Vec<F128>, Vec<F128>, SumcheckMessage) {
     use crate::field::F256Unreduced;
-    use rayon::prelude::*;
     let n = f.len();
     debug_assert!(n.is_power_of_two() && n >= 2);
     debug_assert_eq!(b.len(), n);
@@ -3596,7 +3588,6 @@ pub(crate) fn round_msg_eval_and_lookahead(
     f: &[F128],
     b: &[F128],
 ) -> (SumcheckMessage, F128, FoldLookahead) {
-    use rayon::prelude::*;
     debug_assert_eq!(f.len(), b.len());
     debug_assert!(f.len() >= 4 && f.len().is_multiple_of(4));
     // 9 accumulators: the 8 lookahead slots + the odd dot (y = u_0 + odd).
@@ -3640,7 +3631,6 @@ fn fold1_lookahead_lsb(
     b: &[F128],
     r: F128,
 ) -> (Vec<F128>, Vec<F128>, SumcheckMessage, FoldLookahead) {
-    use rayon::prelude::*;
     let n = f.len();
     debug_assert_eq!(b.len(), n);
     let half = n / 2;
@@ -3697,7 +3687,6 @@ fn fold2_lookahead_lsb(
     r_a: F128,
     r_b: F128,
 ) -> (Vec<F128>, Vec<F128>, SumcheckMessage, FoldLookahead) {
-    use rayon::prelude::*;
     let n = f.len();
     debug_assert_eq!(b.len(), n);
     let quarter = n / 4;
@@ -3751,7 +3740,6 @@ fn fold2_lookahead_lsb(
 /// Fold both arrays by `r` with NO message computation (write-only drain for
 /// a pending lookahead challenge at the end of an odd-length schedule).
 fn fold_pair_no_msg(f: &[F128], b: &[F128], r: F128) -> (Vec<F128>, Vec<F128>) {
-    use rayon::prelude::*;
     let n = f.len();
     debug_assert_eq!(b.len(), n);
     let half = n / 2;
@@ -3803,8 +3791,6 @@ fn fold_and_msg_blocked(
     d: usize,
     live_in: usize,
 ) -> (Vec<F128>, Vec<F128>, SumcheckMessage) {
-    use rayon::prelude::*;
-
     if d == 1 {
         return fold_and_msg_lsb(f, b, r);
     }
@@ -3970,8 +3956,6 @@ fn fold_and_msg_blocked_jit(
     d: usize,
     live_in: usize,
 ) -> (Vec<F128>, Vec<F128>, SumcheckMessage) {
-    use rayon::prelude::*;
-
     let n = f.len();
     debug_assert!(d.is_power_of_two() && n.is_power_of_two() && n >= 2 * d);
     let half = n / 2;
@@ -4183,7 +4167,6 @@ fn round_msg_and_eval_eq_point_blocked(
     point: &[F128],
     d: usize,
 ) -> (SumcheckMessage, F128) {
-    use rayon::prelude::*;
     debug_assert_eq!(f.len(), 1usize << point.len());
     debug_assert!(f.len().is_multiple_of(2 * d));
     let eq = VirtualEqTerm::new(point.to_vec(), F128::ONE);
@@ -4223,7 +4206,6 @@ pub(crate) fn round_msg_eval_and_lookahead_eq_point_blocked(
     point: &[F128],
     d: usize,
 ) -> (SumcheckMessage, F128, FoldLookahead) {
-    use rayon::prelude::*;
     debug_assert_eq!(f.len(), 1usize << point.len());
     debug_assert!(d.is_power_of_two() && f.len().is_multiple_of(4 * d));
     let eq = VirtualEqTerm::new(point.to_vec(), F128::ONE);

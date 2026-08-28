@@ -37,6 +37,7 @@ pub use ring_switch::{RingSwitchProof, SparseEqTensor};
 use crate::challenger::Challenger;
 use crate::field::{F128, F256};
 use crate::zerocheck::PaddingSpec;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 /// Batched opening proof: ring-switching frontend + Ligerito backend.
@@ -489,7 +490,6 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
     }
 
     let t = std::time::Instant::now();
-    use rayon::prelude::*;
 
     let l = if let Some((_, out)) = rs_results.first() {
         out.rs_eq_ind.len()
@@ -1038,8 +1038,6 @@ fn sparse_scatter_add_parallel(
     eq: &SparseEqTensor,
     gamma: F128,
 ) -> (F128, F128) {
-    use rayon::prelude::*;
-
     let c_total = eq.live_tensor.len();
     if c_total == 0 {
         return (F128::ZERO, F128::ZERO);
