@@ -40,7 +40,7 @@ use flock_core::challenger::Challenger;
 use flock_core::field::F128;
 
 use super::hash_to_point_slots::{
-    centering_position, gate_position, COUNTER_BITS, SLOTS, SLOT_BASE, SLOT_STRIDE,
+    COUNTER_BITS, SLOT_BASE, SLOT_STRIDE, SLOTS, centering_position, gate_position,
 };
 
 /// log2 of the padded slot domain (612 slots in 1,024).
@@ -113,7 +113,12 @@ pub fn eval_mle(table: &[F128], point: &[F128]) -> F128 {
 /// them through the packed-direct opening layer).
 ///
 /// Padding slots get gate 0 and neutral 1 elsewhere.
-pub fn factor_tables(block: &[bool], words: &[u16; SLOTS], gamma: F128, beta: F128) -> Vec<Vec<F128>> {
+pub fn factor_tables(
+    block: &[bool],
+    words: &[u16; SLOTS],
+    gamma: F128,
+    beta: F128,
+) -> Vec<Vec<F128>> {
     let domain = 1 << SLOT_VARS;
     let beta_powers = frobenius_powers(beta, COUNTER_BITS);
     let gamma_powers: Vec<F128> = {
@@ -332,7 +337,9 @@ mod tests {
             lo: 0x1234_5678_9abc,
             hi: 0x42,
         };
-        let table: Vec<F128> = (0..512_u64).map(|j| small(j.wrapping_mul(97) ^ 5)).collect();
+        let table: Vec<F128> = (0..512_u64)
+            .map(|j| small(j.wrapping_mul(97) ^ 5))
+            .collect();
         let mut direct = F128::ZERO;
         let mut power = F128::ONE;
         for &c in &table {

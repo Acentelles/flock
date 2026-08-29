@@ -127,10 +127,19 @@ table to the gated slot outputs with soundness about `611 / 2^128` per
 `beta` (the difference is a univariate of degree at most 611 in
 `beta`); the `gamma` combination adds the usual bit-plane union term.
 Stability and ordering need no extra argument: counters are forced by
-the R1CS to increment exactly on accepted slots from a chained start,
-so accepted slots hit indices `0..512` in order. Remaining machinery:
-a degree-12 product sumcheck (new, but structurally the aerie harness's
-two-factor sumcheck generalized) and the counter chaining below.
+the R1CS to increment exactly on accepted slots from a structural zero,
+so gated slots hit indices `0..512` in order.
+
+PROTOTYPED in `r1cs_hashes/hash_to_point_scatter.rs`: the degree-12
+product sumcheck, both identities, the factor tables from a real record
+witness, and the dense side as one MLE opening, with tamper tests. A
+load-bearing simplification found on the way: XOR of 0/1 values IS the
+field sum in characteristic 2, so the MLE of any XOR-of-wires table is
+the F128-linear combination of wire MLEs; the symbolic counter and
+residue bits never need materializing, and every factor terminal is a
+public-weighted linear functional of the committed witness. The
+remaining integration is discharging those terminals through the
+packed-direct/lincheck opening layer instead of direct evaluation.
 `C_H` for the aerie fingerprint is then either a second small
 commitment of the region or a sub-cube opening; decide by measurement
 (work item 4).
@@ -158,8 +167,11 @@ commitment of the region or a sub-cube opening; decide by measurement
    constraint rows would NOT verify). Remaining: the write-gate wire
    for the scatter and the full-record differential against
    `falcon::preprocess::hash_to_point_public_raw`.
-4. `Z_H` region plus copy link (Section 3.3); pick dedicated commitment
-   versus sub-cube opening by measured proof bytes and verifier time.
+4. `Z_H` region plus copy link (Section 3.3): the scatter argument is
+   PROTOTYPED (sumcheck, identities, factor tables, tamper tests);
+   remaining: terminal discharge through the packed-direct/lincheck
+   opening layer, and the dedicated-commitment versus sub-cube-opening
+   decision by measured proof bytes and verifier time.
 5. Implement aerie's `BinaryHashBackend` for the assembled system, with
    the `observe_bytes` seam and the fingerprint opening via
    `ring_switch::prove_batched`.
