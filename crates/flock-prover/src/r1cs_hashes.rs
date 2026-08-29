@@ -14,6 +14,9 @@ pub mod blake3;
 /// [`ChainLayout`]: chain_common::ChainLayout
 pub mod chain_common;
 pub mod common;
+/// The aerie private-salt stable-compaction scatter argument (prototype);
+/// see `AERIE-ADAPTER.md` Section 3.3.
+pub mod hash_to_point_scatter;
 /// Candidate-slot R1CS for the aerie private-salt HashToPoint relation; see
 /// `AERIE-ADAPTER.md`.
 pub mod hash_to_point_slots;
