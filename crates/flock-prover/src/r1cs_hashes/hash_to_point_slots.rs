@@ -16,15 +16,15 @@
 //! symbolically into row taps (the SHA-2 encoder's discipline). Full-adder
 //! carries cost one row each via `maj(p, s, c) = (p ^ c)(s ^ c) ^ c`.
 //!
-//! Wires whose values the relation FORCES (rather than defines) live in the
-//! forced-zero set: [`forced_zero_positions`]. Their rows define them as the
-//! violated quantity, and the claim layer must check the openings of those
-//! positions are zero, exactly like the constant-wire pin
-//! (`docs/const-wire-pin.md`) but with target value 0. [`pins_are_zero`] is
-//! the satisfies-level stand-in. The forced pins are, per slot: the
-//! subtraction bits 14 and 15 of `x - M` (so `a` fits 14 bits), the final
-//! borrow (so `x >= M`), `t_4` of `3 q` (so `q <= 5`), and the range flag
-//! (so `a < 12,289`).
+//! Values the relation FORCES (rather than defines) use self-referential
+//! rows: `(expr ^ w)(1) = w` holds exactly when `expr = 0`, with `w` left
+//! free (witness 0). The zerocheck itself enforces these, so no claim-level
+//! pin machinery is needed and `C_0 = I` is preserved (the generic verifier
+//! converts the c-claim to a z-claim under that assumption). The forced
+//! zeros are, per slot: the subtraction bits 14 and 15 of `x - M` (so `a`
+//! fits 14 bits), the final borrow (so `x >= M`), `t_4` of `3 q` (so
+//! `q <= 5`), and the range flag (so `a < 12,289`). The constant-one wire
+//! still uses the upstream `const_pin`.
 //!
 //! ## Layout (K_LOG = 13, 8,192 wires per block)
 //!
@@ -154,6 +154,12 @@ impl Builder {
     fn define(&mut self, w: usize, lin: &Lin) {
         self.product(w, lin, &constant_one());
     }
+
+    /// Forced zero: `(lin ^ z_w)(1) = z_w` is satisfiable exactly when
+    /// `lin = 0`; the zerocheck enforces it and `z_w` stays free (0).
+    fn force_zero(&mut self, w: usize, lin: &Lin) {
+        self.product(w, &lin_xor(lin, &wire(w)), &constant_one());
+    }
 }
 
 /// One maj-form carry step: appends the product row for
@@ -258,13 +264,13 @@ fn build_matrices() -> (SparseBinaryMatrix, SparseBinaryMatrix) {
         let range = constant_add_chain(&mut builder, base + R_CHAIN, RANGE_K, 14, |i| {
             a_bits[i].clone()
         });
-        builder.define(base + PIN_RANGE, &range);
-        builder.define(base + PIN_A14, &a_bits[14]);
-        builder.define(base + PIN_A15, &a_bits[15]);
-        builder.define(base + PIN_B16, &borrow);
+        builder.force_zero(base + PIN_RANGE, &range);
+        builder.force_zero(base + PIN_A14, &a_bits[14]);
+        builder.force_zero(base + PIN_A15, &a_bits[15]);
+        builder.force_zero(base + PIN_B16, &borrow);
         // t_4 is the SYMBOLIC carry e4 (product xor e3), not the raw product
-        // wire, so it needs its own materialized pin.
-        builder.define(base + PIN_T4, &e4);
+        // wire; forcing it zero is the q <= 5 range bound.
+        builder.force_zero(base + PIN_T4, &e4);
 
         // Counter increment by the accept flag: h_0 = acc,
         // h_{i+1} = cnt_i & h_i, cnt_i' = cnt_i ^ h_i.
@@ -289,35 +295,90 @@ fn build_matrices() -> (SparseBinaryMatrix, SparseBinaryMatrix) {
     (to_matrix(builder.a), to_matrix(builder.b))
 }
 
-/// Wires the claim layer must force to zero, in block-local coordinates.
-pub fn forced_zero_positions() -> Vec<usize> {
-    let mut positions = Vec::with_capacity(5 * SLOTS);
-    for slot in 0..SLOTS {
-        let base = SLOT_BASE + slot * SLOT_STRIDE;
-        positions.extend_from_slice(&[
-            base + PIN_RANGE,
-            base + PIN_A14,
-            base + PIN_A15,
-            base + PIN_B16,
-            base + PIN_T4,
-        ]);
-    }
-    positions
-}
-
-/// Satisfies-level stand-in for the claim-layer zero pins.
-pub fn pins_are_zero(block: &[bool]) -> bool {
-    forced_zero_positions()
-        .into_iter()
-        .all(|position| !block[position])
-}
-
 /// Block accessors for tests and the future scatter argument.
 pub fn accept_position(slot: usize) -> usize {
     SLOT_BASE + slot * SLOT_STRIDE + ACC
 }
 pub fn centering_position(slot: usize) -> usize {
     SLOT_BASE + slot * SLOT_STRIDE + U
+}
+
+/// Reusable slot-prover state: the shared block R1CS plus PCS parameters.
+///
+/// The default Ligerito profile needs `m >= 22`, so the smallest legal
+/// setup is 512 blocks (34,816 candidate slots).
+pub struct SlotSetup {
+    pub n_blocks: usize,
+    pub r1cs: BlockR1cs,
+    pub pcs_params: flock_core::pcs::PcsParams,
+}
+
+impl SlotSetup {
+    pub fn new(n_blocks: usize) -> Self {
+        let n_blocks_log = n_blocks.next_power_of_two().trailing_zeros().max(3) as usize;
+        let r1cs = build_block_r1cs(n_blocks_log);
+        let pcs_params = flock_core::pcs::PcsParams {
+            m: r1cs.m,
+            log_inv_rate: 1,
+            log_batch_size: 6,
+            profile: Default::default(),
+            merkle_hash: Default::default(),
+        };
+        Self {
+            n_blocks,
+            r1cs,
+            pcs_params,
+        }
+    }
+
+    /// Witness for `n_blocks` word blocks, zero-word blocks as padding
+    /// (valid computations with the constant wire set, as `const_pin`
+    /// requires). Counters restart at zero per block; cross-block counter
+    /// chaining is a future claim-level argument.
+    pub fn generate_witness(&self, blocks: &[[u16; SLOTS]]) -> Vec<bool> {
+        assert_eq!(blocks.len(), self.n_blocks);
+        let padded = 1usize << (self.r1cs.m - K_LOG);
+        let zero_block = [0_u16; SLOTS];
+        let mut z = Vec::with_capacity(1 << self.r1cs.m);
+        for index in 0..padded {
+            let words = blocks.get(index).unwrap_or(&zero_block);
+            let (block, _counter) =
+                build_block_witness_with(&self.r1cs.a_0, &self.r1cs.b_0, words, 0);
+            z.extend_from_slice(&block);
+        }
+        z
+    }
+
+    /// Generic matrix-driven prover over the packed witness.
+    pub fn prove_ligerito<Ch: flock_core::challenger::Challenger>(
+        &self,
+        blocks: &[[u16; SLOTS]],
+        challenger: &mut Ch,
+    ) -> (
+        flock_core::proof::R1csProofLigerito,
+        flock_core::pcs::Commitment,
+        flock_core::proof::R1csClaim,
+    ) {
+        let z = self.generate_witness(blocks);
+        let z_packed = flock_core::pcs::pack_witness(&z, self.r1cs.m);
+        crate::prover::prove_ligerito(&self.r1cs, z_packed, &self.pcs_params, challenger)
+    }
+
+    pub fn verify<Ch: flock_core::challenger::Challenger>(
+        &self,
+        commitment: &flock_core::pcs::Commitment,
+        proof: &flock_core::proof::R1csProofLigerito,
+        challenger: &mut Ch,
+    ) -> Result<flock_core::proof::R1csClaim, flock_core::verifier::VerifyError> {
+        flock_core::verifier::verify_ligerito(
+            &self.r1cs,
+            commitment,
+            proof,
+            self.r1cs.csc_lincheck_circuit(),
+            &self.pcs_params,
+            challenger,
+        )
+    }
 }
 
 pub fn build_block_r1cs(n_blocks_log: usize) -> BlockR1cs {
@@ -340,6 +401,16 @@ pub fn build_block_r1cs(n_blocks_log: usize) -> BlockR1cs {
 /// Returns the block bits and the counter value after the block.
 pub fn build_block_witness(words: &[u16; SLOTS], counter_in: u16) -> (Vec<bool>, u16) {
     let (a_0, b_0) = build_matrices();
+    build_block_witness_with(&a_0, &b_0, words, counter_in)
+}
+
+/// [`build_block_witness`] against prebuilt matrices (one build per setup).
+pub fn build_block_witness_with(
+    a_0: &SparseBinaryMatrix,
+    b_0: &SparseBinaryMatrix,
+    words: &[u16; SLOTS],
+    counter_in: u16,
+) -> (Vec<bool>, u16) {
     let mut z = vec![false; K];
     z[Z_CONST_POS] = true;
     for bit in 0..COUNTER_BITS {
@@ -420,7 +491,7 @@ mod tests {
     }
 
     #[test]
-    fn honest_block_satisfies_and_pins_are_zero() {
+    fn honest_block_satisfies() {
         let words = word_battery();
         let (block, counter) = build_block_witness(&words, 0);
         let expected = words
@@ -428,7 +499,6 @@ mod tests {
             .filter(|&&word| u32::from(word) < ACCEPT_BOUND)
             .count() as u16;
         assert_eq!(counter, expected);
-        assert!(pins_are_zero(&block));
         assert!(single_block_r1cs().satisfies(&tiled(&block)));
     }
 
@@ -465,14 +535,12 @@ mod tests {
     }
 
     #[test]
-    fn a_wrong_quotient_satisfies_rows_but_trips_the_pins() {
-        // Every non-input wire is definitional, so a witness built from a
-        // WRONG free input still satisfies all rows; the forced-zero pins
-        // are what reject it. This is exactly why they are claim-level
-        // obligations.
+    fn a_wrong_quotient_breaks_a_forced_zero_row() {
+        // Every ordinary wire is definitional, so a wrong free input still
+        // satisfies those rows; the self-referential forced-zero rows are
+        // what reject it, inside the zerocheck itself.
         let words = word_battery();
         let (mut block, _counter) = build_block_witness(&words, 0);
-        assert!(pins_are_zero(&block));
 
         // Re-derive slot 5 (an accepted word) with quotient + 1.
         let slot = 5;
@@ -482,26 +550,52 @@ mod tests {
         for i in 0..3 {
             block[base + Q + i] = (wrong_quotient >> i) & 1 == 1;
         }
-        let (a_0, b_0) = {
-            let r1cs = single_block_r1cs();
-            (r1cs.a_0, r1cs.b_0)
-        };
+        let r1cs = single_block_r1cs();
         let eval = |lin: &[usize], z: &[bool]| lin.iter().fold(false, |acc, &col| acc ^ z[col]);
         for w in SLOT_BASE..USEFUL_BITS {
             let offset = (w - SLOT_BASE) % SLOT_STRIDE;
             if offset < Q + 3 {
                 continue;
             }
-            block[w] = eval(&a_0.rows[w], &block) & eval(&b_0.rows[w], &block);
+            block[w] = eval(&r1cs.a_0.rows[w], &block) & eval(&r1cs.b_0.rows[w], &block);
         }
-        let r1cs = single_block_r1cs();
         assert!(
-            r1cs.satisfies(&tiled(&block)),
-            "definitional rows accept any free inputs"
+            !r1cs.satisfies(&tiled(&block)),
+            "the wrong quotient must break a forced-zero row"
         );
+    }
+
+    #[test]
+    fn prove_verify_ligerito_roundtrip() {
+        use flock_core::challenger::FsChallenger;
+        // 512 blocks is the smallest default-Ligerito-legal size (m = 22).
+        let n_blocks = 512;
+        let setup = SlotSetup::new(n_blocks);
+        let blocks: Vec<[u16; SLOTS]> = (0..n_blocks)
+            .map(|block| {
+                let mut words = [0_u16; SLOTS];
+                for (slot, word) in words.iter_mut().enumerate() {
+                    *word = ((block * SLOTS + slot) as u16)
+                        .wrapping_mul(9_973)
+                        .wrapping_add(211);
+                }
+                words
+            })
+            .collect();
+        let mut prover_challenger = FsChallenger::new(b"aerie-hash-to-point-slots");
+        let (proof, commitment, claim) = setup.prove_ligerito(&blocks, &mut prover_challenger);
+        let mut verifier_challenger = FsChallenger::new(b"aerie-hash-to-point-slots");
+        let verified = setup
+            .verify(&commitment, &proof, &mut verifier_challenger)
+            .expect("honest slot proof verifies");
+        assert_eq!(verified, claim);
+
+        // A domain-separated transcript must reject the same proof.
+        let mut wrong_domain = FsChallenger::new(b"aerie-hash-to-point-other");
         assert!(
-            !pins_are_zero(&block),
-            "the wrong quotient must trip a forced-zero pin"
+            setup
+                .verify(&commitment, &proof, &mut wrong_domain)
+                .is_err()
         );
     }
 }

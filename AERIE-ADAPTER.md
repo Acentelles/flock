@@ -75,11 +75,9 @@ backend; model v0 counts Booleanity rows that GF(2) gets for free):
   `M = (3q << 12) xor q` with disjoint bit ranges; only the 4-bit `3q`
   adder costs carries;
 - `x = a + M` is enforced by defining `a_i := x_i xor M_i xor c_i` with
-  the carries as maj rows; the no-overflow condition `c_16 = 0` and the
-  range flags `[a < 12,289] = 1`, `[u = (a > 6,144)]` are claim-level
-  pins: their complement wires live in a small public region the
-  verifier checks by opening, exactly the pattern the Keccak encoder
-  uses for its public endpoints;
+  the carries as maj rows; the forced conditions (no overflow, the `a`
+  range, `q <= 5`) are self-referential rows `(expr ^ w)(1) = w`,
+  enforced by the zerocheck itself with `C_0 = I` intact;
 - accept comparison `x < 61,445` as the carry-out of `x + 4,091`
   (16 maj rows); ordered stable compaction as a 10-bit running counter
   (10 maj rows) plus one write-gate AND per slot.
@@ -117,11 +115,17 @@ measurement (work item 4).
    descriptors.
 2. Sponge-chain amendment: public-XOR absorption plus the witness salt
    block (Section 3.1).
-3. Slot-relation encoder (Section 3.2): DONE at the satisfies level in
-   `r1cs_hashes/hash_to_point_slots.rs`; remaining: proving-path
-   integration (lincheck/zerocheck over the materialized matrices), the
-   claim-level forced-zero pin check, counter chaining across blocks,
-   and the full-record differential against
+3. Slot-relation encoder (Section 3.2): DONE through the generic
+   proving path in `r1cs_hashes/hash_to_point_slots.rs`. `SlotSetup`
+   wraps `prover::prove_ligerito` and `verifier::verify_ligerito`; the
+   roundtrip test proves 512 blocks (34,816 slots, `m = 22`) and
+   verifies, with domain separation rejecting. The forced-zero pins
+   became SELF-REFERENTIAL rows `(expr ^ w)(1) = w`, satisfiable
+   exactly when `expr = 0`, so the zerocheck enforces them with
+   `C_0 = I` intact and no claim-level machinery (the generic verifier
+   converts the c-claim to a z-claim assuming identity `C`, so empty-C
+   constraint rows would NOT verify). Remaining: counter chaining
+   across blocks and the full-record differential against
    `falcon::preprocess::hash_to_point_public_raw`.
 4. `Z_H` region plus copy link (Section 3.3); pick dedicated commitment
    versus sub-cube opening by measured proof bytes and verifier time.
