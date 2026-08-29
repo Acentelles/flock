@@ -76,7 +76,8 @@ const PIN_A15: usize = 86; // forced zero: subtraction bit 15
 const PIN_B16: usize = 87; // forced zero: final borrow of x - M
 const H: usize = 88; // 10 counter-increment carry products
 const PIN_T4: usize = 98; // forced zero: t_4 of 3q, so q <= 5
-const SLOT_WIRES: usize = 99;
+const GATE: usize = 99; // write gate: acc AND (count-before < 512)
+const SLOT_WIRES: usize = 100;
 
 /// Falcon rejection bound: accept exactly when `x < 5 * 12,289`.
 const ACCEPT_BOUND: u32 = 61_445;
@@ -275,6 +276,15 @@ fn build_matrices() -> (SparseBinaryMatrix, SparseBinaryMatrix) {
         // wire; forcing it zero is the q <= 5 range bound.
         builder.force_zero(base + PIN_T4, &e4);
 
+        // Write gate: acc AND (count-before-this-slot < 512). The counter
+        // never reaches 1,024 in a 612-slot record, so the condition is
+        // one bit: gate = acc * (1 ^ cnt_9).
+        builder.product(
+            base + GATE,
+            &acc,
+            &lin_xor(&counter[COUNTER_BITS - 1], &constant_one()),
+        );
+
         // Counter increment by the accept flag: h_0 = acc,
         // h_{i+1} = cnt_i & h_i, cnt_i' = cnt_i ^ h_i.
         let mut increment = acc;
@@ -304,6 +314,10 @@ pub fn accept_position(slot: usize) -> usize {
 }
 pub fn centering_position(slot: usize) -> usize {
     SLOT_BASE + slot * SLOT_STRIDE + U
+}
+/// The scatter's write gate: accepted and before the 512th acceptance.
+pub fn gate_position(slot: usize) -> usize {
+    SLOT_BASE + slot * SLOT_STRIDE + GATE
 }
 
 /// Reusable slot-prover state: the shared block R1CS plus PCS parameters.
@@ -564,6 +578,62 @@ mod tests {
             !r1cs.satisfies(&tiled(&block)),
             "the wrong quotient must break a forced-zero row"
         );
+    }
+
+    #[test]
+    fn real_shake_stream_matches_the_reference_compaction() {
+        // The full-record differential on a genuinely Falcon-framed XOF
+        // stream: SHAKE256(salt || hpk || 0x00 || 0x00 || message), 612
+        // big-endian candidates, against an independent integer reference.
+        use sha3::Shake256;
+        use sha3::digest::{ExtendableOutput, Update, XofReader};
+
+        let salt = [7_u8; 40];
+        let hpk = [42_u8; 64];
+        let mut hasher = Shake256::default();
+        hasher.update(&salt);
+        hasher.update(&hpk);
+        hasher.update(&[0x00, 0x00]);
+        hasher.update(b"hash-to-point record differential");
+        let mut reader = hasher.finalize_xof();
+        let mut words = [0_u16; SLOTS];
+        for word in words.iter_mut() {
+            let mut bytes = [0_u8; 2];
+            reader.read(&mut bytes);
+            *word = u16::from_be_bytes(bytes);
+        }
+
+        let (block, counter) = build_block_witness(&words);
+        assert!(
+            counter >= 512,
+            "612 candidates yield 512 acceptances w.h.p."
+        );
+        assert!(single_block_r1cs().satisfies(&tiled(&block)));
+
+        // Independent reference: the first 512 accepted (a, u) in order.
+        let mut reference = Vec::new();
+        for &word in &words {
+            if u32::from(word) < ACCEPT_BOUND && reference.len() < 512 {
+                let residue = u32::from(word) % FALCON_Q;
+                reference.push((residue as u16, residue > (FALCON_Q - 1) / 2));
+            }
+        }
+        assert_eq!(reference.len(), 512);
+
+        // The gated slots reproduce exactly that sequence, in order, with
+        // `a` recovered from the committed quotient wires.
+        let mut gated = Vec::new();
+        for (slot, &word) in words.iter().enumerate() {
+            if block[gate_position(slot)] {
+                let base = SLOT_BASE + slot * SLOT_STRIDE;
+                let mut quotient = 0_u16;
+                for i in 0..3 {
+                    quotient |= u16::from(block[base + Q + i]) << i;
+                }
+                gated.push((word - 12_289 * quotient, block[centering_position(slot)]));
+            }
+        }
+        assert_eq!(gated, reference);
     }
 
     #[test]
