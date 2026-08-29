@@ -11,7 +11,7 @@ description = "Protocol library and verifier for the Flock R1CS-over-GF(2) PIOP.
 # absorption and squeezes, PoW evaluations) via global relaxed atomics. Counts
 # whichever hash each component is configured with — see `hash::HashKind`. Off
 # by default; used by flock-prover's benches/verifier_hash_count.rs.
-hash-count = ["flock-transcript/hash-count"]
+hash-count = ["flock-merkle/hash-count", "flock-transcript/hash-count"]
 
 # Count F128 multiplications and inversions via global relaxed atomics, so the
 # verifier's arithmetic can be attributed per routine. Reports BOTH the native
@@ -29,6 +29,7 @@ unsound-challenger = ["flock-transcript/unsound-challenger"]
 
 [dependencies]
 flock-field = { workspace = true }
+flock-merkle = { workspace = true }
 flock-transcript = { workspace = true }
 flock-multilinear = { path = "../flock-multilinear" }
 rayon = { workspace = true }
