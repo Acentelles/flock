@@ -164,7 +164,7 @@ const _: [(); 16] = [(); core::mem::align_of::<F256>()];
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::field::mul_by_x;
+    use crate::mul_by_x;
 
     struct Rng(u64);
 

@@ -2,8 +2,10 @@
 members = [
     "crates/flock-core",
     "crates/flock-cuda-ffi",
+    "crates/flock-field",
     "crates/flock-multilinear",
     "crates/flock-prover",
+    "crates/flock-transcript",
 ]
 resolver = "2"
 
@@ -14,6 +16,8 @@ license = "MIT OR Apache-2.0"
 authors = ["Succinct Labs", "Benedikt Bunz", "William Wang"]
 
 [workspace.dependencies]
+flock-field = { path = "crates/flock-field" }
+flock-transcript = { path = "crates/flock-transcript" }
 rayon = "1.10"
 sha2 = { version = "0.10", features = ["asm"] }
 rand_core = "0.9"

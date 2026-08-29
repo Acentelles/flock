@@ -82,7 +82,7 @@ fn clmul8(a: u8, b: u8) -> u16 {
     }
     #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
     {
-        clmul8_software(a, b)
+        software::clmul8(a, b)
     }
 }
 
@@ -97,29 +97,29 @@ unsafe fn clmul8_neon(a: u8, b: u8) -> u16 {
     vgetq_lane_u16::<0>(vreinterpretq_u16_p16(prod))
 }
 
-/// Software fallback / test oracle. Used when `aes` is off, and as the
-/// cross-check oracle inside the `software_matches_neon` unit test.
-#[allow(dead_code)]
-#[inline]
-const fn clmul8_software(a: u8, b: u8) -> u16 {
-    let b16 = b as u16;
-    let mut acc: u16 = 0;
-    let mut i = 0;
-    while i < 8 {
-        if (a >> i) & 1 != 0 {
-            acc ^= b16 << i;
+#[cfg(any(test, not(all(target_arch = "aarch64", target_feature = "aes"))))]
+mod software {
+    #[inline]
+    pub(super) const fn clmul8(a: u8, b: u8) -> u16 {
+        let b16 = b as u16;
+        let mut acc: u16 = 0;
+        let mut i = 0;
+        while i < 8 {
+            if (a >> i) & 1 != 0 {
+                acc ^= b16 << i;
+            }
+            i += 1;
         }
-        i += 1;
+        acc
     }
-    acc
 }
 
 /// Reduce a polynomial of degree ≤ 14 modulo x^8 + x^4 + x^3 + x + 1.
 /// Two-step fold: first turns 15-bit input into ≤12-bit, second into ≤8-bit.
 ///
-/// Exposed `pub(crate)` so the URM shift_reduce inner kernel can reuse it.
+/// Exposed so the URM shift-reduce kernel can reuse it.
 #[inline]
-pub(crate) const fn gf8_reduce(p: u16) -> u8 {
+pub const fn gf8_reduce(p: u16) -> u8 {
     let h: u16 = p >> 8;
     let t: u16 = (p & 0xff) ^ h ^ (h << 1) ^ (h << 3) ^ (h << 4);
     let h2: u16 = t >> 8;
@@ -270,7 +270,7 @@ mod tests {
         for _ in 0..1024 {
             let a = (rng.next_u64() & 0xff) as u8;
             let b = (rng.next_u64() & 0xff) as u8;
-            assert_eq!(clmul8(a, b), clmul8_software(a, b));
+            assert_eq!(clmul8(a, b), software::clmul8(a, b));
         }
     }
 

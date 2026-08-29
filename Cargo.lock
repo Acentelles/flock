@@ -155,7 +155,9 @@ version = "0.1.0"
 dependencies = [
  "bincode",
  "blake3",
+ "flock-field",
  "flock-multilinear",
+ "flock-transcript",
  "rand_core",
  "rayon",
  "serde",
@@ -170,6 +172,13 @@ version = "0.1.0"
 dependencies = [
  "flock-core",
  "flock-prover",
+]
+
+[[package]]
+name = "flock-field"
+version = "0.1.0"
+dependencies = [
+ "serde",
 ]
 
 [[package]]
@@ -192,6 +201,18 @@ dependencies = [
  "serde",
  "sha2",
  "sha3",
+]
+
+[[package]]
+name = "flock-transcript"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "flock-field",
+ "rayon",
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]
