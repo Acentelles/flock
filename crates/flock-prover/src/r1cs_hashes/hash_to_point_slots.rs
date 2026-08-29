@@ -1,10 +1,17 @@
 //! Candidate-slot R1CS for the aerie private-salt HashToPoint relation.
 //!
-//! One block proves `SLOTS = 68` rejection-sampling candidates (one SHAKE256
-//! rate block's worth): per 16-bit candidate word `x`, the accept comparison
+//! One block proves one RECORD's worth of rejection-sampling candidates:
+//! `SLOTS = 612` (nine SHAKE256 rate blocks, the default squeeze bucket;
+//! longer buckets are separate block families). Per 16-bit candidate word
+//! `x`, the block proves the accept comparison
 //! `x < 61,445`, the decomposition `x = 12,289 q + a` with `0 <= a < 12,289`
 //! and `q <= 5`, the centering flag `u = (a > 6,144)`, and the running
-//! acceptance counter. See `AERIE-ADAPTER.md` Sections 3.2 and 3.3; the
+//! acceptance counter. Because the whole record lives in one block, the
+//! counter chains across all 612 slots inside the block, and its reset to
+//! zero is structural: there are no counter-input wires and the initial
+//! symbolic counter is the empty support. No cross-block chaining
+//! machinery is needed for the counter.
+//! See `AERIE-ADAPTER.md` Sections 3.2 and 3.3; the
 //! scatter of accepted `(a, u)` values onto the dense `Z_H` region is a
 //! claim-level argument (the counter's monotone increments make it a stable
 //! permutation) and is NOT part of this block.
@@ -26,29 +33,29 @@
 //! `q <= 5`), and the range flag (so `a < 12,289`). The constant-one wire
 //! still uses the upstream `const_pin`.
 //!
-//! ## Layout (K_LOG = 13, 8,192 wires per block)
+//! ## Layout (K_LOG = 16, 65,536 wires per block = one record)
 //!
 //! ```text
-//! 0   .. 10    counter input bits (free; block chaining is future work)
-//! 10           constant-one wire (const_pin)
-//! 16  .. 6,816 68 slots, stride 100 (see slot offsets in the code)
-//! rest         zero padding (empty rows)
+//! 0              constant-one wire (const_pin)
+//! 16 .. 61,216   612 slots, stride 100 (see slot offsets in the code)
+//! rest           zero padding (empty rows)
 //! ```
 
 use flock_core::r1cs::{BlockR1cs, SparseBinaryMatrix};
 
 use super::common::build_block_r1cs_with_matrices;
 
-pub const K_LOG: usize = 13;
+pub const K_LOG: usize = 16;
 pub const K: usize = 1 << K_LOG;
 pub const K_SKIP: usize = 6;
 
-/// Candidates per block: one SHAKE256 rate block.
-pub const SLOTS: usize = 68;
+/// Squeeze blocks in the default bucket (spec Section 4).
+pub const SQUEEZE_BLOCKS: usize = 9;
+/// Candidates per record block: nine SHAKE256 rate blocks.
+pub const SLOTS: usize = SQUEEZE_BLOCKS * 68;
 
 pub const COUNTER_BITS: usize = 10;
-pub const CNT_IN_BASE: usize = 0;
-pub const Z_CONST_POS: usize = CNT_IN_BASE + COUNTER_BITS;
+pub const Z_CONST_POS: usize = 0;
 pub const SLOT_BASE: usize = 16;
 pub const SLOT_STRIDE: usize = 100;
 pub const USEFUL_BITS: usize = SLOT_BASE + SLOTS * SLOT_STRIDE;
@@ -195,15 +202,11 @@ fn constant_add_chain(
 /// outputs (used by future chaining; also returned for tests).
 fn build_matrices() -> (SparseBinaryMatrix, SparseBinaryMatrix) {
     let mut builder = Builder::new();
-    for bit in 0..COUNTER_BITS {
-        builder.input(CNT_IN_BASE + bit);
-    }
     builder.input(Z_CONST_POS);
 
-    // Running counter, symbolic across slots.
-    let mut counter: Vec<Lin> = (0..COUNTER_BITS)
-        .map(|bit| wire(CNT_IN_BASE + bit))
-        .collect();
+    // Running counter, symbolic across all slots of the record; the reset
+    // to zero is structural (empty initial supports, no input wires).
+    let mut counter: Vec<Lin> = vec![Vec::new(); COUNTER_BITS];
 
     for slot in 0..SLOTS {
         let base = SLOT_BASE + slot * SLOT_STRIDE;
@@ -305,8 +308,8 @@ pub fn centering_position(slot: usize) -> usize {
 
 /// Reusable slot-prover state: the shared block R1CS plus PCS parameters.
 ///
-/// The default Ligerito profile needs `m >= 22`, so the smallest legal
-/// setup is 512 blocks (34,816 candidate slots).
+/// One block is one record. The default Ligerito profile needs `m >= 22`,
+/// so the smallest legal setup is 64 records (39,168 candidate slots).
 pub struct SlotSetup {
     pub n_blocks: usize,
     pub r1cs: BlockR1cs,
@@ -331,10 +334,9 @@ impl SlotSetup {
         }
     }
 
-    /// Witness for `n_blocks` word blocks, zero-word blocks as padding
+    /// Witness for `n_blocks` record blocks, zero-word blocks as padding
     /// (valid computations with the constant wire set, as `const_pin`
-    /// requires). Counters restart at zero per block; cross-block counter
-    /// chaining is a future claim-level argument.
+    /// requires). The counter reset per record is structural.
     pub fn generate_witness(&self, blocks: &[[u16; SLOTS]]) -> Vec<bool> {
         assert_eq!(blocks.len(), self.n_blocks);
         let padded = 1usize << (self.r1cs.m - K_LOG);
@@ -342,8 +344,7 @@ impl SlotSetup {
         let mut z = Vec::with_capacity(1 << self.r1cs.m);
         for index in 0..padded {
             let words = blocks.get(index).unwrap_or(&zero_block);
-            let (block, _counter) =
-                build_block_witness_with(&self.r1cs.a_0, &self.r1cs.b_0, words, 0);
+            let (block, _counter) = build_block_witness_with(&self.r1cs.a_0, &self.r1cs.b_0, words);
             z.extend_from_slice(&block);
         }
         z
@@ -399,9 +400,9 @@ pub fn build_block_r1cs(n_blocks_log: usize) -> BlockR1cs {
 /// the candidate words, the quotient bits, and the counter input.
 ///
 /// Returns the block bits and the counter value after the block.
-pub fn build_block_witness(words: &[u16; SLOTS], counter_in: u16) -> (Vec<bool>, u16) {
+pub fn build_block_witness(words: &[u16; SLOTS]) -> (Vec<bool>, u16) {
     let (a_0, b_0) = build_matrices();
-    build_block_witness_with(&a_0, &b_0, words, counter_in)
+    build_block_witness_with(&a_0, &b_0, words)
 }
 
 /// [`build_block_witness`] against prebuilt matrices (one build per setup).
@@ -409,13 +410,9 @@ pub fn build_block_witness_with(
     a_0: &SparseBinaryMatrix,
     b_0: &SparseBinaryMatrix,
     words: &[u16; SLOTS],
-    counter_in: u16,
 ) -> (Vec<bool>, u16) {
     let mut z = vec![false; K];
     z[Z_CONST_POS] = true;
-    for bit in 0..COUNTER_BITS {
-        z[CNT_IN_BASE + bit] = (counter_in >> bit) & 1 == 1;
-    }
     for (slot, &word) in words.iter().enumerate() {
         let base = SLOT_BASE + slot * SLOT_STRIDE;
         for i in 0..16 {
@@ -430,8 +427,7 @@ pub fn build_block_witness_with(
     }
     let eval = |lin: &[usize], z: &[bool]| lin.iter().fold(false, |acc, &col| acc ^ z[col]);
     for w in 0..K {
-        let is_input = w < CNT_IN_BASE + COUNTER_BITS
-            || w == Z_CONST_POS
+        let is_input = w == Z_CONST_POS
             || (w >= SLOT_BASE && {
                 let offset = (w - SLOT_BASE) % SLOT_STRIDE;
                 (w - SLOT_BASE) / SLOT_STRIDE < SLOTS && offset < Q + 3
@@ -443,7 +439,7 @@ pub fn build_block_witness_with(
     }
 
     // Differential against the integer reference semantics.
-    let mut counter = counter_in;
+    let mut counter = 0_u16;
     for (slot, &word) in words.iter().enumerate() {
         let accept = u32::from(word) < ACCEPT_BOUND;
         let residue = u32::from(word) % FALCON_Q;
@@ -464,6 +460,7 @@ mod tests {
     use super::*;
 
     fn word_battery() -> [u16; SLOTS] {
+        // 612 words: the boundary edges first, pseudo-random fill after.
         let mut words = [0_u16; SLOTS];
         let edges = [
             0_u16, 1, 6_144, 6_145, 12_288, 12_289, 24_577, 36_866, 49_155, 61_444, 61_445, 61_446,
@@ -493,7 +490,7 @@ mod tests {
     #[test]
     fn honest_block_satisfies() {
         let words = word_battery();
-        let (block, counter) = build_block_witness(&words, 0);
+        let (block, counter) = build_block_witness(&words);
         let expected = words
             .iter()
             .filter(|&&word| u32::from(word) < ACCEPT_BOUND)
@@ -503,20 +500,24 @@ mod tests {
     }
 
     #[test]
-    fn counter_chains_across_blocks() {
+    fn counter_counts_all_record_slots() {
         let words = word_battery();
-        let (_block, counter) = build_block_witness(&words, 100);
+        let (block, counter) = build_block_witness(&words);
         let accepted = words
             .iter()
             .filter(|&&word| u32::from(word) < ACCEPT_BOUND)
             .count() as u16;
-        assert_eq!(counter, 100 + accepted);
+        assert_eq!(counter, accepted);
+        // Honest random words accept at rate 61,445/65,536, so a full
+        // record's 612 slots always clear 512 acceptances here.
+        assert!(counter >= 512);
+        let _ = block;
     }
 
     #[test]
     fn tampered_wires_fail_satisfies() {
         let words = word_battery();
-        let (block, _counter) = build_block_witness(&words, 0);
+        let (block, _counter) = build_block_witness(&words);
         let r1cs = single_block_r1cs();
         for position in [
             accept_position(0),
@@ -540,7 +541,7 @@ mod tests {
         // satisfies those rows; the self-referential forced-zero rows are
         // what reject it, inside the zerocheck itself.
         let words = word_battery();
-        let (mut block, _counter) = build_block_witness(&words, 0);
+        let (mut block, _counter) = build_block_witness(&words);
 
         // Re-derive slot 5 (an accepted word) with quotient + 1.
         let slot = 5;
@@ -568,8 +569,8 @@ mod tests {
     #[test]
     fn prove_verify_ligerito_roundtrip() {
         use flock_core::challenger::FsChallenger;
-        // 512 blocks is the smallest default-Ligerito-legal size (m = 22).
-        let n_blocks = 512;
+        // 64 records is the smallest default-Ligerito-legal size (m = 22).
+        let n_blocks = 64;
         let setup = SlotSetup::new(n_blocks);
         let blocks: Vec<[u16; SLOTS]> = (0..n_blocks)
             .map(|block| {

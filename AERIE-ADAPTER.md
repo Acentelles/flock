@@ -99,14 +99,41 @@ against these measured counts.
 
 ### 3.3 The `Z_H` output region and copy link
 
-A dedicated aligned region per record (the `state_24` slot pattern:
-byte-contiguous, `2^region_log`-aligned, zero-padded) holding the
-`512 x 15` packed target bits. The compaction write gates pin the region
-to the accepted candidates' `(a, u)` bits, which is the aerie spec's
-Section 5.2 copy link. `C_H` for the fingerprint is then either a second
-small commitment of this region alone or a sub-cube opening of the main
-witness at Boolean prefix coordinates selecting the region; decide by
-measurement (work item 4).
+A dedicated aligned region per record holding the `512 x 15` packed
+target bits, linked to the slot blocks by a SCATTER argument rather
+than R1CS multiplexer rows (which would cost about `612 x 512` selector
+products per record). The counter's monotone increments make the
+scatter a stable permutation, and one identity makes it one sumcheck:
+
+- Slot side: in characteristic 2,
+  `beta^count = prod_b (1 + count_b (beta^(2^b) + 1))`, LINEAR in each
+  committed counter bit. With a bit-combining challenge `gamma`, the
+  slot fingerprint
+  `S(beta) = sum_s gate_s * val_s(gamma) * beta^(count_s)` is a product
+  sumcheck over slots with 12 multilinear factors (the write gate, ten
+  counter factors, the gamma-combined value), so degree 12 per round.
+  The gate is `acc_s * (1 xor cnt_bit_9)`: honest records accept more
+  than 512 of their 612 candidates (the battery test pins this), so
+  writes must stop at the 512th acceptance, and with the counter below
+  1,024 the condition `count < 512` is one bit.
+- Dense side: the power sum `sum_j Z[j] beta^j` equals
+  `prod_b (1 + beta^(2^b)) * MLE_Z(x)` at the derived point
+  `x_b = beta^(2^b) / (1 + beta^(2^b))` (defined whenever
+  `beta^(2^b) != 1`), i.e. ONE extra MLE opening of the `Z_H` region at
+  a public point.
+
+Equality of the two sides at a post-commitment `beta` binds the dense
+table to the gated slot outputs with soundness about `611 / 2^128` per
+`beta` (the difference is a univariate of degree at most 611 in
+`beta`); the `gamma` combination adds the usual bit-plane union term.
+Stability and ordering need no extra argument: counters are forced by
+the R1CS to increment exactly on accepted slots from a chained start,
+so accepted slots hit indices `0..512` in order. Remaining machinery:
+a degree-12 product sumcheck (new, but structurally the aerie harness's
+two-factor sumcheck generalized) and the counter chaining below.
+`C_H` for the aerie fingerprint is then either a second small
+commitment of the region or a sub-cube opening; decide by measurement
+(work item 4).
 
 ## 4. Work items, in order
 
@@ -116,16 +143,20 @@ measurement (work item 4).
 2. Sponge-chain amendment: public-XOR absorption plus the witness salt
    block (Section 3.1).
 3. Slot-relation encoder (Section 3.2): DONE through the generic
-   proving path in `r1cs_hashes/hash_to_point_slots.rs`. `SlotSetup`
-   wraps `prover::prove_ligerito` and `verifier::verify_ligerito`; the
-   roundtrip test proves 512 blocks (34,816 slots, `m = 22`) and
+   proving path in `r1cs_hashes/hash_to_point_slots.rs`, restructured
+   to ONE RECORD PER BLOCK (`K_LOG = 16`, 612 slots, 93% utilization):
+   the counter chains across the whole record inside the block and its
+   zero reset is structural (no counter-input wires), so cross-block
+   counter chaining machinery is unnecessary. `SlotSetup` wraps
+   `prover::prove_ligerito` and `verifier::verify_ligerito`; the
+   roundtrip test proves 64 records (39,168 slots, `m = 22`) and
    verifies, with domain separation rejecting. The forced-zero pins
    became SELF-REFERENTIAL rows `(expr ^ w)(1) = w`, satisfiable
    exactly when `expr = 0`, so the zerocheck enforces them with
    `C_0 = I` intact and no claim-level machinery (the generic verifier
    converts the c-claim to a z-claim assuming identity `C`, so empty-C
-   constraint rows would NOT verify). Remaining: counter chaining
-   across blocks and the full-record differential against
+   constraint rows would NOT verify). Remaining: the write-gate wire
+   for the scatter and the full-record differential against
    `falcon::preprocess::hash_to_point_public_raw`.
 4. `Z_H` region plus copy link (Section 3.3); pick dedicated commitment
    versus sub-cube opening by measured proof bytes and verifier time.
