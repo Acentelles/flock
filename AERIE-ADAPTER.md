@@ -187,12 +187,25 @@ commitment of the region or a sub-cube opening; decide by measurement
    bits, beta over index bits, gamma over coordinate bits).
    `hash_to_point_record::{prove_record, verify_record}` assemble the
    slot R1CS (zerocheck + lincheck through the generic path), the
-   scatter, its discharge, the `Z_H` binding identity, the fifteen
-   aerie-fingerprint sub-cube openings (their theta-weighted sum is
-   `MLE_K(Z_H, r)`), and ONE batched opening carrying the base
-   `[ab, c]` quirky claims plus all 57 multilinear claims through the
-   new `LowBinding` seam. Roundtrip and tamper tests pass at 32 records
-   (`m = 22`).
+   scatter, the `Z_H` binding identity, the fifteen aerie-fingerprint
+   sub-cube openings (their theta-weighted sum is `MLE_K(Z_H, r)`), and
+   ONE batched opening carrying the base `[ab, c]` quirky claims plus
+   all 57 multilinear claims through the new `LowBinding` seam.
+   Roundtrip and tamper tests pass at 32 records (`m = 22`).
+
+   Post-bench optimization pass (first host numbers: 28-31 ms/record,
+   flat 15 ms verify, ~400 KB log-growth proofs): materializing the ten
+   counter-AFTER bits as planes made every counter tap O(1) instead of
+   O(slot) AND deleted the GT discharge entirely, because on gated
+   slots `beta^(count-before) = beta^(-1) beta^(count-after)` and
+   count-after lives in same-slot planes, so the counter factors are
+   plain sub-cube openings at the scatter point (the binding identity
+   gains one factor of beta). Claim values now evaluate over gathered
+   sub-cubes instead of the dense witness. Same-machine A/B at 32
+   records: prove 4,611 -> 1,231 ms; witness generation needs a
+   dependency-aware order for the counter family (H(s) taps CNT(s-1),
+   CNT(s) taps H(s)). The remaining prover dominator is the degree-13
+   scatter sumcheck (42%), ordinary sumcheck engineering.
 5. Implement aerie's `BinaryHashBackend` for the assembled system: the
    flock-side engine is `prove_record`/`verify_record` (commitment,
    relation minus the sponge lane, fingerprint value at a

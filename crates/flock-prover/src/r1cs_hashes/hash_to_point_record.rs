@@ -49,6 +49,51 @@ pub fn flock_claim_shape(point_msb: &[F128]) -> ([F128; 7], Vec<F128>) {
     (x_low, x_outer)
 }
 
+/// Bit-MLE evaluation that folds Boolean coordinates by index selection
+/// (a gather over the sub-cube) and only the non-Boolean coordinates
+/// arithmetically. The record-lane claims all fix their plane bits, so
+/// this is orders of magnitude cheaper than the dense fold.
+pub fn bit_mle_fast(bits: &[bool], point_msb: &[F128]) -> F128 {
+    let vars = point_msb.len();
+    assert_eq!(bits.len(), 1 << vars);
+    // Partition coordinates: var i (MSB-first) controls address bit
+    // (vars - 1 - i). Boolean coords contribute a fixed address offset;
+    // the rest form the gathered sub-cube, order preserved.
+    let mut fixed_offset = 0_usize;
+    let mut free: Vec<(usize, F128)> = Vec::new();
+    for (i, &coord) in point_msb.iter().enumerate() {
+        let bit = vars - 1 - i;
+        if coord == F128::ZERO {
+            // contributes nothing
+        } else if coord == F128::ONE {
+            fixed_offset |= 1 << bit;
+        } else {
+            free.push((bit, coord));
+        }
+    }
+    let free_vars = free.len();
+    let mut layer = vec![F128::ZERO; 1 << free_vars];
+    for (index, slot) in layer.iter_mut().enumerate() {
+        // Sub-cube index bits map to the free address bits, MSB-first.
+        let mut address = fixed_offset;
+        for (j, &(bit, _)) in free.iter().enumerate() {
+            if (index >> (free_vars - 1 - j)) & 1 == 1 {
+                address |= 1 << bit;
+            }
+        }
+        *slot = if bits[address] { F128::ONE } else { F128::ZERO };
+    }
+    for &(_, r) in &free {
+        let half = layer.len() / 2;
+        for i in 0..half {
+            let low = layer[i];
+            layer[i] = low + r * (low + layer[half + i]);
+        }
+        layer.truncate(half);
+    }
+    layer[0]
+}
+
 /// Direct MSB-first bit-MLE evaluation of a boolean table (reference and
 /// prover-side claim values).
 pub fn bit_mle(bits: &[bool], point_msb: &[F128]) -> F128 {
@@ -154,6 +199,24 @@ mod tests {
     }
 
     #[test]
+    fn fast_bit_mle_matches_the_dense_fold() {
+        let bits: Vec<bool> = (0..1_u64 << 12)
+            .map(|i| i.wrapping_mul(0x9E37_79B9) & 64 != 0)
+            .collect();
+        // Mixed Boolean and field coordinates in several patterns.
+        for seed in 0..4_u64 {
+            let point: Vec<F128> = (0..12_u64)
+                .map(|i| match (i + seed) % 3 {
+                    0 => F128::ZERO,
+                    1 => F128::ONE,
+                    _ => small(i * 977 + seed * 131 + 5),
+                })
+                .collect();
+            assert_eq!(bit_mle_fast(&bits, &point), bit_mle(&bits, &point));
+        }
+    }
+
+    #[test]
     fn record_proof_roundtrips_and_rejects_tampering() {
         // The complete record lane against real commitments: slot R1CS,
         // scatter, discharge, Z_H binding, one batched opening. Coverage
@@ -173,9 +236,9 @@ mod tests {
         let mut fresh = FsChallenger::new(b"aerie-record-proof");
         assert!(verify_record(&setup, &wrong, &mut fresh).is_err());
 
-        // A tampered counter claim breaks the discharge.
+        // A tampered counter-plane opening breaks the terminal.
         let mut wrong = proof.clone();
-        wrong.counter_claims[2] += F128::ONE;
+        wrong.opening_values[35] += F128::ONE;
         let mut fresh = FsChallenger::new(b"aerie-record-proof");
         assert!(verify_record(&setup, &wrong, &mut fresh).is_err());
 
@@ -282,14 +345,6 @@ fn frobenius(base: F128, bits: usize) -> Vec<F128> {
     powers
 }
 
-/// eq of two extension points (MSB-first, equal lengths).
-fn eq_points(a: &[F128], b: &[F128]) -> F128 {
-    assert_eq!(a.len(), b.len());
-    a.iter().zip(b).fold(F128::ONE, |acc, (&x, &y)| {
-        acc * (x * y + (F128::ONE + x) * (F128::ONE + y))
-    })
-}
-
 /// Per-slot value bits from the committed wires: `a_c = x_c ^ M_c ^ b_c`
 /// with `M` from the quotient wires and `b` the borrow prefix parity.
 fn slot_residue_bits(z: &[bool], base: usize, slot: usize) -> [bool; 14] {
@@ -348,16 +403,19 @@ fn record_factor_tables(
                 delta_power *= power;
             }
         }
-        let mut count_before = 0_u32;
         for slot in 0..(1 << SLOT_VARS) {
             let index = (record << SLOT_VARS) | slot;
             delta_factor[index] = delta_power;
-            for (bit, factor) in counter_factors.iter_mut().enumerate() {
-                if (count_before >> bit) & 1 == 1 {
-                    factor[index] = beta_powers[bit];
-                }
-            }
             if slot < SLOTS {
+                // Counter factors from the materialized counter-AFTER
+                // wires: the plane formula everywhere, so the factor
+                // tables ARE the verifier's opening reconstruction. The
+                // beta^(-1) shift moves to the binding identity.
+                for (bit, factor) in counter_factors.iter_mut().enumerate() {
+                    if z[base + slots::counter_position(slot, bit)] {
+                        factor[index] = beta_powers[bit];
+                    }
+                }
                 if z[base + slots::gate_position(slot)] {
                     gate[index] = F128::ONE;
                 }
@@ -372,9 +430,6 @@ fn record_factor_tables(
                     val += gamma_powers[14];
                 }
                 value[index] = val;
-                if z[base + slots::accept_position(slot)] {
-                    count_before += 1;
-                }
             }
         }
     }
@@ -451,8 +506,6 @@ pub struct RecordProof {
     pub zerocheck: zerocheck::ZerocheckProof,
     pub lincheck: lincheck::LincheckProof,
     pub scatter: scatter::ScatterProof,
-    pub counter_claims: Vec<F128>,
-    pub counter_sumcheck: scatter::ScatterProof,
     /// Claimed values of the multilinear openings, in the fixed order
     /// produced by [`multilinear_points`].
     pub opening_values: Vec<F128>,
@@ -469,7 +522,6 @@ pub struct RecordProof {
 fn multilinear_points(
     record_vars: usize,
     rs: &[F128],
-    rd: &[F128],
     r_fp: &[F128],
     beta: F128,
     gamma: F128,
@@ -510,12 +562,10 @@ fn multilinear_points(
         rs,
     ));
     for bit in 0..COUNTER_BITS {
-        let source = if bit == 0 {
-            slots::accept_position(0)
-        } else {
-            slots::increment_position(0, bit - 1)
-        };
-        points.push(plane_point(slots::plane_of(source), rd));
+        points.push(plane_point(
+            slots::plane_of(slots::counter_position(0, bit)),
+            rs,
+        ));
     }
     let (zh, _scale) = zh_power_point(record_vars, beta, gamma, delta)?;
     points.push(zh);
@@ -553,7 +603,6 @@ fn multilinear_points(
 fn reconstruct_terminal(
     record_vars: usize,
     rs: &[F128],
-    counter_claims: &[F128],
     values: &[F128],
     beta: F128,
     gamma: F128,
@@ -570,8 +619,8 @@ fn reconstruct_terminal(
     let gate = values[0];
     product *= gate;
     let beta_powers = frobenius(beta, COUNTER_BITS);
-    for (bit, &claim) in counter_claims.iter().enumerate() {
-        product *= F128::ONE + (beta_powers[bit] + F128::ONE) * claim;
+    for bit in 0..COUNTER_BITS {
+        product *= F128::ONE + (beta_powers[bit] + F128::ONE) * values[33 + bit];
     }
     // Value factor from the x/q/borrow/centering openings.
     let x = &values[1..15];
@@ -606,8 +655,21 @@ pub fn prove_record<Ch: Challenger>(
 ) -> RecordProof {
     let r1cs = &setup.r1cs;
     let record_vars = r1cs.m - slots::K_LOG;
+    let trace = std::env::var("RECORD_TRACE").is_ok();
+    let mut stage = std::time::Instant::now();
+    let lap = |label: &str, stage: &mut std::time::Instant| {
+        if trace {
+            eprintln!(
+                "  [prove_record] {label}: {:7.1} ms",
+                stage.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        *stage = std::time::Instant::now();
+    };
     let z = setup.generate_witness(blocks);
+    lap("witness generation", &mut stage);
     let z_packed = pcs::pack_witness(&z, r1cs.m);
+    lap("pack_witness", &mut stage);
     let lig_config = setup
         .pcs_params
         .ligerito_prover_config()
@@ -615,6 +677,7 @@ pub fn prove_record<Ch: Challenger>(
 
     let (commitment, prover_data) = pcs::commit(&z_packed, &setup.pcs_params);
     bind_statement(challenger, r1cs, &commitment);
+    lap("commit", &mut stage);
 
     // Base R1CS: zerocheck + lincheck, exactly the generic prover's path.
     let a_packed_f128 = r1cs.apply_a_packed(&z_packed);
@@ -622,6 +685,7 @@ pub fn prove_record<Ch: Challenger>(
     let cast = |v: &[F128]| -> &[u8] {
         unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
     };
+    lap("apply a/b", &mut stage);
     let z_packed_lincheck = lincheck::pack_z_lincheck_from_packed(&z_packed, r1cs.m, r1cs.k_log);
     let padding = r1cs.padding_spec();
     let (zc_proof, zc_claim, s_hat_v_c) = zerocheck::prove_packed_padded_capture_s_hat_v_c(
@@ -654,6 +718,7 @@ pub fn prove_record<Ch: Challenger>(
         value: zc_claim.c_eval,
     };
     let s_hat_v_ab = pcs::ring_switch::s_hat_v_from_z_vec(&z_vec_pre, &lc_claim.r_inner_rest[1..]);
+    lap("zerocheck + lincheck", &mut stage);
 
     // Scatter challenges, post-commitment and post-R1CS.
     challenger.observe_label(b"aerie-record-scatter-challenges-v0");
@@ -667,99 +732,20 @@ pub fn prove_record<Ch: Challenger>(
     let r_fp = challenger.sample_f128_vec(record_vars + 9);
 
     let factors = record_factor_tables(&z, record_vars, beta, gamma, delta);
+    lap("factor tables", &mut stage);
     let (scatter_proof, rs) = scatter::prove(factors, challenger);
+    lap("scatter sumcheck", &mut stage);
 
-    // Discharge: per-bit counter claims at rs, rho-batched 2-factor
-    // sumcheck over (record, slot) with the eq (x) suffix-sum weight.
-    let (rs_rec, rs_slot) = rs.split_at(record_vars);
-    let eq_rec = {
-        let mut weights = vec![F128::ONE];
-        for &r in rs_rec {
-            let mut next = Vec::with_capacity(2 * weights.len());
-            for &w in &weights {
-                next.push(w * (F128::ONE + r));
-                next.push(w * r);
-            }
-            weights = next;
-        }
-        weights
-    };
-    let slot_weights = {
-        // w(s') = sum_{s > s'} eq(rs_slot, s).
-        let mut eq = vec![F128::ONE];
-        for &r in rs_slot {
-            let mut next = Vec::with_capacity(2 * eq.len());
-            for &w in &eq {
-                next.push(w * (F128::ONE + r));
-                next.push(w * r);
-            }
-            eq = next;
-        }
-        let mut weights = vec![F128::ZERO; eq.len()];
-        let mut suffix = F128::ZERO;
-        for s in (0..eq.len() - 1).rev() {
-            suffix += eq[s + 1];
-            weights[s] = suffix;
-        }
-        weights
-    };
-    let records = 1 << record_vars;
-    let domain = records << SLOT_VARS;
-    let mut weight_table = vec![F128::ZERO; domain];
-    for record in 0..records {
-        for slot in 0..(1 << SLOT_VARS) {
-            weight_table[(record << SLOT_VARS) | slot] = eq_rec[record] * slot_weights[slot];
-        }
-    }
-    let source_tables: Vec<Vec<F128>> = (0..COUNTER_BITS)
-        .map(|bit| {
-            let mut table = vec![F128::ZERO; domain];
-            for record in 0..records {
-                let base = record << slots::K_LOG;
-                for slot in 0..SLOTS {
-                    let position = if bit == 0 {
-                        slots::accept_position(slot)
-                    } else {
-                        slots::increment_position(slot, bit - 1)
-                    };
-                    if z[base + position] {
-                        table[(record << SLOT_VARS) | slot] = F128::ONE;
-                    }
-                }
-            }
-            table
-        })
-        .collect();
-    let counter_claims: Vec<F128> = source_tables
-        .iter()
-        .map(|table| {
-            table
-                .iter()
-                .zip(&weight_table)
-                .fold(F128::ZERO, |sum, (&v, &w)| sum + v * w)
-        })
-        .collect();
-    challenger.observe_label(b"aerie-record-discharge-v0");
-    challenger.observe_f128_slice(&counter_claims);
-    let rho = challenger.sample_f128();
-    let mut combined = vec![F128::ZERO; domain];
-    let mut power = F128::ONE;
-    for table in &source_tables {
-        for (index, &v) in table.iter().enumerate() {
-            combined[index] += power * v;
-        }
-        power *= rho;
-    }
-    let (counter_sumcheck, rd) = scatter::prove(vec![weight_table, combined], challenger);
-
-    // The single batched opening: [ab, c] plus every multilinear claim.
-    let points = multilinear_points(record_vars, &rs, &rd, &r_fp, beta, gamma, delta)
+    let points = multilinear_points(record_vars, &rs, &r_fp, beta, gamma, delta)
         .expect("derived power coordinates defined");
-    let opening_values: Vec<F128> = points.iter().map(|p| bit_mle(&z, p)).collect();
+    let opening_values: Vec<F128> = points.iter().map(|p| bit_mle_fast(&z, p)).collect();
+    lap("opening values", &mut stage);
     let mut fingerprint_value = F128::ZERO;
     for c in 0..15 {
         fingerprint_value += F128 { lo: 1 << c, hi: 0 } * opening_values[44 + c];
     }
+
+    // The single batched opening: [ab, c] plus every multilinear claim.
     let mut x_fulls: Vec<Vec<F128>> = vec![
         {
             let mut v = ab.point.x_inner_rest.clone();
@@ -793,13 +779,13 @@ pub fn prove_record<Ch: Challenger>(
         challenger,
     );
 
+    lap("batched open", &mut stage);
+
     RecordProof {
         commitment,
         zerocheck: zc_proof,
         lincheck: lc_proof,
         scatter: scatter_proof,
-        counter_claims,
-        counter_sumcheck,
         opening_values,
         fingerprint_value,
         pcs_open,
@@ -840,28 +826,6 @@ pub fn verify_record<Ch: Challenger>(
         challenger,
     )?;
 
-    if proof.counter_claims.len() != COUNTER_BITS {
-        return Err("wrong counter claim count");
-    }
-    challenger.observe_label(b"aerie-record-discharge-v0");
-    challenger.observe_f128_slice(&proof.counter_claims);
-    let rho = challenger.sample_f128();
-    let mut combined_claim = F128::ZERO;
-    let mut power = F128::ONE;
-    for &claim in &proof.counter_claims {
-        combined_claim += power * claim;
-        power *= rho;
-    }
-    if proof.counter_sumcheck.claim != combined_claim {
-        return Err("counter claims do not combine to the sumcheck claim");
-    }
-    let (rd, sub_terminal) = scatter::verify(
-        &proof.counter_sumcheck,
-        record_vars + SLOT_VARS,
-        2,
-        challenger,
-    )?;
-
     // Claimed opening values, in the fixed order.
     if proof.opening_values.len() != 59 {
         return Err("wrong opening value count");
@@ -875,46 +839,22 @@ pub fn verify_record<Ch: Challenger>(
         return Err("the fingerprint value does not match its openings");
     }
 
-    // Discharge terminal: transparent eq (x) GT weight times the
-    // rho-combined counter-source openings at rd.
-    let (rs_rec, rs_slot) = rs.split_at(record_vars);
-    let (rd_rec, rd_slot) = rd.split_at(record_vars);
-    let mut h_combined = F128::ZERO;
-    let mut power = F128::ONE;
-    for bit in 0..COUNTER_BITS {
-        h_combined += power * values[33 + bit];
-        power *= rho;
-    }
-    let weight = eq_points(rs_rec, rd_rec) * scatter::gt_mle(rs_slot, rd_slot);
-    if sub_terminal != weight * h_combined {
-        return Err("discharge terminal does not match the openings");
-    }
-
     // Scatter terminal from the claimed openings.
-    if terminal
-        != reconstruct_terminal(
-            record_vars,
-            &rs,
-            &proof.counter_claims,
-            values,
-            beta,
-            gamma,
-            delta,
-        )
-    {
+    if terminal != reconstruct_terminal(record_vars, &rs, values, beta, gamma, delta) {
         return Err("scatter terminal does not match the openings");
     }
 
-    // The Z_H binding identity: the scatter claim equals the scaled
-    // sub-cube opening of the Z region.
+    // The Z_H binding identity: the slot side carries beta^(count-after)
+    // = beta * beta^(write index) on gated slots, so the scatter claim
+    // equals beta times the scaled sub-cube opening of the Z region.
     let (_zh_point, zh_scale) =
         zh_power_point(record_vars, beta, gamma, delta).ok_or("degenerate power point")?;
-    if proof.scatter.claim != zh_scale * values[43] {
+    if proof.scatter.claim != beta * zh_scale * values[43] {
         return Err("the Z_H power sum does not match the scatter claim");
     }
 
     // The single batched opening: [ab, c] quirky plus the multilinear set.
-    let points = multilinear_points(record_vars, &rs, &rd, &r_fp, beta, gamma, delta)
+    let points = multilinear_points(record_vars, &rs, &r_fp, beta, gamma, delta)
         .ok_or("degenerate power point")?;
     let mut claim_values = vec![ab.value, c.value];
     claim_values.extend_from_slice(values);

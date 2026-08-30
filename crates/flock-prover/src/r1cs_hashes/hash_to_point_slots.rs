@@ -52,6 +52,8 @@
 //! planes 56..70  centering products;      70 centering flag
 //! planes 71..85  range products;          85..90 forced-zero rows
 //! planes 90..100 counter products;        100 write gate
+//! planes 101..111 materialized counter-after bits
+//! planes 112..120 the dense Z_H region (free inputs, scatter-bound)
 //! rest           zero padding (empty rows)
 //! ```
 
@@ -94,11 +96,17 @@ const PIN_B16: usize = 88; // forced zero: final borrow of x - M
 const PIN_T4: usize = 89; // forced zero: t_4 of 3q, so q <= 5
 const H: usize = 90; // 10 planes: counter-increment carry products
 const GATE: usize = 100; // write gate: acc AND (count-before < 512)
+/// Materialized counter-AFTER bits (ten planes): slot `s` holds the
+/// count after `s`'s increment. Keeping these as wires makes every
+/// counter tap O(1) (the symbolic prefix supports were O(s) per slot)
+/// and turns the scatter's counter factors into plain sub-cube openings:
+/// on gated slots `beta^(count-before) = beta^(-1) beta^(count-after)`.
+const CNT: usize = 101;
 /// The dense `Z_H` region: 512 output indices x 16 coordinate planes
 /// (15 live) = 2^13 bits per record, as eight planes at an eight-aligned
-/// base so the region is a sub-cube (top-four plane bits = 13). Free
+/// base so the region is a sub-cube (top-four plane bits = 14). Free
 /// inputs; the scatter argument binds them to the gated slot outputs.
-pub const Z_BASE: usize = 104;
+pub const Z_BASE: usize = 112;
 const Z_PLANES: usize = 8;
 const PLANES: usize = Z_BASE + Z_PLANES;
 pub const USEFUL_BITS: usize = PLANES * PLANE;
@@ -333,12 +341,14 @@ fn build_matrices() -> (SparseBinaryMatrix, SparseBinaryMatrix) {
         );
 
         // Counter increment by the accept flag: h_0 = acc,
-        // h_{i+1} = cnt_i & h_i, cnt_i' = cnt_i ^ h_i.
+        // h_{i+1} = cnt_i & h_i, cnt_i' = cnt_i ^ h_i; the new counter
+        // bits are MATERIALIZED so every later tap is O(1).
         let mut increment = acc;
         for (bit, cnt_bit) in counter.iter_mut().enumerate() {
             builder.product(pos(H + bit, slot), cnt_bit, &increment);
             let carried = wire(pos(H + bit, slot));
-            *cnt_bit = lin_xor(cnt_bit, &increment);
+            builder.define(pos(CNT + bit, slot), &lin_xor(cnt_bit, &increment));
+            *cnt_bit = wire(pos(CNT + bit, slot));
             increment = carried;
         }
         // A record has at most 680 slots, so the counter cannot wrap; the
@@ -387,6 +397,10 @@ pub fn borrow_position(slot: usize, bit: usize) -> usize {
 /// Committed counter-increment product `bit` of `slot`.
 pub fn increment_position(slot: usize, bit: usize) -> usize {
     pos(H + bit, slot)
+}
+/// Materialized counter-AFTER bit `bit` of `slot`.
+pub fn counter_position(slot: usize, bit: usize) -> usize {
+    pos(CNT + bit, slot)
 }
 /// The plane index of a wire, for sub-cube opening points.
 pub fn plane_of(position: usize) -> usize {
@@ -518,7 +532,27 @@ pub fn build_block_witness_with(
         }
     }
     let eval = |lin: &[usize], z: &[bool]| lin.iter().fold(false, |acc, &col| acc ^ z[col]);
-    for w in 0..K {
+    // Dependency-aware order: the chains below plane H are slot-local and
+    // ascending; the counter family alternates between planes across
+    // slots (H(s) taps CNT(s-1), CNT(s) taps H(s)), so it is evaluated
+    // slot-major; everything above is inputs or forced-zero padding.
+    for w in 0..H * PLANE {
+        if is_input(w) {
+            continue;
+        }
+        z[w] = eval(&a_0.rows[w], &z) & eval(&b_0.rows[w], &z);
+    }
+    for slot in 0..PLANE {
+        let gate = pos(GATE, slot);
+        z[gate] = eval(&a_0.rows[gate], &z) & eval(&b_0.rows[gate], &z);
+        for bit in 0..COUNTER_BITS {
+            let h = pos(H + bit, slot);
+            z[h] = eval(&a_0.rows[h], &z) & eval(&b_0.rows[h], &z);
+            let cnt = pos(CNT + bit, slot);
+            z[cnt] = eval(&a_0.rows[cnt], &z) & eval(&b_0.rows[cnt], &z);
+        }
+    }
+    for w in (CNT + COUNTER_BITS) * PLANE..K {
         if is_input(w) {
             continue;
         }
