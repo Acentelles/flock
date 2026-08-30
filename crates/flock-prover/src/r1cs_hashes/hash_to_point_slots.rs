@@ -33,11 +33,25 @@
 //! `q <= 5`), and the range flag (so `a < 12,289`). The constant-one wire
 //! still uses the upstream `const_pin`.
 //!
-//! ## Layout (K_LOG = 16, 65,536 wires per block = one record)
+//! ## Layout (K_LOG = 17, PLANE-MAJOR, one record per block)
+//!
+//! Each wire class occupies its own 1,024-slot aligned plane:
+//! `wire = plane * 1,024 + slot`. This is what makes the scatter's
+//! terminal discharge succinct: every per-slot class table is a sub-cube
+//! of the witness, so its MLE at `r` is an ordinary opening at
+//! `(plane bits, r)`, and the counter prefix parities reduce through one
+//! less-than-weighted sumcheck (the LT multilinear is verifier-evaluable
+//! in `O(n)`). 101 planes, `USEFUL_BITS = 103,424` of 131,072 (79%).
 //!
 //! ```text
-//! 0              constant-one wire (const_pin)
-//! 16 .. 61,216   612 slots, stride 100 (see slot offsets in the code)
+//! plane 0        constant-one wire at slot 0 (const_pin); rest forced zero
+//! planes 1..17   x bits (free inputs)
+//! planes 17..20  q bits (free inputs)
+//! planes 20..36  accept-chain products;   36 accept flag
+//! planes 37..40  3q-adder products;       40..56 borrow products
+//! planes 56..70  centering products;      70 centering flag
+//! planes 71..85  range products;          85..90 forced-zero rows
+//! planes 90..100 counter products;        100 write gate
 //! rest           zero padding (empty rows)
 //! ```
 
@@ -45,7 +59,7 @@ use flock_core::r1cs::{BlockR1cs, SparseBinaryMatrix};
 
 use super::common::build_block_r1cs_with_matrices;
 
-pub const K_LOG: usize = 16;
+pub const K_LOG: usize = 17;
 pub const K: usize = 1 << K_LOG;
 pub const K_SKIP: usize = 6;
 
@@ -54,30 +68,47 @@ pub const SQUEEZE_BLOCKS: usize = 9;
 /// Candidates per record block: nine SHAKE256 rate blocks.
 pub const SLOTS: usize = SQUEEZE_BLOCKS * 68;
 
+/// The padded slot domain: each wire class is one aligned plane of this
+/// many slots, so class tables are sub-cubes of the witness.
+pub const PLANE: usize = 1 << SLOT_VARS;
+/// log2 of the plane size.
+pub const SLOT_VARS: usize = 10;
+
 pub const COUNTER_BITS: usize = 10;
 pub const Z_CONST_POS: usize = 0;
-pub const SLOT_BASE: usize = 16;
-pub const SLOT_STRIDE: usize = 100;
-pub const USEFUL_BITS: usize = SLOT_BASE + SLOTS * SLOT_STRIDE;
 
-// Per-slot wire offsets.
-const X: usize = 0; // 16 candidate word bits, free inputs
-const Q: usize = 16; // 3 quotient bits, free inputs
-const D: usize = 19; // 16 accept-chain carry products
-const ACC: usize = 35; // materialized accept flag
-const E: usize = 36; // 3 carry products of the 3q mini-adder
-const G: usize = 39; // 16 borrow products of x - M
-const U_CHAIN: usize = 55; // 14 centering-chain carry products
-const U: usize = 69; // materialized centering flag
-const R_CHAIN: usize = 70; // 14 range-chain carry products
-const PIN_RANGE: usize = 84; // forced zero: carry-out of a + 4,095
-const PIN_A14: usize = 85; // forced zero: subtraction bit 14
-const PIN_A15: usize = 86; // forced zero: subtraction bit 15
-const PIN_B16: usize = 87; // forced zero: final borrow of x - M
-const H: usize = 88; // 10 counter-increment carry products
-const PIN_T4: usize = 98; // forced zero: t_4 of 3q, so q <= 5
-const GATE: usize = 99; // write gate: acc AND (count-before < 512)
-const SLOT_WIRES: usize = 100;
+// Plane indices (wire = plane * PLANE + slot).
+const X: usize = 1; // 16 planes: candidate word bits, free inputs
+const Q: usize = 17; // 3 planes: quotient bits, free inputs
+const D: usize = 20; // 16 planes: accept-chain carry products
+const ACC: usize = 36; // materialized accept flag
+const E: usize = 37; // 3 planes: carry products of the 3q mini-adder
+const G: usize = 40; // 16 planes: borrow products of x - M
+const U_CHAIN: usize = 56; // 14 planes: centering-chain carry products
+const U: usize = 70; // materialized centering flag
+const R_CHAIN: usize = 71; // 14 planes: range-chain carry products
+const PIN_RANGE: usize = 85; // forced zero: carry-out of a + 4,095
+const PIN_A14: usize = 86; // forced zero: subtraction bit 14
+const PIN_A15: usize = 87; // forced zero: subtraction bit 15
+const PIN_B16: usize = 88; // forced zero: final borrow of x - M
+const PIN_T4: usize = 89; // forced zero: t_4 of 3q, so q <= 5
+const H: usize = 90; // 10 planes: counter-increment carry products
+const GATE: usize = 100; // write gate: acc AND (count-before < 512)
+const PLANES: usize = 101;
+pub const USEFUL_BITS: usize = PLANES * PLANE;
+
+/// The wire of `plane` at `slot`.
+const fn pos(plane: usize, slot: usize) -> usize {
+    plane * PLANE + slot
+}
+
+/// Free inputs: the constant wire, the x bits, and the q bits of live
+/// slots. Shared by witness generation and the tests' re-derivation.
+fn is_input(w: usize) -> bool {
+    let plane = w / PLANE;
+    let slot = w % PLANE;
+    w == Z_CONST_POS || (slot < SLOTS && (X..Q + 3).contains(&plane))
+}
 
 /// Falcon rejection bound: accept exactly when `x < 5 * 12,289`.
 const ACCEPT_BOUND: u32 = 61_445;
@@ -179,10 +210,12 @@ fn carry_step(builder: &mut Builder, w: usize, p: &Lin, s: &Lin, c: &Lin) -> Lin
 }
 
 /// Carry chain for `value + CONSTANT` over `bits` bits with per-bit value
-/// forms `value_bit(i)`. Returns the symbolic carry-out.
+/// forms `value_bit(i)`; product `i` lands in plane `plane_base + i` at
+/// `slot`. Returns the symbolic carry-out.
 fn constant_add_chain(
     builder: &mut Builder,
-    products_base: usize,
+    plane_base: usize,
+    slot: usize,
     constant: u32,
     bits: usize,
     value_bit: impl Fn(usize) -> Lin,
@@ -194,7 +227,13 @@ fn constant_add_chain(
         } else {
             Vec::new()
         };
-        carry = carry_step(builder, products_base + i, &value_bit(i), &k_bit, &carry);
+        carry = carry_step(
+            builder,
+            pos(plane_base + i, slot),
+            &value_bit(i),
+            &k_bit,
+            &carry,
+        );
     }
     carry
 }
@@ -210,27 +249,26 @@ fn build_matrices() -> (SparseBinaryMatrix, SparseBinaryMatrix) {
     let mut counter: Vec<Lin> = vec![Vec::new(); COUNTER_BITS];
 
     for slot in 0..SLOTS {
-        let base = SLOT_BASE + slot * SLOT_STRIDE;
-        let x = |i: usize| wire(base + X + i);
+        let x = |i: usize| wire(pos(X + i, slot));
         for i in 0..16 {
-            builder.input(base + X + i);
+            builder.input(pos(X + i, slot));
         }
         for i in 0..3 {
-            builder.input(base + Q + i);
+            builder.input(pos(Q + i, slot));
         }
-        let q = |i: usize| wire(base + Q + i);
+        let q = |i: usize| wire(pos(Q + i, slot));
 
         // Accept: reject flag is the carry-out of x + 4,091.
-        let reject = constant_add_chain(&mut builder, base + D, ACCEPT_K, 16, x);
-        builder.define(base + ACC, &lin_xor(&reject, &constant_one()));
-        let acc = wire(base + ACC);
+        let reject = constant_add_chain(&mut builder, D, slot, ACCEPT_K, 16, x);
+        builder.define(pos(ACC, slot), &lin_xor(&reject, &constant_one()));
+        let acc = wire(pos(ACC, slot));
 
         // t = 3 q = q + (q << 1); bits: t_0 = q_0, t_1 = q_1 ^ q_0,
         // t_2 = q_2 ^ q_1 ^ e_2, t_3 = q_2 ^ e_3, t_4 = e_4.
-        let e2 = carry_step(&mut builder, base + E, &q(1), &q(0), &Vec::new());
+        let e2 = carry_step(&mut builder, pos(E, slot), &q(1), &q(0), &Vec::new());
         let e2 = lin_xor(&e2, &Vec::new());
-        let e3 = carry_step(&mut builder, base + E + 1, &q(2), &q(1), &e2);
-        let e4 = carry_step(&mut builder, base + E + 2, &Vec::new(), &q(2), &e3);
+        let e3 = carry_step(&mut builder, pos(E + 1, slot), &q(2), &q(1), &e2);
+        let e4 = carry_step(&mut builder, pos(E + 2, slot), &Vec::new(), &q(2), &e3);
         let t = [
             q(0),
             lin_xor(&q(1), &q(0)),
@@ -255,32 +293,32 @@ fn build_matrices() -> (SparseBinaryMatrix, SparseBinaryMatrix) {
         for i in 0..16 {
             a_bits.push(lin_xor(&lin_xor(&x(i), &m_bit(i)), &borrow));
             let not_x = lin_xor(&x(i), &constant_one());
-            borrow = carry_step(&mut builder, base + G + i, &not_x, &m_bit(i), &borrow);
+            borrow = carry_step(&mut builder, pos(G + i, slot), &not_x, &m_bit(i), &borrow);
         }
 
         // Centering flag: carry-out of a + 10,239 over 14 bits.
-        let center = constant_add_chain(&mut builder, base + U_CHAIN, CENTER_K, 14, |i| {
+        let center = constant_add_chain(&mut builder, U_CHAIN, slot, CENTER_K, 14, |i| {
             a_bits[i].clone()
         });
-        builder.define(base + U, &center);
+        builder.define(pos(U, slot), &center);
 
         // Range flag: carry-out of a + 4,095 over 14 bits; forced zero.
-        let range = constant_add_chain(&mut builder, base + R_CHAIN, RANGE_K, 14, |i| {
+        let range = constant_add_chain(&mut builder, R_CHAIN, slot, RANGE_K, 14, |i| {
             a_bits[i].clone()
         });
-        builder.force_zero(base + PIN_RANGE, &range);
-        builder.force_zero(base + PIN_A14, &a_bits[14]);
-        builder.force_zero(base + PIN_A15, &a_bits[15]);
-        builder.force_zero(base + PIN_B16, &borrow);
+        builder.force_zero(pos(PIN_RANGE, slot), &range);
+        builder.force_zero(pos(PIN_A14, slot), &a_bits[14]);
+        builder.force_zero(pos(PIN_A15, slot), &a_bits[15]);
+        builder.force_zero(pos(PIN_B16, slot), &borrow);
         // t_4 is the SYMBOLIC carry e4 (product xor e3), not the raw product
         // wire; forcing it zero is the q <= 5 range bound.
-        builder.force_zero(base + PIN_T4, &e4);
+        builder.force_zero(pos(PIN_T4, slot), &e4);
 
         // Write gate: acc AND (count-before-this-slot < 512). The counter
         // never reaches 1,024 in a 612-slot record, so the condition is
         // one bit: gate = acc * (1 ^ cnt_9).
         builder.product(
-            base + GATE,
+            pos(GATE, slot),
             &acc,
             &lin_xor(&counter[COUNTER_BITS - 1], &constant_one()),
         );
@@ -289,15 +327,14 @@ fn build_matrices() -> (SparseBinaryMatrix, SparseBinaryMatrix) {
         // h_{i+1} = cnt_i & h_i, cnt_i' = cnt_i ^ h_i.
         let mut increment = acc;
         for (bit, cnt_bit) in counter.iter_mut().enumerate() {
-            builder.product(base + H + bit, cnt_bit, &increment);
-            let carried = wire(base + H + bit);
+            builder.product(pos(H + bit, slot), cnt_bit, &increment);
+            let carried = wire(pos(H + bit, slot));
             *cnt_bit = lin_xor(cnt_bit, &increment);
             increment = carried;
         }
         // A record has at most 680 slots, so the counter cannot wrap; the
         // final increment carry is left dangling by design.
         let _ = increment;
-        let _ = base + SLOT_WIRES;
     }
 
     let to_matrix = |rows: Vec<Vec<usize>>| SparseBinaryMatrix {
@@ -308,16 +345,36 @@ fn build_matrices() -> (SparseBinaryMatrix, SparseBinaryMatrix) {
     (to_matrix(builder.a), to_matrix(builder.b))
 }
 
-/// Block accessors for tests and the future scatter argument.
+/// Block accessors for tests and the scatter argument.
 pub fn accept_position(slot: usize) -> usize {
-    SLOT_BASE + slot * SLOT_STRIDE + ACC
+    pos(ACC, slot)
 }
 pub fn centering_position(slot: usize) -> usize {
-    SLOT_BASE + slot * SLOT_STRIDE + U
+    pos(U, slot)
 }
 /// The scatter's write gate: accepted and before the 512th acceptance.
 pub fn gate_position(slot: usize) -> usize {
-    SLOT_BASE + slot * SLOT_STRIDE + GATE
+    pos(GATE, slot)
+}
+/// Committed quotient bit `bit` of `slot`.
+pub fn quotient_position(slot: usize, bit: usize) -> usize {
+    pos(Q + bit, slot)
+}
+/// Committed candidate word bit `bit` of `slot`.
+pub fn word_position(slot: usize, bit: usize) -> usize {
+    pos(X + bit, slot)
+}
+/// Committed borrow product `bit` of `slot` (`x - M` chain).
+pub fn borrow_position(slot: usize, bit: usize) -> usize {
+    pos(G + bit, slot)
+}
+/// Committed counter-increment product `bit` of `slot`.
+pub fn increment_position(slot: usize, bit: usize) -> usize {
+    pos(H + bit, slot)
+}
+/// The plane index of a wire, for sub-cube opening points.
+pub fn plane_of(position: usize) -> usize {
+    position / PLANE
 }
 
 /// Reusable slot-prover state: the shared block R1CS plus PCS parameters.
@@ -428,25 +485,19 @@ pub fn build_block_witness_with(
     let mut z = vec![false; K];
     z[Z_CONST_POS] = true;
     for (slot, &word) in words.iter().enumerate() {
-        let base = SLOT_BASE + slot * SLOT_STRIDE;
         for i in 0..16 {
-            z[base + X + i] = (word >> i) & 1 == 1;
+            z[pos(X + i, slot)] = (word >> i) & 1 == 1;
         }
         // The honest quotient; for rejected words it is still the true
         // quotient (capped by the pin only through q <= 5, x >= M, a < q).
         let quotient = (u32::from(word) / FALCON_Q).min(5) as u16;
         for i in 0..3 {
-            z[base + Q + i] = (quotient >> i) & 1 == 1;
+            z[pos(Q + i, slot)] = (quotient >> i) & 1 == 1;
         }
     }
     let eval = |lin: &[usize], z: &[bool]| lin.iter().fold(false, |acc, &col| acc ^ z[col]);
     for w in 0..K {
-        let is_input = w == Z_CONST_POS
-            || (w >= SLOT_BASE && {
-                let offset = (w - SLOT_BASE) % SLOT_STRIDE;
-                (w - SLOT_BASE) / SLOT_STRIDE < SLOTS && offset < Q + 3
-            });
-        if is_input {
+        if is_input(w) {
             continue;
         }
         z[w] = eval(&a_0.rows[w], &z) & eval(&b_0.rows[w], &z);
@@ -536,9 +587,9 @@ mod tests {
         for position in [
             accept_position(0),
             centering_position(3),
-            SLOT_BASE + G + 5,
-            SLOT_BASE + 2 * SLOT_STRIDE + D + 9,
-            SLOT_BASE + H + 1,
+            pos(G + 5, 0),
+            pos(D + 9, 2),
+            pos(H + 1, 0),
         ] {
             let mut tampered = block.clone();
             tampered[position] = !tampered[position];
@@ -559,17 +610,15 @@ mod tests {
 
         // Re-derive slot 5 (an accepted word) with quotient + 1.
         let slot = 5;
-        let base = SLOT_BASE + slot * SLOT_STRIDE;
         let word = words[slot];
         let wrong_quotient = (u32::from(word) / FALCON_Q + 1) as u16;
         for i in 0..3 {
-            block[base + Q + i] = (wrong_quotient >> i) & 1 == 1;
+            block[quotient_position(slot, i)] = (wrong_quotient >> i) & 1 == 1;
         }
         let r1cs = single_block_r1cs();
         let eval = |lin: &[usize], z: &[bool]| lin.iter().fold(false, |acc, &col| acc ^ z[col]);
-        for w in SLOT_BASE..USEFUL_BITS {
-            let offset = (w - SLOT_BASE) % SLOT_STRIDE;
-            if offset < Q + 3 {
+        for w in 0..USEFUL_BITS {
+            if is_input(w) {
                 continue;
             }
             block[w] = eval(&r1cs.a_0.rows[w], &block) & eval(&r1cs.b_0.rows[w], &block);
@@ -625,10 +674,9 @@ mod tests {
         let mut gated = Vec::new();
         for (slot, &word) in words.iter().enumerate() {
             if block[gate_position(slot)] {
-                let base = SLOT_BASE + slot * SLOT_STRIDE;
                 let mut quotient = 0_u16;
                 for i in 0..3 {
-                    quotient |= u16::from(block[base + Q + i]) << i;
+                    quotient |= u16::from(block[quotient_position(slot, i)]) << i;
                 }
                 gated.push((word - 12_289 * quotient, block[centering_position(slot)]));
             }
@@ -639,8 +687,8 @@ mod tests {
     #[test]
     fn prove_verify_ligerito_roundtrip() {
         use flock_core::challenger::FsChallenger;
-        // 64 records is the smallest default-Ligerito-legal size (m = 22).
-        let n_blocks = 64;
+        // 32 records is the smallest default-Ligerito-legal size (m = 22).
+        let n_blocks = 32;
         let setup = SlotSetup::new(n_blocks);
         let blocks: Vec<[u16; SLOTS]> = (0..n_blocks)
             .map(|block| {

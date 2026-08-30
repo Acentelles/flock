@@ -130,16 +130,26 @@ Stability and ordering need no extra argument: counters are forced by
 the R1CS to increment exactly on accepted slots from a structural zero,
 so gated slots hit indices `0..512` in order.
 
-PROTOTYPED in `r1cs_hashes/hash_to_point_scatter.rs`: the degree-12
-product sumcheck, both identities, the factor tables from a real record
-witness, and the dense side as one MLE opening, with tamper tests. A
-load-bearing simplification found on the way: XOR of 0/1 values IS the
-field sum in characteristic 2, so the MLE of any XOR-of-wires table is
-the F128-linear combination of wire MLEs; the symbolic counter and
-residue bits never need materializing, and every factor terminal is a
-public-weighted linear functional of the committed witness. The
-remaining integration is discharging those terminals through the
-packed-direct/lincheck opening layer instead of direct evaluation.
+COMPLETE at the protocol level in
+`r1cs_hashes/hash_to_point_scatter.rs`: the degree-12 product sumcheck,
+both identities, the factor tables, AND the full terminal discharge.
+The slot encoder moved to a PLANE-MAJOR layout (`K_LOG = 17`, each wire
+class in its own 1,024-slot aligned plane, 101 planes, 79% utilization)
+precisely so every class table is a sub-cube of the witness: its MLE at
+`r` is an ordinary opening at `(plane bits, r)`, which the batched
+ring-switch openings already support (a test pins the sub-cube
+identity). The counter prefix parities discharge through one
+rho-batched 2-factor sumcheck whose weight is the transparent
+greater-than multilinear `GT(r, y)`, evaluable in `O(n)`; the prover
+sends the ten per-bit claims, and the rho-combination binds them
+(degree 9 in rho). The parity sources are the accept plane for bit 0
+and carry-out plane `H_{b-1}` for bit b (the stored products are carry
+OUTS; an off-by-one here was caught by the terminal reconstruction
+test). Load-bearing simplification: XOR of 0/1 values IS the field sum
+in characteristic 2, so no symbolic bit ever needs materializing.
+Remaining: route the roughly 35 sub-cube openings and the discharge
+through the real batched PCS opening against the slot commitment
+(plumbing, no new protocol content).
 `C_H` for the aerie fingerprint is then either a second small
 commitment of the region or a sub-cube opening; decide by measurement
 (work item 4).
