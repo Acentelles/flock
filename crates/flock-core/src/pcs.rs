@@ -560,10 +560,24 @@ pub struct PackedDirectClaimRef<'a> {
 /// materialization), then drives the succinct recursive Ligerito verifier,
 /// evaluating the combined basis only at the residual point.
 #[allow(clippy::too_many_arguments)]
-pub fn verify_opening_batch_ligerito_mixed<Ch: Challenger>(
+/// Low-bit binding mode of one ring-switched claim: how the verifier
+/// weights the binding-agnostic `s_hat_v` message over the 128 packed-word
+/// coordinates. `Quirky` is the native univariate-skip shape (`z_skip`
+/// binds address bits 0..6 in the phi8 basis; `x_outer[0]` binds bit 6).
+/// `Multilinear` binds all seven low address bits by plain equality
+/// weights, for openings at arbitrary multilinear points; `x_outer[0]` is
+/// then unused by the claim check but `x_outer[1..]` remains the word
+/// suffix as usual.
+#[derive(Clone, Debug)]
+pub enum LowBinding {
+    Quirky { z_skip: F128 },
+    Multilinear { x_low: [F128; LOG_PACKING] },
+}
+
+pub fn verify_opening_batch_ligerito_mixed_bound<Ch: Challenger>(
     commitment: &Commitment,
     claims: &[F128],
-    z_skips: &[F128],
+    bindings: &[LowBinding],
     x_outers: &[&[F128]],
     packed_direct: &[PackedDirectClaimRef<'_>],
     proof: &BatchOpeningProofLigerito,
@@ -572,7 +586,7 @@ pub fn verify_opening_batch_ligerito_mixed<Ch: Challenger>(
 ) -> Result<(), VerifyError> {
     let n_rs = claims.len();
     let n_pd = packed_direct.len();
-    assert_eq!(z_skips.len(), n_rs);
+    assert_eq!(bindings.len(), n_rs);
     assert_eq!(x_outers.len(), n_rs);
     assert_eq!(proof.ring_switches.len(), n_rs);
     assert!(n_rs + n_pd > 0);
@@ -584,13 +598,22 @@ pub fn verify_opening_batch_ligerito_mixed<Ch: Challenger>(
     //    ~16 MB allocation at m=29.
     let mut rs_outputs = Vec::with_capacity(n_rs);
     for i in 0..n_rs {
-        let out = ring_switch::verify_succinct(
-            claims[i],
-            z_skips[i],
-            x_outers[i],
-            &proof.ring_switches[i],
-            challenger,
-        )
+        let out = match &bindings[i] {
+            LowBinding::Quirky { z_skip } => ring_switch::verify_succinct(
+                claims[i],
+                *z_skip,
+                x_outers[i],
+                &proof.ring_switches[i],
+                challenger,
+            ),
+            LowBinding::Multilinear { x_low } => ring_switch::verify_succinct_multilinear(
+                claims[i],
+                x_low,
+                x_outers[i],
+                &proof.ring_switches[i],
+                challenger,
+            ),
+        }
         .map_err(VerifyError::RingSwitch)?;
         rs_outputs.push(out);
     }
@@ -697,6 +720,32 @@ pub fn verify_opening_batch_ligerito_mixed<Ch: Challenger>(
         return Err(VerifyError::Ligerito);
     }
     Ok(())
+}
+
+pub fn verify_opening_batch_ligerito_mixed<Ch: Challenger>(
+    commitment: &Commitment,
+    claims: &[F128],
+    z_skips: &[F128],
+    x_outers: &[&[F128]],
+    packed_direct: &[PackedDirectClaimRef<'_>],
+    proof: &BatchOpeningProofLigerito,
+    lig_config: &ligerito::VerifierConfig,
+    challenger: &mut Ch,
+) -> Result<(), VerifyError> {
+    let bindings: Vec<LowBinding> = z_skips
+        .iter()
+        .map(|&z_skip| LowBinding::Quirky { z_skip })
+        .collect();
+    verify_opening_batch_ligerito_mixed_bound(
+        commitment,
+        claims,
+        &bindings,
+        x_outers,
+        packed_direct,
+        proof,
+        lig_config,
+        challenger,
+    )
 }
 
 #[cfg(test)]

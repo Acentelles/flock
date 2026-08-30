@@ -2663,6 +2663,56 @@ pub fn verify_succinct<Ch: Challenger>(
     })
 }
 
+/// Claim weights for a PLAIN MULTILINEAR low-7 binding: `weights[a] =
+/// prod_j eq(x_low[j], bit_j(a))` with coordinate `j` of the packed word
+/// bound by `x_low[j]`. Binds the same binding-agnostic `s_hat_v` message
+/// as [`build_claim_weights`] does for univariate-skip points.
+pub fn build_claim_weights_multilinear(x_low: &[F128]) -> Vec<F128> {
+    assert_eq!(x_low.len(), LOG_PACKING);
+    let mut weights = vec![F128::ONE; 1 << LOG_PACKING];
+    for (a, w) in weights.iter_mut().enumerate() {
+        for (j, &x) in x_low.iter().enumerate() {
+            *w *= if (a >> j) & 1 == 1 { x } else { F128::ONE + x };
+        }
+    }
+    weights
+}
+
+/// [`verify_succinct`] with a plain multilinear low-7 binding: `x_low`
+/// binds packed-word coordinates 0..7 (address bits 0..7), `x_outer[0]`
+/// is IGNORED for the claim check (the multilinear binding carries all
+/// seven low coordinates) but `x_outer[1..]` remains the word suffix.
+/// Transcript-identical to [`verify_succinct`].
+pub fn verify_succinct_multilinear<Ch: Challenger>(
+    claim: F128,
+    x_low: &[F128],
+    x_outer: &[F128],
+    proof: &RingSwitchProof,
+    challenger: &mut Ch,
+) -> Result<RingSwitchVerifierOutput, VerifyError> {
+    assert!(!x_outer.is_empty());
+    assert_eq!(proof.s_hat_v.len(), 1 << LOG_PACKING);
+
+    challenger.observe_label(b"flock-ring-switch-v0");
+    challenger.observe_f128_slice(&proof.s_hat_v);
+
+    let weights = build_claim_weights_multilinear(x_low);
+    if claim_check(&weights, &proof.s_hat_v) != claim {
+        return Err(VerifyError::ClaimMismatch);
+    }
+
+    let r_dprime = challenger.sample_f128_vec(LOG_PACKING);
+    let eq_r_dprime = build_eq(&r_dprime);
+
+    let s_hat_u = tensor_algebra_transpose(&proof.s_hat_v);
+    let sumcheck_claim = inner_product(&s_hat_u, &eq_r_dprime);
+
+    Ok(RingSwitchVerifierOutput {
+        sumcheck_claim,
+        eq_r_dprime,
+    })
+}
+
 /// Polylog-cost evaluation of `MLE(rs_eq_ind)(query)` at the BaseFold final
 /// challenge point, following [DP24] §1.3 Figure 3.
 ///

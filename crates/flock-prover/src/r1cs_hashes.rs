@@ -14,6 +14,9 @@ pub mod blake3;
 /// [`ChainLayout`]: chain_common::ChainLayout
 pub mod chain_common;
 pub mod common;
+/// Record assembly for the aerie private-salt lane: real commitments and
+/// openings for the slot proof, scatter, Z_H table, and fingerprint.
+pub mod hash_to_point_record;
 /// The aerie private-salt stable-compaction scatter argument (prototype);
 /// see `AERIE-ADAPTER.md` Section 3.3.
 pub mod hash_to_point_scatter;
