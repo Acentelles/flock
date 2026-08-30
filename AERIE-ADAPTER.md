@@ -206,6 +206,28 @@ commitment of the region or a sub-cube opening; decide by measurement
    dependency-aware order for the counter family (H(s) taps CNT(s-1),
    CNT(s) taps H(s)). The remaining prover dominator is the degree-13
    scatter sumcheck (42%), ordinary sumcheck engineering.
+
+   Post-optimization host anchors (M3 Max, quiet host, 2026-08-30,
+   `hash_to_point_record_bench`; Keccak sponge lane NOT included):
+
+   | records | prove_ms | verify_ms | proof_bytes |
+   |---:|---:|---:|---:|
+   | 32 | 197.6 | 10.7 | 397,912 |
+   | 64 | 308.4 | 10.9 | 410,776 |
+   | 128 | 764.5 | 11.6 | 421,672 |
+   | 256 | 1,564.0 | 12.0 | 442,376 |
+
+   About 6.1 ms/record above 64 records, verifier flat, bytes
+   logarithmic (about 520 KB extrapolated at 16,384 records, below the
+   640 KB salt array the profile removes). Honest accounting: at this
+   rate the bridge lane extrapolates to about 100 s at 16,384 records,
+   about 50-100x the spec's Keccak-lane estimate, so the bridge lane is
+   currently the profile's prover bottleneck. Known unexploited levers:
+   the custom stages (witness generation, factor tables, scatter,
+   claim values) are single-threaded while every comparison anchor is
+   10-thread, and the scatter sumcheck has standard optimizations
+   untouched (gate sparsity, factoring the transparent delta factor
+   out of the inner product).
 5. Implement aerie's `BinaryHashBackend` for the assembled system: the
    flock-side engine is `prove_record`/`verify_record` (commitment,
    relation minus the sponge lane, fingerprint value at a
