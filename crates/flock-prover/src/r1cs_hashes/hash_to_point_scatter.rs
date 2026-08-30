@@ -229,7 +229,7 @@ pub fn dense_power_sum(dense: &[F128], beta: F128, gamma: F128) -> Option<F128> 
 /// One round message: the round polynomial's evaluations at `0..=12`.
 pub type RoundEvals = Vec<F128>;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ScatterProof {
     pub claim: F128,
     pub rounds: Vec<RoundEvals>,

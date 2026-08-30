@@ -94,7 +94,13 @@ const PIN_B16: usize = 88; // forced zero: final borrow of x - M
 const PIN_T4: usize = 89; // forced zero: t_4 of 3q, so q <= 5
 const H: usize = 90; // 10 planes: counter-increment carry products
 const GATE: usize = 100; // write gate: acc AND (count-before < 512)
-const PLANES: usize = 101;
+/// The dense `Z_H` region: 512 output indices x 16 coordinate planes
+/// (15 live) = 2^13 bits per record, as eight planes at an eight-aligned
+/// base so the region is a sub-cube (top-four plane bits = 13). Free
+/// inputs; the scatter argument binds them to the gated slot outputs.
+pub const Z_BASE: usize = 104;
+const Z_PLANES: usize = 8;
+const PLANES: usize = Z_BASE + Z_PLANES;
 pub const USEFUL_BITS: usize = PLANES * PLANE;
 
 /// The wire of `plane` at `slot`.
@@ -102,12 +108,15 @@ const fn pos(plane: usize, slot: usize) -> usize {
     plane * PLANE + slot
 }
 
-/// Free inputs: the constant wire, the x bits, and the q bits of live
-/// slots. Shared by witness generation and the tests' re-derivation.
+/// Free inputs: the constant wire, the x bits and q bits of live slots,
+/// and the `Z_H` region. Shared by witness generation and the tests'
+/// re-derivation.
 fn is_input(w: usize) -> bool {
     let plane = w / PLANE;
     let slot = w % PLANE;
-    w == Z_CONST_POS || (slot < SLOTS && (X..Q + 3).contains(&plane))
+    w == Z_CONST_POS
+        || (slot < SLOTS && (X..Q + 3).contains(&plane))
+        || (Z_BASE..Z_BASE + Z_PLANES).contains(&plane)
 }
 
 /// Falcon rejection bound: accept exactly when `x < 5 * 12,289`.
@@ -337,6 +346,13 @@ fn build_matrices() -> (SparseBinaryMatrix, SparseBinaryMatrix) {
         let _ = increment;
     }
 
+    // The Z_H region: free inputs, bound by the scatter argument.
+    for plane in Z_BASE..Z_BASE + Z_PLANES {
+        for slot in 0..PLANE {
+            builder.input(pos(plane, slot));
+        }
+    }
+
     let to_matrix = |rows: Vec<Vec<usize>>| SparseBinaryMatrix {
         num_rows: K,
         num_cols: K,
@@ -375,6 +391,12 @@ pub fn increment_position(slot: usize, bit: usize) -> usize {
 /// The plane index of a wire, for sub-cube opening points.
 pub fn plane_of(position: usize) -> usize {
     position / PLANE
+}
+/// The `Z_H` region wire for output index `j`, coordinate plane `c`
+/// (`c < 15` live: 14 residue bits, then the centering flag).
+pub fn zh_position(j: usize, c: usize) -> usize {
+    let index = (j << 4) | c;
+    pos(Z_BASE + (index >> SLOT_VARS), index & (PLANE - 1))
 }
 
 /// Reusable slot-prover state: the shared block R1CS plus PCS parameters.
@@ -501,6 +523,21 @@ pub fn build_block_witness_with(
             continue;
         }
         z[w] = eval(&a_0.rows[w], &z) & eval(&b_0.rows[w], &z);
+    }
+
+    // Fill the Z_H region from the gated slot outputs, in counter order.
+    let mut index = 0_usize;
+    for (slot, &word) in words.iter().enumerate() {
+        if !z[pos(GATE, slot)] {
+            continue;
+        }
+        let quotient = (u32::from(word) / FALCON_Q) as u16;
+        let residue = word - 12_289 * quotient;
+        for c in 0..14 {
+            z[zh_position(index, c)] = (residue >> c) & 1 == 1;
+        }
+        z[zh_position(index, 14)] = z[pos(U, slot)];
+        index += 1;
     }
 
     // Differential against the integer reference semantics.

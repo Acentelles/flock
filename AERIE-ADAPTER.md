@@ -177,15 +177,33 @@ commitment of the region or a sub-cube opening; decide by measurement
    constraint rows would NOT verify). Remaining: the write-gate wire
    for the scatter and the full-record differential against
    `falcon::preprocess::hash_to_point_public_raw`.
-4. `Z_H` region plus copy link (Section 3.3): the scatter argument is
-   PROTOTYPED (sumcheck, identities, factor tables, tamper tests);
-   remaining: terminal discharge through the packed-direct/lincheck
-   opening layer, and the dedicated-commitment versus sub-cube-opening
-   decision by measured proof bytes and verifier time.
-5. Implement aerie's `BinaryHashBackend` for the assembled system, with
-   the `observe_bytes` seam and the fingerprint opening via
-   `ring_switch::prove_batched`.
-6. E2 host benchmarks at the aerie spec's `N_T` sweep.
+4. `Z_H` region plus copy link (Section 3.3): COMPLETE against real
+   commitments. The `Z_H` table lives as eight aligned planes INSIDE the
+   slot-witness commitment (free-input wires bound by the scatter), so
+   there is no second commitment and no small-`m` Ligerito problem. The
+   multi-record scatter runs once over the `(record, slot)` domain with
+   a transparent delta-power record factor (13 factors); the dense side
+   is one sub-cube opening at the mixed power point (delta over record
+   bits, beta over index bits, gamma over coordinate bits).
+   `hash_to_point_record::{prove_record, verify_record}` assemble the
+   slot R1CS (zerocheck + lincheck through the generic path), the
+   scatter, its discharge, the `Z_H` binding identity, the fifteen
+   aerie-fingerprint sub-cube openings (their theta-weighted sum is
+   `MLE_K(Z_H, r)`), and ONE batched opening carrying the base
+   `[ab, c]` quirky claims plus all 57 multilinear claims through the
+   new `LowBinding` seam. Roundtrip and tamper tests pass at 32 records
+   (`m = 22`).
+5. Implement aerie's `BinaryHashBackend` for the assembled system: the
+   flock-side engine is `prove_record`/`verify_record` (commitment,
+   relation minus the sponge lane, fingerprint value at a
+   challenger-sampled point; in production the challenger is the joint
+   aerie transcript seeded through `observe_bytes`). The thin aerie-side
+   trait impl is type conversion only (same field, same polynomial).
+6. E2 host benchmarks:
+   `cargo run --release --example hash_to_point_record_bench [N...]`
+   emits TSV (records, slots, setup/prove/verify ms, proof bytes) with
+   the coverage banner. The sponge lane (work item 2) is the one
+   remaining circuit gap; any comparison must say so.
 
 ## 5. Open questions
 
