@@ -299,8 +299,11 @@ pub struct ConsistencyProof {
 }
 
 /// Sample the per-repetition consistency challenges: `r_k` over the
-/// packed-leaf variables and the multiplier `gamma_k`.
-fn consistency_challenges<Ch: Challenger>(
+/// packed-leaf variables and the multiplier `gamma_k`. Public so the
+/// composed Section 7 driver samples ONCE from the joint transcript and
+/// hands the same values to the Akita bridge (spec 6.1: both lanes must
+/// prove the same tags at the same challenges).
+pub fn consistency_challenges<Ch: Challenger>(
     record_vars: usize,
     challenger: &mut Ch,
 ) -> Vec<(Vec<F128>, F128)> {
@@ -358,6 +361,17 @@ fn prove_consistency<Ch: Challenger>(
     challenger: &mut Ch,
 ) -> (ConsistencyProof, Vec<Vec<F128>>) {
     let challenges = consistency_challenges(record_vars, challenger);
+    prove_consistency_with(record_vars, z_packed, &challenges)
+}
+
+/// [`prove_consistency`] against caller-sampled challenges (the composed
+/// driver's path; the challenges must come from the joint transcript
+/// after every commitment).
+pub fn prove_consistency_with(
+    record_vars: usize,
+    z_packed: &[F128],
+    challenges: &[(Vec<F128>, F128)],
+) -> (ConsistencyProof, Vec<Vec<F128>>) {
     let mut points = Vec::with_capacity(slots::MASK_REPS * 16);
     let mut values = Vec::with_capacity(slots::MASK_REPS);
     let mut tags = Vec::with_capacity(slots::MASK_REPS);
@@ -386,6 +400,15 @@ fn verify_consistency<Ch: Challenger>(
     challenger: &mut Ch,
 ) -> Result<(Vec<Vec<F128>>, Vec<F128>), &'static str> {
     let challenges = consistency_challenges(record_vars, challenger);
+    verify_consistency_with(record_vars, proof, &challenges)
+}
+
+/// [`verify_consistency`] against caller-sampled challenges.
+pub fn verify_consistency_with(
+    record_vars: usize,
+    proof: &ConsistencyProof,
+    challenges: &[(Vec<F128>, F128)],
+) -> Result<(Vec<Vec<F128>>, Vec<F128>), &'static str> {
     if proof.values.len() != slots::MASK_REPS || proof.tags.len() != slots::MASK_REPS {
         return Err("wrong consistency repetition count");
     }
