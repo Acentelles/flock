@@ -20,19 +20,19 @@
 //! the equality of the two sums binds every cell pairwise with error
 //! about `(records + 93) / 2^128` per challenge tuple.
 //!
-//! The linkage opens each lane's commitment once more (its claims need
-//! challenges sampled after BOTH commitments); folding these claims into
-//! the lanes' main batches is a known optimization.
+//! The linkage claims need challenges sampled after BOTH commitments, so
+//! the composed driver runs both lanes' cores first, samples the linkage,
+//! and folds each side's claims into that lane's single batched opening:
+//! two Ligerito openings total for the complete relation.
 
 use flock_core::challenger::Challenger;
 use flock_core::field::F128;
-use flock_core::pcs::{self, Commitment};
 
 use super::hash_to_point_record::{self as record, RecordProof};
 use super::hash_to_point_slots as slots;
 use super::hash_to_point_slots::SlotSetup;
 use super::hash_to_point_sponge::{
-    self as sponge, LaneArtifacts, SpongeProof, SpongePublic, SpongeRecord, SpongeSetup,
+    self as sponge, SpongeProof, SpongePublic, SpongeRecord, SpongeSetup,
 };
 use super::keccak::K_LOG as KECCAK_K_LOG;
 
@@ -205,14 +205,13 @@ pub fn keccak_link_claims(
     Some(claims)
 }
 
-/// The linkage proof: claimed values plus one extra batched opening per
-/// lane commitment.
+/// The linkage proof: the claimed values on both sides. The opening
+/// proofs live inside the lanes' single batched openings; the linkage
+/// claims are folded in as extra points.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct LinkProof {
     pub slot_values: Vec<F128>,
     pub keccak_values: Vec<F128>,
-    pub slot_open: pcs::BatchOpeningProofLigerito,
-    pub keccak_open: pcs::BatchOpeningProofLigerito,
 }
 
 fn weighted_sum(claims: &[LinkClaim], values: &[F128]) -> F128 {
@@ -224,13 +223,16 @@ fn weighted_sum(claims: &[LinkClaim], values: &[F128]) -> F128 {
         })
 }
 
-pub fn prove_link<Ch: Challenger>(
+/// Sample the linkage challenges (post both commitments), build both
+/// claim sets, and evaluate their values on the packed witnesses. The
+/// caller folds the returned points into each lane's batched opening.
+pub fn prove_link_claims<Ch: Challenger>(
     slot_setup: &SlotSetup,
     sponge_setup: &SpongeSetup,
-    slot_artifacts: &LaneArtifacts,
-    keccak_artifacts: &LaneArtifacts,
+    slot_z_packed: &[F128],
+    keccak_z_packed: &[F128],
     challenger: &mut Ch,
-) -> LinkProof {
+) -> (LinkProof, Vec<Vec<F128>>, Vec<Vec<F128>>) {
     challenger.observe_label(b"aerie-word-link-v0");
     let delta = challenger.sample_f128();
     let nu = challenger.sample_f128();
@@ -249,13 +251,13 @@ pub fn prove_link<Ch: Challenger>(
             || {
                 slot_claims
                     .par_iter()
-                    .map(|claim| sponge::gather_eval(&slot_artifacts.z_packed, &claim.point))
+                    .map(|claim| sponge::gather_eval(slot_z_packed, &claim.point))
                     .collect()
             },
             || {
                 keccak_claims
                     .par_iter()
-                    .map(|claim| sponge::gather_eval(&keccak_artifacts.z_packed, &claim.point))
+                    .map(|claim| sponge::gather_eval(keccak_z_packed, &claim.point))
                     .collect()
             },
         )
@@ -263,40 +265,24 @@ pub fn prove_link<Ch: Challenger>(
 
     let slot_points: Vec<Vec<F128>> = slot_claims.into_iter().map(|c| c.point).collect();
     let keccak_points: Vec<Vec<F128>> = keccak_claims.into_iter().map(|c| c.point).collect();
-    let slot_open = record::open_multilinear(
-        slot_artifacts.z_packed.clone(),
-        &slot_artifacts.prover_data,
-        &slot_artifacts.commitment,
-        &slot_points,
-        &slot_setup.r1cs.padding_spec(),
-        &slot_setup.pcs_params,
-        challenger,
-    );
-    let keccak_open = record::open_multilinear(
-        keccak_artifacts.z_packed.clone(),
-        &keccak_artifacts.prover_data,
-        &keccak_artifacts.commitment,
-        &keccak_points,
-        &sponge_setup.keccak.r1cs.padding_spec(),
-        &sponge_setup.keccak.pcs_params,
-        challenger,
-    );
-    LinkProof {
-        slot_values,
-        keccak_values,
-        slot_open,
-        keccak_open,
-    }
+    (
+        LinkProof {
+            slot_values,
+            keccak_values,
+        },
+        slot_points,
+        keccak_points,
+    )
 }
 
-pub fn verify_link<Ch: Challenger>(
+/// Verify the linkage identity (the two weighted sums agree) and return
+/// both claim point lists for the lanes' batched opening verifies.
+pub fn verify_link_claims<Ch: Challenger>(
     slot_setup: &SlotSetup,
     sponge_setup: &SpongeSetup,
-    slot_commitment: &Commitment,
-    keccak_commitment: &Commitment,
     proof: &LinkProof,
     challenger: &mut Ch,
-) -> Result<(), &'static str> {
+) -> Result<(Vec<Vec<F128>>, Vec<Vec<F128>>), &'static str> {
     challenger.observe_label(b"aerie-word-link-v0");
     let delta = challenger.sample_f128();
     let nu = challenger.sample_f128();
@@ -321,24 +307,7 @@ pub fn verify_link<Ch: Challenger>(
     }
     let slot_points: Vec<Vec<F128>> = slot_claims.into_iter().map(|c| c.point).collect();
     let keccak_points: Vec<Vec<F128>> = keccak_claims.into_iter().map(|c| c.point).collect();
-    record::verify_multilinear(
-        slot_commitment,
-        &slot_points,
-        &proof.slot_values,
-        &proof.slot_open,
-        &slot_setup.pcs_params,
-        challenger,
-    )
-    .map_err(|_| "slot-side linkage opening failed")?;
-    record::verify_multilinear(
-        keccak_commitment,
-        &keccak_points,
-        &proof.keccak_values,
-        &proof.keccak_open,
-        &sponge_setup.keccak.pcs_params,
-        challenger,
-    )
-    .map_err(|_| "keccak-side linkage opening failed")
+    Ok((slot_points, keccak_points))
 }
 
 /// The complete private-salt HashToPoint proof: both lanes plus the
@@ -353,15 +322,18 @@ pub struct HashToPointProof {
     pub link: LinkProof,
 }
 
+/// Transcript order: sponge core, record core, linkage challenges and
+/// values, then the two batched openings (sponge first) with the linkage
+/// claims folded in as extra points. Two openings total.
 pub fn prove_hash_to_point<Ch: Challenger>(
     sponge_setup: &SpongeSetup,
     slot_setup: &SlotSetup,
     records: &[SpongeRecord],
     challenger: &mut Ch,
 ) -> HashToPointProof {
-    let (sponge_proof, words, keccak_artifacts) =
-        sponge::prove_sponge(sponge_setup, records, challenger);
-    let blocks: Vec<[u16; slots::SLOTS]> = words
+    let sponge_core = sponge::prove_sponge_core(sponge_setup, records, challenger);
+    let blocks: Vec<[u16; slots::SLOTS]> = sponge_core
+        .all_words
         .iter()
         .map(|w| {
             let mut block = [0_u16; slots::SLOTS];
@@ -369,14 +341,17 @@ pub fn prove_hash_to_point<Ch: Challenger>(
             block
         })
         .collect();
-    let (record_proof, slot_artifacts) = record::prove_record(slot_setup, &blocks, challenger);
-    let link = prove_link(
+    let record_core = record::prove_record_core(slot_setup, &blocks, challenger);
+    let (link, slot_points, keccak_points) = prove_link_claims(
         slot_setup,
         sponge_setup,
-        &slot_artifacts,
-        &keccak_artifacts,
+        &record_core.z_packed,
+        &sponge_core.fast.z_packed,
         challenger,
     );
+    let (sponge_proof, _) =
+        sponge::open_sponge(sponge_setup, sponge_core, &keccak_points, challenger);
+    let (record_proof, _) = record::open_record(slot_setup, record_core, &slot_points, challenger);
     HashToPointProof {
         sponge: sponge_proof,
         record: record_proof,
@@ -391,14 +366,24 @@ pub fn verify_hash_to_point<Ch: Challenger>(
     proof: &HashToPointProof,
     challenger: &mut Ch,
 ) -> Result<(), &'static str> {
-    sponge::verify_sponge(sponge_setup, publics, &proof.sponge, challenger)?;
-    record::verify_record(slot_setup, &proof.record, challenger)?;
-    verify_link(
-        slot_setup,
+    let sponge_core = sponge::verify_sponge_core(sponge_setup, publics, &proof.sponge, challenger)?;
+    let record_core = record::verify_record_core(slot_setup, &proof.record, challenger)?;
+    let (slot_points, keccak_points) =
+        verify_link_claims(slot_setup, sponge_setup, &proof.link, challenger)?;
+    sponge::verify_sponge_open(
         sponge_setup,
-        &proof.record.commitment,
-        &proof.sponge.commitment,
-        &proof.link,
+        &proof.sponge,
+        sponge_core,
+        &keccak_points,
+        &proof.link.keccak_values,
+        challenger,
+    )?;
+    record::verify_record_open(
+        slot_setup,
+        &proof.record,
+        record_core,
+        &slot_points,
+        &proof.link.slot_values,
         challenger,
     )
 }

@@ -332,18 +332,62 @@ pub struct LaneArtifacts {
     pub commitment: Commitment,
 }
 
+/// Everything the sponge lane produces before its batched opening: the
+/// commit-and-R1CS core, the chaining claim set, and the squeeze words.
+/// Cross-lane arguments read `fast.z_packed` for their claim values and
+/// fold their points into [`open_sponge`].
+pub struct SpongeCore {
+    pub fast: crate::prover::ProveCore,
+    pub points: Vec<Vec<F128>>,
+    pub opening_values: Vec<F128>,
+    pub all_words: Vec<Vec<u16>>,
+}
+
+/// The standalone sponge lane: core plus an immediate opening with no
+/// cross-lane claims. Transcript-identical to the composed path with an
+/// empty extra set.
 pub fn prove_sponge<Ch: Challenger>(
     setup: &SpongeSetup,
     records: &[SpongeRecord],
     challenger: &mut Ch,
 ) -> (SpongeProof, Vec<Vec<u16>>, LaneArtifacts) {
+    let core = prove_sponge_core(setup, records, challenger);
+    let words = core.all_words.clone();
+    let z_packed = core.fast.z_packed.clone();
+    let (proof, prover_data) = open_sponge(setup, core, &[], challenger);
+    let artifacts = LaneArtifacts {
+        z_packed,
+        prover_data,
+        commitment: proof.commitment.clone(),
+    };
+    (proof, words, artifacts)
+}
+
+pub fn prove_sponge_core<Ch: Challenger>(
+    setup: &SpongeSetup,
+    records: &[SpongeRecord],
+    challenger: &mut Ch,
+) -> SpongeCore {
+    use rayon::prelude::*;
     assert_eq!(records.len(), setup.records);
     let record_vars = setup.record_vars();
+    let trace = std::env::var("RECORD_TRACE").is_ok();
+    let mut stage = std::time::Instant::now();
+    let mut lap = |label: &str| {
+        if trace {
+            eprintln!(
+                "  [prove_sponge] {label}: {:7.1} ms",
+                stage.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        stage = std::time::Instant::now();
+    };
     let zero_state: State = [false; STATE_BITS];
+    let traces: Vec<([State; LIVE_PERMS], Vec<u16>)> =
+        records.par_iter().map(sponge_trace).collect();
     let mut initial_states = Vec::with_capacity(setup.keccak.n_keccak_slots());
     let mut all_words = Vec::with_capacity(records.len());
-    for record in records {
-        let (states, words) = sponge_trace(record);
+    for (states, words) in traces {
         initial_states.extend_from_slice(&states);
         initial_states.extend(std::iter::repeat_n(zero_state, PERM_SLOTS - LIVE_PERMS));
         all_words.push(words);
@@ -352,12 +396,14 @@ pub fn prove_sponge<Ch: Challenger>(
     while initial_states.len() < setup.keccak.n_keccak_slots() {
         initial_states.push(zero_state);
     }
+    lap("sponge traces");
 
     let (z_packed, a_packed, b_packed, z_lincheck) =
         keccak::generate_witness_with_ab_packed_and_lincheck(
             &initial_states,
             setup.keccak.n_keccaks_log(),
         );
+    lap("keccak witness");
     let core = crate::prover::prove_fast_core(
         &setup.keccak.r1cs,
         &setup.keccak.pcs_params,
@@ -368,6 +414,7 @@ pub fn prove_sponge<Ch: Challenger>(
         &KeccakLincheckCircuit,
         challenger,
     );
+    lap("keccak core (commit + zerocheck + lincheck)");
 
     challenger.observe_label(b"aerie-sponge-challenges-v0");
     let delta = challenger.sample_f128();
@@ -375,15 +422,35 @@ pub fn prove_sponge<Ch: Challenger>(
 
     let points = sponge_points(record_vars, delta, &r).expect("derived coords defined");
     let opening_values: Vec<F128> = points
-        .iter()
+        .par_iter()
         .map(|point| {
             let (fixed, free) = split_boolean(point);
             gather_eval_split(&core.z_packed, fixed, &free)
         })
         .collect();
+    lap("opening values");
 
-    let ab = core.ab.clone();
-    let c = core.c.clone();
+    SpongeCore {
+        fast: core,
+        points,
+        opening_values,
+        all_words,
+    }
+}
+
+/// The sponge lane's single batched opening: `[ab, c]` quirky, the
+/// chaining claims, and any cross-lane multilinear `extra_points`
+/// (appended after the lane's own claims, values carried by the caller).
+/// Returns the prover data for callers that keep artifacts.
+pub fn open_sponge<Ch: Challenger>(
+    setup: &SpongeSetup,
+    core: SpongeCore,
+    extra_points: &[Vec<F128>],
+    challenger: &mut Ch,
+) -> (SpongeProof, pcs::ProverData) {
+    let fast = core.fast;
+    let ab = fast.ab.clone();
+    let c = fast.c.clone();
     let mut x_fulls: Vec<Vec<F128>> = vec![
         {
             let mut v = ab.point.x_inner_rest.clone();
@@ -396,26 +463,28 @@ pub fn prove_sponge<Ch: Challenger>(
             v
         },
     ];
-    for point in &points {
+    for point in core.points.iter().chain(extra_points) {
         let (_low, x_outer) = flock_claim_shape(point);
         x_fulls.push(x_outer);
     }
     let x_refs: Vec<&[F128]> = x_fulls.iter().map(|v| v.as_slice()).collect();
-    let pre_ab: Option<&[F128]> = core.s_hat_v_ab.as_deref();
-    let pre_c: Option<&[F128]> = Some(core.s_hat_v_c.as_slice());
+    let pre_ab: Option<&[F128]> = fast.s_hat_v_ab.as_deref();
+    let pre_c: Option<&[F128]> = Some(fast.s_hat_v_c.as_slice());
     let mut precomputed: Vec<Option<&[F128]>> = vec![pre_ab, pre_c];
-    precomputed.extend(std::iter::repeat_n(None, points.len()));
+    precomputed.extend(std::iter::repeat_n(
+        None,
+        core.points.len() + extra_points.len(),
+    ));
     let lig_config = setup
         .keccak
         .pcs_params
         .ligerito_prover_config()
         .expect("Ligerito config");
     let padding = setup.keccak.r1cs.padding_spec();
-    let z_packed_kept = core.z_packed.clone();
     let pcs_open = pcs::open_batch_mixed_ligerito_with_precomputed_s_hat_v(
-        core.z_packed,
-        &core.prover_data,
-        &core.commitment,
+        fast.z_packed,
+        &fast.prover_data,
+        &fast.commitment,
         &x_refs,
         &precomputed,
         &[],
@@ -424,21 +493,15 @@ pub fn prove_sponge<Ch: Challenger>(
         challenger,
     );
 
-    let commitment = core.commitment;
     (
         SpongeProof {
-            commitment: commitment.clone(),
-            zerocheck: core.zc_proof,
-            lincheck: core.lc_proof,
-            opening_values,
+            commitment: fast.commitment,
+            zerocheck: fast.zc_proof,
+            lincheck: fast.lc_proof,
+            opening_values: core.opening_values,
             pcs_open,
         },
-        all_words,
-        LaneArtifacts {
-            z_packed: z_packed_kept,
-            prover_data: core.prover_data,
-            commitment,
-        },
+        fast.prover_data,
     )
 }
 
@@ -493,12 +556,32 @@ fn gather_eval_split(z_packed: &[F128], fixed: usize, free: &[(usize, F128)]) ->
 }
 
 /// Verify the sponge lane against the public inputs.
+/// The verifier-side counterpart of [`SpongeCore`]: the replayed base
+/// claims and the lane's own opening points, ready for the batch verify.
+pub struct SpongeVerifyCore {
+    pub ab: flock_core::proof::ZClaim,
+    pub c: flock_core::proof::ZClaim,
+    pub points: Vec<Vec<F128>>,
+}
+
 pub fn verify_sponge<Ch: Challenger>(
     setup: &SpongeSetup,
     publics: &[SpongePublic],
     proof: &SpongeProof,
     challenger: &mut Ch,
 ) -> Result<(), &'static str> {
+    let core = verify_sponge_core(setup, publics, proof, challenger)?;
+    verify_sponge_open(setup, proof, core, &[], &[], challenger)
+}
+
+/// Everything except the batched opening: base R1CS replay, the sponge
+/// challenges, and the chaining/pinning checks over the claimed values.
+pub fn verify_sponge_core<Ch: Challenger>(
+    setup: &SpongeSetup,
+    publics: &[SpongePublic],
+    proof: &SpongeProof,
+    challenger: &mut Ch,
+) -> Result<SpongeVerifyCore, &'static str> {
     assert_eq!(publics.len(), setup.records);
     let record_vars = setup.record_vars();
     let (ab, c) = flock_core::verifier::verify_core(
@@ -542,8 +625,27 @@ pub fn verify_sponge<Ch: Challenger>(
     }
 
     let points = sponge_points(record_vars, delta, &r).ok_or("degenerate delta")?;
+    Ok(SpongeVerifyCore { ab, c, points })
+}
+
+/// Verify the lane's single batched opening: `[ab, c]` quirky, the
+/// chaining claims, and any cross-lane `extra_points`/`extra_values`
+/// (in the same order the prover folded them in).
+pub fn verify_sponge_open<Ch: Challenger>(
+    setup: &SpongeSetup,
+    proof: &SpongeProof,
+    core: SpongeVerifyCore,
+    extra_points: &[Vec<F128>],
+    extra_values: &[F128],
+    challenger: &mut Ch,
+) -> Result<(), &'static str> {
+    if extra_points.len() != extra_values.len() {
+        return Err("extra claim points and values disagree");
+    }
+    let SpongeVerifyCore { ab, c, points } = core;
     let mut claim_values = vec![ab.value, c.value];
-    claim_values.extend_from_slice(values);
+    claim_values.extend_from_slice(&proof.opening_values);
+    claim_values.extend_from_slice(extra_values);
     let mut bindings = vec![
         LowBinding::Quirky {
             z_skip: ab.point.z_skip,
@@ -564,7 +666,7 @@ pub fn verify_sponge<Ch: Challenger>(
             v
         },
     ];
-    for point in &points {
+    for point in points.iter().chain(extra_points) {
         let (x_low, x_outer) = flock_claim_shape(point);
         bindings.push(LowBinding::Multilinear { x_low });
         x_fulls.push(x_outer);

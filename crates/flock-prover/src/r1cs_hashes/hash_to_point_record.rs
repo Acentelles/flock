@@ -648,11 +648,49 @@ fn reconstruct_terminal(
 /// Prove the record lane for `setup.n_blocks` records: slot R1CS, the
 /// scatter binding `Z_H` to the gated outputs, the discharge, and one
 /// batched opening for everything.
+/// Everything the record lane produces before its batched opening.
+/// Cross-lane arguments read `z_packed` for their claim values and fold
+/// their points into [`open_record`].
+pub struct RecordCore {
+    pub z_packed: Vec<F128>,
+    pub prover_data: pcs::ProverData,
+    pub commitment: Commitment,
+    pub zc_proof: zerocheck::ZerocheckProof,
+    pub lc_proof: lincheck::LincheckProof,
+    pub scatter_proof: scatter::ScatterProof,
+    pub ab: ZClaim,
+    pub c: ZClaim,
+    pub s_hat_v_ab: Vec<F128>,
+    pub s_hat_v_c: Vec<F128>,
+    pub opening_values: Vec<F128>,
+    pub fingerprint_value: F128,
+    pub points: Vec<Vec<F128>>,
+}
+
+/// The standalone record lane: core plus an immediate opening with no
+/// cross-lane claims. Transcript-identical to the composed path with an
+/// empty extra set.
 pub fn prove_record<Ch: Challenger>(
     setup: &SlotSetup,
     blocks: &[[u16; SLOTS]],
     challenger: &mut Ch,
 ) -> (RecordProof, super::hash_to_point_sponge::LaneArtifacts) {
+    let core = prove_record_core(setup, blocks, challenger);
+    let z_packed = core.z_packed.clone();
+    let (proof, prover_data) = open_record(setup, core, &[], challenger);
+    let artifacts = super::hash_to_point_sponge::LaneArtifacts {
+        z_packed,
+        prover_data,
+        commitment: proof.commitment.clone(),
+    };
+    (proof, artifacts)
+}
+
+pub fn prove_record_core<Ch: Challenger>(
+    setup: &SlotSetup,
+    blocks: &[[u16; SLOTS]],
+    challenger: &mut Ch,
+) -> RecordCore {
     let r1cs = &setup.r1cs;
     let record_vars = r1cs.m - slots::K_LOG;
     let trace = std::env::var("RECORD_TRACE").is_ok();
@@ -670,10 +708,6 @@ pub fn prove_record<Ch: Challenger>(
     lap("witness generation", &mut stage);
     let z_packed = pcs::pack_witness(&z, r1cs.m);
     lap("pack_witness", &mut stage);
-    let lig_config = setup
-        .pcs_params
-        .ligerito_prover_config()
-        .expect("Ligerito config");
 
     let (commitment, prover_data) = pcs::commit(&z_packed, &setup.pcs_params);
     bind_statement(challenger, r1cs, &commitment);
@@ -748,33 +782,68 @@ pub fn prove_record<Ch: Challenger>(
         fingerprint_value += F128 { lo: 1 << c, hi: 0 } * opening_values[44 + c];
     }
 
-    // The single batched opening: [ab, c] plus every multilinear claim.
+    RecordCore {
+        z_packed,
+        prover_data,
+        commitment,
+        zc_proof,
+        lc_proof,
+        scatter_proof,
+        ab,
+        c,
+        s_hat_v_ab,
+        s_hat_v_c,
+        opening_values,
+        fingerprint_value,
+        points,
+    }
+}
+
+/// The record lane's single batched opening: `[ab, c]` quirky, the
+/// lane's multilinear claims, and any cross-lane `extra_points`
+/// (appended after the lane's own claims, values carried by the caller).
+/// Returns the prover data for callers that keep artifacts.
+pub fn open_record<Ch: Challenger>(
+    setup: &SlotSetup,
+    core: RecordCore,
+    extra_points: &[Vec<F128>],
+    challenger: &mut Ch,
+) -> (RecordProof, pcs::ProverData) {
+    let trace = std::env::var("RECORD_TRACE").is_ok();
+    let stage = std::time::Instant::now();
+    let lig_config = setup
+        .pcs_params
+        .ligerito_prover_config()
+        .expect("Ligerito config");
+    let padding = setup.r1cs.padding_spec();
     let mut x_fulls: Vec<Vec<F128>> = vec![
         {
-            let mut v = ab.point.x_inner_rest.clone();
-            v.extend_from_slice(&ab.point.x_outer);
+            let mut v = core.ab.point.x_inner_rest.clone();
+            v.extend_from_slice(&core.ab.point.x_outer);
             v
         },
         {
-            let mut v = c.point.x_inner_rest.clone();
-            v.extend_from_slice(&c.point.x_outer);
+            let mut v = core.c.point.x_inner_rest.clone();
+            v.extend_from_slice(&core.c.point.x_outer);
             v
         },
     ];
-    for p in &points {
+    for p in core.points.iter().chain(extra_points) {
         let (_low, x_outer) = flock_claim_shape(p);
         x_fulls.push(x_outer);
     }
     let x_refs: Vec<&[F128]> = x_fulls.iter().map(|v| v.as_slice()).collect();
-    let pre_ab: Option<&[F128]> = Some(s_hat_v_ab.as_slice());
-    let pre_c: Option<&[F128]> = Some(s_hat_v_c.as_slice());
+    let pre_ab: Option<&[F128]> = Some(core.s_hat_v_ab.as_slice());
+    let pre_c: Option<&[F128]> = Some(core.s_hat_v_c.as_slice());
     let mut precomputed: Vec<Option<&[F128]>> = vec![pre_ab, pre_c];
-    precomputed.extend(std::iter::repeat_n(None, points.len()));
-    let z_packed_kept = z_packed.clone();
+    precomputed.extend(std::iter::repeat_n(
+        None,
+        core.points.len() + extra_points.len(),
+    ));
     let pcs_open = pcs::open_batch_mixed_ligerito_with_precomputed_s_hat_v(
-        z_packed,
-        &prover_data,
-        &commitment,
+        core.z_packed,
+        &core.prover_data,
+        &core.commitment,
         &x_refs,
         &precomputed,
         &[],
@@ -782,26 +851,36 @@ pub fn prove_record<Ch: Challenger>(
         &lig_config,
         challenger,
     );
+    if trace {
+        eprintln!(
+            "  [prove_record] batched open: {:7.1} ms",
+            stage.elapsed().as_secs_f64() * 1e3
+        );
+    }
 
-    lap("batched open", &mut stage);
-
-    let artifacts = super::hash_to_point_sponge::LaneArtifacts {
-        z_packed: z_packed_kept,
-        prover_data,
-        commitment: commitment.clone(),
-    };
     (
         RecordProof {
-            commitment,
-            zerocheck: zc_proof,
-            lincheck: lc_proof,
-            scatter: scatter_proof,
-            opening_values,
-            fingerprint_value,
+            commitment: core.commitment,
+            zerocheck: core.zc_proof,
+            lincheck: core.lc_proof,
+            scatter: core.scatter_proof,
+            opening_values: core.opening_values,
+            fingerprint_value: core.fingerprint_value,
             pcs_open,
         },
-        artifacts,
+        core.prover_data,
     )
+}
+
+/// The verifier-side counterpart of [`RecordCore`]: the replayed base
+/// claims and the lane's own opening points, plus the fingerprint leaf
+/// data the aerie side consumes.
+pub struct RecordVerifyCore {
+    pub ab: ZClaim,
+    pub c: ZClaim,
+    pub points: Vec<Vec<F128>>,
+    pub r_fp: Vec<F128>,
+    pub fingerprint_value: F128,
 }
 
 /// Verify a [`RecordProof`]: base R1CS replay, the scatter and its
@@ -811,6 +890,24 @@ pub fn verify_record<Ch: Challenger>(
     proof: &RecordProof,
     challenger: &mut Ch,
 ) -> Result<(R1csClaim, Vec<F128>, F128), &'static str> {
+    let core = verify_record_core(setup, proof, challenger)?;
+    let claim = R1csClaim {
+        ab: core.ab.clone(),
+        c: core.c.clone(),
+    };
+    let r_fp = core.r_fp.clone();
+    let fingerprint_value = core.fingerprint_value;
+    verify_record_open(setup, proof, core, &[], &[], challenger)?;
+    Ok((claim, r_fp, fingerprint_value))
+}
+
+/// Everything except the batched opening: base R1CS replay, the scatter
+/// and its discharge, and the Z_H binding identity.
+pub fn verify_record_core<Ch: Challenger>(
+    setup: &SlotSetup,
+    proof: &RecordProof,
+    challenger: &mut Ch,
+) -> Result<RecordVerifyCore, &'static str> {
     let r1cs = &setup.r1cs;
     let record_vars = r1cs.m - slots::K_LOG;
     let (ab, c) = flock_core::verifier::verify_core(
@@ -865,11 +962,35 @@ pub fn verify_record<Ch: Challenger>(
         return Err("the Z_H power sum does not match the scatter claim");
     }
 
-    // The single batched opening: [ab, c] quirky plus the multilinear set.
     let points = multilinear_points(record_vars, &rs, &r_fp, beta, gamma, delta)
         .ok_or("degenerate power point")?;
+    Ok(RecordVerifyCore {
+        ab,
+        c,
+        points,
+        r_fp,
+        fingerprint_value,
+    })
+}
+
+/// Verify the lane's single batched opening: `[ab, c]` quirky, the lane's
+/// multilinear claims, and any cross-lane `extra_points`/`extra_values`
+/// (in the same order the prover folded them in).
+pub fn verify_record_open<Ch: Challenger>(
+    setup: &SlotSetup,
+    proof: &RecordProof,
+    core: RecordVerifyCore,
+    extra_points: &[Vec<F128>],
+    extra_values: &[F128],
+    challenger: &mut Ch,
+) -> Result<(), &'static str> {
+    if extra_points.len() != extra_values.len() {
+        return Err("extra claim points and values disagree");
+    }
+    let RecordVerifyCore { ab, c, points, .. } = core;
     let mut claim_values = vec![ab.value, c.value];
-    claim_values.extend_from_slice(values);
+    claim_values.extend_from_slice(&proof.opening_values);
+    claim_values.extend_from_slice(extra_values);
     let mut bindings = vec![
         LowBinding::Quirky {
             z_skip: ab.point.z_skip,
@@ -890,7 +1011,7 @@ pub fn verify_record<Ch: Challenger>(
             v
         },
     ];
-    for p in &points {
+    for p in points.iter().chain(extra_points) {
         let (x_low, x_outer) = flock_claim_shape(p);
         bindings.push(LowBinding::Multilinear { x_low });
         x_fulls.push(x_outer);
@@ -910,6 +1031,5 @@ pub fn verify_record<Ch: Challenger>(
         &lig_config,
         challenger,
     )
-    .map_err(|_| "batched opening verification failed")?;
-    Ok((R1csClaim { ab, c }, r_fp, fingerprint_value))
+    .map_err(|_| "batched opening verification failed")
 }

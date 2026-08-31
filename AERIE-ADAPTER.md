@@ -175,9 +175,13 @@ commitment of the region or a sub-cube opening; decide by measurement
    address-bit complement (`gamma` weights `(gamma^8, 1)` on position
    bit 3) and the x-planes sixteen-aligned so the bit combination is
    one tensor. `prove_hash_to_point`/`verify_hash_to_point` drive both
-   lanes plus the linkage under one transcript; the linkage currently
-   opens each commitment once more (folding its claims into the lanes'
-   main batches is a known optimization). The full composition
+   lanes plus the linkage under one transcript. The linkage claims are
+   FOLDED into the lanes' single batched openings (each lane split into
+   `*_core` + `open_*` taking extra points; the composed driver runs
+   both cores, samples the linkage, then opens each lane once): two
+   Ligerito openings total, proof bytes 1,420,280 -> 849,536 at 32
+   records and 1,470,752 -> 876,104 at 64 (about -40%), and the
+   packed-witness clones leave the composed path. The full composition
    roundtrips (`full_hash_to_point_roundtrips`, 32 records, with
    linkage-value and public-message tamper rejection). Landing it
    required a fork fix in `pcs/ligerito.rs`: the succinct verifier's
