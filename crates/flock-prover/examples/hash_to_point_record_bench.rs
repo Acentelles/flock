@@ -49,7 +49,7 @@ fn main() {
 
         let t = std::time::Instant::now();
         let mut prover_challenger = FsChallenger::new(b"aerie-record-bench");
-        let proof = prove_record(&setup, &blocks, &mut prover_challenger);
+        let (proof, _artifacts) = prove_record(&setup, &blocks, &mut prover_challenger);
         let prove_ms = t.elapsed().as_secs_f64() * 1e3;
 
         let proof_bytes = bincode::serialize(&proof).expect("serialize").len();

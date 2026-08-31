@@ -225,7 +225,7 @@ mod tests {
         let setup = SlotSetup::new(n_records);
         let blocks = record_batch(n_records);
         let mut prover_challenger = FsChallenger::new(b"aerie-record-proof");
-        let proof = prove_record(&setup, &blocks, &mut prover_challenger);
+        let (proof, _artifacts) = prove_record(&setup, &blocks, &mut prover_challenger);
 
         let mut verifier_challenger = FsChallenger::new(b"aerie-record-proof");
         verify_record(&setup, &proof, &mut verifier_challenger).expect("record proof verifies");
@@ -652,7 +652,7 @@ pub fn prove_record<Ch: Challenger>(
     setup: &SlotSetup,
     blocks: &[[u16; SLOTS]],
     challenger: &mut Ch,
-) -> RecordProof {
+) -> (RecordProof, super::hash_to_point_sponge::LaneArtifacts) {
     let r1cs = &setup.r1cs;
     let record_vars = r1cs.m - slots::K_LOG;
     let trace = std::env::var("RECORD_TRACE").is_ok();
@@ -767,6 +767,7 @@ pub fn prove_record<Ch: Challenger>(
     let pre_c: Option<&[F128]> = Some(s_hat_v_c.as_slice());
     let mut precomputed: Vec<Option<&[F128]>> = vec![pre_ab, pre_c];
     precomputed.extend(std::iter::repeat_n(None, points.len()));
+    let z_packed_kept = z_packed.clone();
     let pcs_open = pcs::open_batch_mixed_ligerito_with_precomputed_s_hat_v(
         z_packed,
         &prover_data,
@@ -781,15 +782,23 @@ pub fn prove_record<Ch: Challenger>(
 
     lap("batched open", &mut stage);
 
-    RecordProof {
-        commitment,
-        zerocheck: zc_proof,
-        lincheck: lc_proof,
-        scatter: scatter_proof,
-        opening_values,
-        fingerprint_value,
-        pcs_open,
-    }
+    let artifacts = super::hash_to_point_sponge::LaneArtifacts {
+        z_packed: z_packed_kept,
+        prover_data,
+        commitment: commitment.clone(),
+    };
+    (
+        RecordProof {
+            commitment,
+            zerocheck: zc_proof,
+            lincheck: lc_proof,
+            scatter: scatter_proof,
+            opening_values,
+            fingerprint_value,
+            pcs_open,
+        },
+        artifacts,
+    )
 }
 
 /// Verify a [`RecordProof`]: base R1CS replay, the scatter and its

@@ -159,8 +159,33 @@ commitment of the region or a sub-cube opening; decide by measurement
 1. Bucket descriptors: fixed shapes per (absorption blocks, squeeze
    blocks) per aerie spec Section 4, as repeated block-diagonal
    descriptors.
-2. Sponge-chain amendment: public-XOR absorption plus the witness salt
-   block (Section 3.1).
+2. Sponge-chain amendment: DONE in `hash_to_point_sponge.rs`, and
+   simpler than planned: records stride sixteen Keccak instances, so
+   with a post-commitment `delta` every chaining constraint is a
+   transparent-weighted SUB-CUBE OPENING pair (no chain shift sumcheck):
+   interior edges `IN_e = OUT_(e-1)`, the absorption edge plus the
+   verifier-computed public MLE of the second message blocks, and the
+   record-start pinning with the 320 salt bits subtracted as two scaled
+   aligned sub-cubes. The witness's physical state layout is lane-major
+   = FIPS byte order, so byte ranges are sub-cubes directly; a sha3
+   differential pins the simulation and padding. The WORD LINKAGE
+   (`hash_to_point_link.rs`) closes the last gap: the slot words equal
+   the squeeze stream via four-challenge weighted sums over aligned
+   piece decompositions, with the big-endian byte swap a single
+   address-bit complement (`gamma` weights `(gamma^8, 1)` on position
+   bit 3) and the x-planes sixteen-aligned so the bit combination is
+   one tensor. `prove_hash_to_point`/`verify_hash_to_point` drive both
+   lanes plus the linkage under one transcript; the linkage currently
+   opens each commitment once more (folding its claims into the lanes'
+   main batches is a known optimization). The full composition
+   roundtrips (`full_hash_to_point_roundtrips`, 32 records, with
+   linkage-value and public-message tamper rejection). Landing it
+   required a fork fix in `pcs/ligerito.rs`: the succinct verifier's
+   final-level `yr` binding samples `alpha_last`/`beta_last`, but the
+   prover never consumed them, so the challengers desynced for any
+   protocol stage appended AFTER an opening (invisible upstream because
+   opens were always the terminal transcript consumer). The prover's
+   terminal branch now mirrors both samples.
 3. Slot-relation encoder (Section 3.2): DONE through the generic
    proving path in `r1cs_hashes/hash_to_point_slots.rs`, restructured
    to ONE RECORD PER BLOCK (`K_LOG = 16`, 612 slots, 93% utilization):
@@ -236,9 +261,13 @@ commitment of the region or a sub-cube opening; decide by measurement
    trait impl is type conversion only (same field, same polynomial).
 6. E2 host benchmarks:
    `cargo run --release --example hash_to_point_record_bench [N...]`
-   emits TSV (records, slots, setup/prove/verify ms, proof bytes) with
-   the coverage banner. The sponge lane (work item 2) is the one
-   remaining circuit gap; any comparison must say so.
+   emits TSV for the record lane alone (coverage banner: no sponge).
+   `cargo run --release --example hash_to_point_full_bench [N...]`
+   benches the COMPLETE relation (sponge + slots + scatter + `Z_H` +
+   fingerprint + word linkage; salt private). Still outside it: the
+   aerie-side dual-commitment consistency and the composed Section 7
+   transcript; never present either as a Falcon aggregate-signature
+   result.
 
 ## 5. Open questions
 

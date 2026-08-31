@@ -324,11 +324,19 @@ fn salt_scales(r: &[F128]) -> (F128, F128) {
     (s256, s64)
 }
 
+/// Prover-side leftovers a cross-lane argument needs to open this
+/// commitment again: the packed witness and the commit-time data.
+pub struct LaneArtifacts {
+    pub z_packed: Vec<F128>,
+    pub prover_data: pcs::ProverData,
+    pub commitment: Commitment,
+}
+
 pub fn prove_sponge<Ch: Challenger>(
     setup: &SpongeSetup,
     records: &[SpongeRecord],
     challenger: &mut Ch,
-) -> (SpongeProof, Vec<Vec<u16>>) {
+) -> (SpongeProof, Vec<Vec<u16>>, LaneArtifacts) {
     assert_eq!(records.len(), setup.records);
     let record_vars = setup.record_vars();
     let zero_state: State = [false; STATE_BITS];
@@ -370,7 +378,7 @@ pub fn prove_sponge<Ch: Challenger>(
         .iter()
         .map(|point| {
             let (fixed, free) = split_boolean(point);
-            gather_eval(&core.z_packed, fixed, &free)
+            gather_eval_split(&core.z_packed, fixed, &free)
         })
         .collect();
 
@@ -403,6 +411,7 @@ pub fn prove_sponge<Ch: Challenger>(
         .ligerito_prover_config()
         .expect("Ligerito config");
     let padding = setup.keccak.r1cs.padding_spec();
+    let z_packed_kept = core.z_packed.clone();
     let pcs_open = pcs::open_batch_mixed_ligerito_with_precomputed_s_hat_v(
         core.z_packed,
         &core.prover_data,
@@ -415,16 +424,28 @@ pub fn prove_sponge<Ch: Challenger>(
         challenger,
     );
 
+    let commitment = core.commitment;
     (
         SpongeProof {
-            commitment: core.commitment,
+            commitment: commitment.clone(),
             zerocheck: core.zc_proof,
             lincheck: core.lc_proof,
             opening_values,
             pcs_open,
         },
         all_words,
+        LaneArtifacts {
+            z_packed: z_packed_kept,
+            prover_data: core.prover_data,
+            commitment,
+        },
     )
+}
+
+/// Gather-and-fold bit-MLE evaluation of the packed witness at a point.
+pub fn gather_eval(z_packed: &[F128], point: &[F128]) -> F128 {
+    let (fixed, free) = split_boolean(point);
+    gather_eval_split(z_packed, fixed, &free)
 }
 
 /// Split a point into its Boolean-fixed address offset and free coords
@@ -446,7 +467,7 @@ fn split_boolean(point: &[F128]) -> (usize, Vec<(usize, F128)>) {
 }
 
 /// Gather-and-fold bit-MLE evaluation over the PACKED witness.
-fn gather_eval(z_packed: &[F128], fixed: usize, free: &[(usize, F128)]) -> F128 {
+fn gather_eval_split(z_packed: &[F128], fixed: usize, free: &[(usize, F128)]) -> F128 {
     let free_vars = free.len();
     let mut layer = vec![F128::ZERO; 1 << free_vars];
     for (index, slot) in layer.iter_mut().enumerate() {
@@ -621,7 +642,7 @@ mod tests {
             .collect();
 
         let mut prover_challenger = FsChallenger::new(b"aerie-sponge-proof");
-        let (proof, words) = prove_sponge(&setup, &inputs, &mut prover_challenger);
+        let (proof, words, _artifacts) = prove_sponge(&setup, &inputs, &mut prover_challenger);
         assert_eq!(words.len(), records);
 
         let mut verifier_challenger = FsChallenger::new(b"aerie-sponge-proof");

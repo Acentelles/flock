@@ -14,6 +14,8 @@ pub mod blake3;
 /// [`ChainLayout`]: chain_common::ChainLayout
 pub mod chain_common;
 pub mod common;
+/// The cross-lane word linkage plus the complete HashToPoint driver.
+pub mod hash_to_point_link;
 /// Record assembly for the aerie private-salt lane: real commitments and
 /// openings for the slot proof, scatter, Z_H table, and fingerprint.
 pub mod hash_to_point_record;

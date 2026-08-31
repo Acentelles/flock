@@ -570,8 +570,8 @@ mod tests {
         let mut direct = F128::ZERO;
         let mut power = F128::ONE;
         for &c in &table {
-            direct = direct + c * power;
-            power = power * beta;
+            direct += c * power;
+            power *= beta;
         }
         let (point, scale) = power_sum_point(beta, 9).expect("beta powers != 1");
         assert_eq!(direct, scale * eval_mle(&table, &point));
@@ -699,7 +699,7 @@ mod tests {
 
         // A tampered counter claim rejects.
         let mut wrong = discharge.clone();
-        wrong.counter_claims[3] = wrong.counter_claims[3] + F128::ONE;
+        wrong.counter_claims[3] += F128::ONE;
         let mut fresh = FsChallenger::new(b"aerie-scatter-full");
         let (point, terminal) =
             verify(&proof, SLOT_VARS, FACTORS, &mut fresh).expect("scatter verifies");
@@ -746,7 +746,7 @@ mod tests {
 
         // A tampered round rejects or mismatches the terminal.
         let mut wrong = proof.clone();
-        wrong.rounds[4][2] = wrong.rounds[4][2] + F128::ONE;
+        wrong.rounds[4][2] += F128::ONE;
         let mut fresh = FsChallenger::new(b"aerie-scatter-test");
         match verify(&wrong, SLOT_VARS, FACTORS, &mut fresh) {
             Err(_) => {}

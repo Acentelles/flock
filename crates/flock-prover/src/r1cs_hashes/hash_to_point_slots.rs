@@ -41,19 +41,17 @@
 //! of the witness, so its MLE at `r` is an ordinary opening at
 //! `(plane bits, r)`, and the counter prefix parities reduce through one
 //! less-than-weighted sumcheck (the LT multilinear is verifier-evaluable
-//! in `O(n)`). 101 planes, `USEFUL_BITS = 103,424` of 131,072 (79%).
+//! in `O(n)`). 120 planes (with alignment gaps),
+//! `USEFUL_BITS = 122,880` of 131,072 (94%).
 //!
 //! ```text
-//! plane 0        constant-one wire at slot 0 (const_pin); rest forced zero
-//! planes 1..17   x bits (free inputs)
-//! planes 17..20  q bits (free inputs)
-//! planes 20..36  accept-chain products;   36 accept flag
-//! planes 37..40  3q-adder products;       40..56 borrow products
-//! planes 56..70  centering products;      70 centering flag
-//! planes 71..85  range products;          85..90 forced-zero rows
-//! planes 90..100 counter products;        100 write gate
-//! planes 101..111 materialized counter-after bits
-//! planes 112..120 the dense Z_H region (free inputs, scatter-bound)
+//! plane 0          constant-one wire at slot 0 (const_pin)
+//! planes 1..15     q bits, accept, 3q products, centering, gate, pins
+//! planes 16..32    x bits (free inputs, SIXTEEN-ALIGNED for the linkage)
+//! planes 32..48    accept-chain products; 48..64 borrow products
+//! planes 64..78    centering products;    78..92 range products
+//! planes 92..102   counter products;      102..112 counter-after bits
+//! planes 112..120  the dense Z_H region (free inputs, scatter-bound)
 //! rest           zero padding (empty rows)
 //! ```
 
@@ -79,29 +77,36 @@ pub const SLOT_VARS: usize = 10;
 pub const COUNTER_BITS: usize = 10;
 pub const Z_CONST_POS: usize = 0;
 
-// Plane indices (wire = plane * PLANE + slot).
-const X: usize = 1; // 16 planes: candidate word bits, free inputs
-const Q: usize = 17; // 3 planes: quotient bits, free inputs
-const D: usize = 20; // 16 planes: accept-chain carry products
-const ACC: usize = 36; // materialized accept flag
-const E: usize = 37; // 3 planes: carry products of the 3q mini-adder
-const G: usize = 40; // 16 planes: borrow products of x - M
-const U_CHAIN: usize = 56; // 14 planes: centering-chain carry products
-const U: usize = 70; // materialized centering flag
-const R_CHAIN: usize = 71; // 14 planes: range-chain carry products
-const PIN_RANGE: usize = 85; // forced zero: carry-out of a + 4,095
-const PIN_A14: usize = 86; // forced zero: subtraction bit 14
-const PIN_A15: usize = 87; // forced zero: subtraction bit 15
-const PIN_B16: usize = 88; // forced zero: final borrow of x - M
-const PIN_T4: usize = 89; // forced zero: t_4 of 3q, so q <= 5
-const H: usize = 90; // 10 planes: counter-increment carry products
-const GATE: usize = 100; // write gate: acc AND (count-before < 512)
+// Plane indices (wire = plane * PLANE + slot). The sixteen x-bit planes
+// sit at a SIXTEEN-ALIGNED base so the word linkage's bit combination is
+// one gamma'-tensor over the four low plane bits; the small aux planes
+// pack below them. Plane order is NOT dependency order; witness
+// generation evaluates classes explicitly.
+const Q: usize = 1; // 3 planes: quotient bits, free inputs
+const ACC: usize = 4; // materialized accept flag
+const E: usize = 5; // 3 planes: carry products of the 3q mini-adder
+const U: usize = 8; // materialized centering flag
+const GATE_P: usize = 9; // (kept name GATE below at its new home)
+const PIN_RANGE: usize = 10; // forced zero: carry-out of a + 4,095
+const PIN_A14: usize = 11; // forced zero: subtraction bit 14
+const PIN_A15: usize = 12; // forced zero: subtraction bit 15
+const PIN_B16: usize = 13; // forced zero: final borrow of x - M
+const PIN_T4: usize = 14; // forced zero: t_4 of 3q, so q <= 5
+/// The candidate-word bit planes, sixteen-aligned for the word linkage.
+pub const X_BASE: usize = 16;
+const X: usize = X_BASE; // 16 planes: candidate word bits, free inputs
+const D: usize = 32; // 16 planes: accept-chain carry products
+const G: usize = 48; // 16 planes: borrow products of x - M
+const U_CHAIN: usize = 64; // 14 planes: centering-chain carry products
+const R_CHAIN: usize = 78; // 14 planes: range-chain carry products
+const H: usize = 92; // 10 planes: counter-increment carry products
+const GATE: usize = GATE_P; // write gate: acc AND (count-before < 512)
 /// Materialized counter-AFTER bits (ten planes): slot `s` holds the
 /// count after `s`'s increment. Keeping these as wires makes every
 /// counter tap O(1) (the symbolic prefix supports were O(s) per slot)
 /// and turns the scatter's counter factors into plain sub-cube openings:
 /// on gated slots `beta^(count-before) = beta^(-1) beta^(count-after)`.
-const CNT: usize = 101;
+const CNT: usize = 102;
 /// The dense `Z_H` region: 512 output indices x 16 coordinate planes
 /// (15 live) = 2^13 bits per record, as eight planes at an eight-aligned
 /// base so the region is a sub-cube (top-four plane bits = 14). Free
@@ -117,13 +122,14 @@ const fn pos(plane: usize, slot: usize) -> usize {
 }
 
 /// Free inputs: the constant wire, the x bits and q bits of live slots,
-/// and the `Z_H` region. Shared by witness generation and the tests'
-/// re-derivation.
+/// and the `Z_H` region. Used by the tests' independent re-derivation of
+/// the witness (production witgen fills planes in explicit class order).
+#[cfg(test)]
 fn is_input(w: usize) -> bool {
     let plane = w / PLANE;
     let slot = w % PLANE;
     w == Z_CONST_POS
-        || (slot < SLOTS && (X..Q + 3).contains(&plane))
+        || (slot < SLOTS && ((X..X + 16).contains(&plane) || (Q..Q + 3).contains(&plane)))
         || (Z_BASE..Z_BASE + Z_PLANES).contains(&plane)
 }
 
@@ -532,15 +538,23 @@ pub fn build_block_witness_with(
         }
     }
     let eval = |lin: &[usize], z: &[bool]| lin.iter().fold(false, |acc, &col| acc ^ z[col]);
-    // Dependency-aware order: the chains below plane H are slot-local and
-    // ascending; the counter family alternates between planes across
-    // slots (H(s) taps CNT(s-1), CNT(s) taps H(s)), so it is evaluated
-    // slot-major; everything above is inputs or forced-zero padding.
-    for w in 0..H * PLANE {
-        if is_input(w) {
-            continue;
+    // Explicit class order (plane order is layout, not dependency order):
+    // the slot-local chains first, then the counter family slot-major
+    // (H(s) taps CNT(s-1), CNT(s) taps H(s)).
+    let class_planes: Vec<usize> = (D..D + 16)
+        .chain([ACC])
+        .chain(E..E + 3)
+        .chain(G..G + 16)
+        .chain(U_CHAIN..U_CHAIN + 14)
+        .chain([U])
+        .chain(R_CHAIN..R_CHAIN + 14)
+        .chain([PIN_RANGE, PIN_A14, PIN_A15, PIN_B16, PIN_T4])
+        .collect();
+    for slot in 0..PLANE {
+        for &plane in &class_planes {
+            let w = pos(plane, slot);
+            z[w] = eval(&a_0.rows[w], &z) & eval(&b_0.rows[w], &z);
         }
-        z[w] = eval(&a_0.rows[w], &z) & eval(&b_0.rows[w], &z);
     }
     for slot in 0..PLANE {
         let gate = pos(GATE, slot);
@@ -551,12 +565,6 @@ pub fn build_block_witness_with(
             let cnt = pos(CNT + bit, slot);
             z[cnt] = eval(&a_0.rows[cnt], &z) & eval(&b_0.rows[cnt], &z);
         }
-    }
-    for w in (CNT + COUNTER_BITS) * PLANE..K {
-        if is_input(w) {
-            continue;
-        }
-        z[w] = eval(&a_0.rows[w], &z) & eval(&b_0.rows[w], &z);
     }
 
     // Fill the Z_H region from the gated slot outputs, in counter order.
