@@ -261,8 +261,33 @@ commitment of the region or a sub-cube opening; decide by measurement
    opening-value gathers per claim, sponge traces per record, and the
    linkage gathers. Same-session managed-env stage ratios at 32
    records: scatter sumcheck about 9x, witness generation about 5x,
-   opening values about 3x; host numbers pending
-   (`hash_to_point_full_bench`).
+   opening values about 3x.
+
+   COMPLETE-relation host anchors (M3 Max, quiet host, 2026-08-31,
+   `hash_to_point_full_bench`, post parallelization + linkage fold-in;
+   sponge lane + slot relation + scatter + `Z_H` + fingerprint + word
+   linkage, salt private; NOT a Falcon aggregate-signature result):
+
+   | records | prove_ms | verify_ms | proof_bytes |
+   |---:|---:|---:|---:|
+   | 32 | 139.6 | 22.2 | 849,536 |
+   | 64 | 169.1 | 23.1 | 876,104 |
+   | 128 | 258.3 | 24.3 | 903,456 |
+   | 256 | 417.5 | 25.1 | 944,272 |
+
+   Marginal cost about 1.3 ms/record with a ~100 ms floor; the
+   complete relation at 256 records is 3.7x faster than the record
+   lane ALONE was before this pass. Verifier flat at 22-25 ms. Linear
+   extrapolation to 16,384 records: about 21 s prove (a floor: PCS
+   stages grow superlinearly), 10-20x the spec's Keccak-lane estimate,
+   down from 50-100x. Bytes grow 27-41 KB per doubling, about 1.2 MB
+   extrapolated at 16,384: ABOVE the 640 KB salt array the profile
+   removes, so on wire bytes alone the profile is currently net
+   negative at target scale; the byte levers are Ligerito config
+   (query counts, rate) rather than more claim folding. Remaining
+   prover levers: PCS config tuning for these two instance shapes,
+   then the generic zerocheck/lincheck stages, now the dominant host
+   cost share.
 5. Implement aerie's `BinaryHashBackend` for the assembled system: the
    flock-side engine is `prove_record`/`verify_record` (commitment,
    relation minus the sponge lane, fingerprint value at a
