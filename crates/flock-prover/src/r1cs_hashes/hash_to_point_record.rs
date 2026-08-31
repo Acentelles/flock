@@ -738,7 +738,10 @@ pub fn prove_record<Ch: Challenger>(
 
     let points = multilinear_points(record_vars, &rs, &r_fp, beta, gamma, delta)
         .expect("derived power coordinates defined");
-    let opening_values: Vec<F128> = points.iter().map(|p| bit_mle_fast(&z, p)).collect();
+    let opening_values: Vec<F128> = {
+        use rayon::prelude::*;
+        points.par_iter().map(|p| bit_mle_fast(&z, p)).collect()
+    };
     lap("opening values", &mut stage);
     let mut fingerprint_value = F128::ZERO;
     for c in 0..15 {

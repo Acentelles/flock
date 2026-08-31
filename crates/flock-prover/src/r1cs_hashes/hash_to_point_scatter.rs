@@ -259,39 +259,62 @@ pub fn prove<Ch: Challenger>(
     mut factors: Vec<Vec<F128>>,
     challenger: &mut Ch,
 ) -> (ScatterProof, Vec<F128>) {
+    use rayon::prelude::*;
     let degree = factors.len();
-    let claim = (0..factors[0].len()).fold(F128::ZERO, |sum, s| {
-        sum + factors.iter().map(|f| f[s]).fold(F128::ONE, |p, v| p * v)
-    });
+    assert!(degree < 32, "stack buffer sized for degree < 32");
+    let claim = (0..factors[0].len())
+        .into_par_iter()
+        .map(|s| factors.iter().map(|f| f[s]).fold(F128::ONE, |p, v| p * v))
+        .reduce(|| F128::ZERO, |a, b| a + b);
     challenger.observe_label(b"aerie-scatter-v0");
     challenger.observe_f128(claim);
 
+    let points: Vec<F128> = (0..=degree as u64).map(small).collect();
     let vars = factors[0].len().trailing_zeros() as usize;
     let mut rounds = Vec::with_capacity(vars);
     let mut point = Vec::with_capacity(vars);
     while factors[0].len() > 1 {
         let half = factors[0].len() / 2;
-        let mut evals = vec![F128::ZERO; degree + 1];
-        for (t, eval) in evals.iter_mut().enumerate() {
-            let p_t = small(t as u64);
-            for i in 0..half {
-                let mut term = F128::ONE;
-                for factor in &factors {
-                    let low = factor[i];
-                    term *= low + p_t * (low + factor[half + i]);
-                }
-                *eval += term;
-            }
-        }
+        // One pass over the domain: load each factor pair once and extend
+        // it to every evaluation point, instead of degree + 1 passes.
+        let evals = (0..half)
+            .into_par_iter()
+            .fold(
+                || vec![F128::ZERO; degree + 1],
+                |mut acc, i| {
+                    let mut terms = [F128::ONE; 32];
+                    let terms = &mut terms[..degree + 1];
+                    for factor in &factors {
+                        let low = factor[i];
+                        let diff = low + factor[half + i];
+                        for (t, term) in terms.iter_mut().enumerate() {
+                            *term *= low + points[t] * diff;
+                        }
+                    }
+                    for (t, term) in terms.iter().enumerate() {
+                        acc[t] += *term;
+                    }
+                    acc
+                },
+            )
+            .reduce(
+                || vec![F128::ZERO; degree + 1],
+                |mut a, b| {
+                    for (x, y) in a.iter_mut().zip(&b) {
+                        *x += *y;
+                    }
+                    a
+                },
+            );
         challenger.observe_f128_slice(&evals);
         let challenge = challenger.sample_f128();
-        for factor in &mut factors {
+        factors.par_iter_mut().for_each(|factor| {
             for i in 0..half {
                 let low = factor[i];
                 factor[i] = low + challenge * (low + factor[half + i]);
             }
             factor.truncate(half);
-        }
+        });
         rounds.push(evals);
         point.push(challenge);
     }

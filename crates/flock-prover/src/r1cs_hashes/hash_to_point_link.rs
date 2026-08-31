@@ -243,14 +243,23 @@ pub fn prove_link<Ch: Challenger>(
         slot_link_claims(slot_record_vars, delta, nu, mu, gamma).expect("nondegenerate");
     let keccak_claims =
         keccak_link_claims(keccak_record_vars, delta, nu, mu, gamma).expect("nondegenerate");
-    let slot_values: Vec<F128> = slot_claims
-        .iter()
-        .map(|claim| sponge::gather_eval(&slot_artifacts.z_packed, &claim.point))
-        .collect();
-    let keccak_values: Vec<F128> = keccak_claims
-        .iter()
-        .map(|claim| sponge::gather_eval(&keccak_artifacts.z_packed, &claim.point))
-        .collect();
+    let (slot_values, keccak_values): (Vec<F128>, Vec<F128>) = {
+        use rayon::prelude::*;
+        rayon::join(
+            || {
+                slot_claims
+                    .par_iter()
+                    .map(|claim| sponge::gather_eval(&slot_artifacts.z_packed, &claim.point))
+                    .collect()
+            },
+            || {
+                keccak_claims
+                    .par_iter()
+                    .map(|claim| sponge::gather_eval(&keccak_artifacts.z_packed, &claim.point))
+                    .collect()
+            },
+        )
+    };
 
     let slot_points: Vec<Vec<F128>> = slot_claims.into_iter().map(|c| c.point).collect();
     let keccak_points: Vec<Vec<F128>> = keccak_claims.into_iter().map(|c| c.point).collect();

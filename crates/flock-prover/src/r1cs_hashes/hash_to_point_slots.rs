@@ -451,15 +451,19 @@ impl SlotSetup {
     /// (valid computations with the constant wire set, as `const_pin`
     /// requires). The counter reset per record is structural.
     pub fn generate_witness(&self, blocks: &[[u16; SLOTS]]) -> Vec<bool> {
+        use rayon::prelude::*;
         assert_eq!(blocks.len(), self.n_blocks);
         let padded = 1usize << (self.r1cs.m - K_LOG);
         let zero_block = [0_u16; SLOTS];
-        let mut z = Vec::with_capacity(1 << self.r1cs.m);
-        for index in 0..padded {
-            let words = blocks.get(index).unwrap_or(&zero_block);
-            let (block, _counter) = build_block_witness_with(&self.r1cs.a_0, &self.r1cs.b_0, words);
-            z.extend_from_slice(&block);
-        }
+        let mut z = vec![false; padded << K_LOG];
+        z.par_chunks_mut(1 << K_LOG)
+            .enumerate()
+            .for_each(|(index, chunk)| {
+                let words = blocks.get(index).unwrap_or(&zero_block);
+                let (block, _counter) =
+                    build_block_witness_with(&self.r1cs.a_0, &self.r1cs.b_0, words);
+                chunk.copy_from_slice(&block);
+            });
         z
     }
 

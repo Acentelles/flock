@@ -248,11 +248,17 @@ commitment of the region or a sub-cube opening; decide by measurement
    rate the bridge lane extrapolates to about 100 s at 16,384 records,
    about 50-100x the spec's Keccak-lane estimate, so the bridge lane is
    currently the profile's prover bottleneck. Known unexploited levers:
-   the custom stages (witness generation, factor tables, scatter,
-   claim values) are single-threaded while every comparison anchor is
-   10-thread, and the scatter sumcheck has standard optimizations
-   untouched (gate sparsity, factoring the transparent delta factor
-   out of the inner product).
+   the scatter sumcheck still has standard optimizations untouched
+   (gate sparsity, factoring the transparent delta factor out of the
+   inner product). The single-threaded custom stages were parallelized
+   2026-08-30 (rayon): witness generation per block, the scatter round
+   evaluation as a one-pass-per-index chunked reduction (each factor
+   pair loaded once and extended to all degree + 1 points),
+   opening-value gathers per claim, sponge traces per record, and the
+   linkage gathers. Same-session managed-env stage ratios at 32
+   records: scatter sumcheck about 9x, witness generation about 5x,
+   opening values about 3x; host numbers pending
+   (`hash_to_point_full_bench`).
 5. Implement aerie's `BinaryHashBackend` for the assembled system: the
    flock-side engine is `prove_record`/`verify_record` (commitment,
    relation minus the sponge lane, fingerprint value at a
