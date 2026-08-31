@@ -569,13 +569,22 @@ fn multilinear_points(
     }
     let (zh, _scale) = zh_power_point(record_vars, beta, gamma, delta)?;
     points.push(zh);
-    // The aerie fingerprint: fifteen Z-region sub-cubes at the external
-    // leaf point, one per live coordinate plane; their theta-weighted sum
-    // is MLE_K(Z_H, r) over the packed leaves.
+    points.extend(zh_fingerprint_points(record_vars, r_fp));
+    Some(points)
+}
+
+/// The fifteen `Z_H`-region sub-cube points at leaf point `r` (record
+/// coords then nine index coords), one per live coordinate plane. Their
+/// theta-weighted sum (`theta_c = x^c`) is `MLE_K(Z_H, r)` over the
+/// packed leaves of spec Section 5.1. Used for the aerie fingerprint and
+/// for each masked consistency repetition.
+pub fn zh_fingerprint_points(record_vars: usize, r: &[F128]) -> Vec<Vec<F128>> {
+    assert_eq!(r.len(), record_vars + 9);
     let top = slots::Z_BASE >> 3;
+    let mut points = Vec::with_capacity(15);
     for c in 0..15 {
         let mut point = Vec::with_capacity(record_vars + slots::K_LOG);
-        point.extend_from_slice(&r_fp[..record_vars]);
+        point.extend_from_slice(&r[..record_vars]);
         for j in 0..4 {
             point.push(if (top >> (3 - j)) & 1 == 1 {
                 F128::ONE
@@ -583,7 +592,7 @@ fn multilinear_points(
                 F128::ZERO
             });
         }
-        point.extend_from_slice(&r_fp[record_vars..]);
+        point.extend_from_slice(&r[record_vars..]);
         for j in 0..4 {
             point.push(if (c >> (3 - j)) & 1 == 1 {
                 F128::ONE
@@ -593,7 +602,18 @@ fn multilinear_points(
         }
         points.push(point);
     }
-    Some(points)
+    points
+}
+
+/// Theta-weighted combination of the fifteen values opened at
+/// [`zh_fingerprint_points`]: `MLE_K(Z_H, r)`.
+pub fn zh_fingerprint_value(values: &[F128]) -> F128 {
+    assert_eq!(values.len(), 15);
+    let mut acc = F128::ZERO;
+    for (c, &value) in values.iter().enumerate() {
+        acc += F128 { lo: 1 << c, hi: 0 } * value;
+    }
+    acc
 }
 
 /// Reconstruct the scatter terminal from the claimed opening values (the
@@ -691,6 +711,17 @@ pub fn prove_record_core<Ch: Challenger>(
     blocks: &[[u16; SLOTS]],
     challenger: &mut Ch,
 ) -> RecordCore {
+    prove_record_core_with_masks(setup, blocks, &[[false; 128]; slots::MASK_REPS], challenger)
+}
+
+/// [`prove_record_core`] with the consistency masks written into the
+/// witness before the commitment (spec Section 6.1 step 2).
+pub fn prove_record_core_with_masks<Ch: Challenger>(
+    setup: &SlotSetup,
+    blocks: &[[u16; SLOTS]],
+    masks: &[[bool; 128]; slots::MASK_REPS],
+    challenger: &mut Ch,
+) -> RecordCore {
     let r1cs = &setup.r1cs;
     let record_vars = r1cs.m - slots::K_LOG;
     let trace = std::env::var("RECORD_TRACE").is_ok();
@@ -704,7 +735,7 @@ pub fn prove_record_core<Ch: Challenger>(
         }
         *stage = std::time::Instant::now();
     };
-    let z = setup.generate_witness(blocks);
+    let z = setup.generate_witness_with_masks(blocks, masks);
     lap("witness generation", &mut stage);
     let z_packed = pcs::pack_witness(&z, r1cs.m);
     lap("pack_witness", &mut stage);

@@ -275,6 +275,139 @@ pub fn prove_link_claims<Ch: Challenger>(
     )
 }
 
+/// The masked packed-MLE fingerprint (spec Section 6.1): per repetition
+/// `k`, the shared public tag
+///
+/// ```text
+/// tag_k = gamma_k * MLE_K(Z_H, r_k) + mask_H,k
+/// ```
+///
+/// with `(r_k, gamma_k)` sampled after every commitment and `mask_H,k`
+/// committed inside `C_H` (the record-lane commitment) before any
+/// challenge. The sixteen claims per repetition (fifteen `Z_H` plane
+/// sub-cubes plus the theta-weighted mask sub-cube) fold into the record
+/// lane's batched opening; the claimed values travel here so the
+/// verifier can check the tag equation and the opening batch together.
+/// The Akita lane must prove the same `tag_k` against `C_A` (spec 6.2).
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ConsistencyProof {
+    /// Per repetition: the fifteen `Z_H` plane values at `r_k`, then the
+    /// mask sub-cube value.
+    pub values: Vec<Vec<F128>>,
+    /// Per repetition: the shared public tag.
+    pub tags: Vec<F128>,
+}
+
+/// Sample the per-repetition consistency challenges: `r_k` over the
+/// packed-leaf variables and the multiplier `gamma_k`.
+fn consistency_challenges<Ch: Challenger>(
+    record_vars: usize,
+    challenger: &mut Ch,
+) -> Vec<(Vec<F128>, F128)> {
+    challenger.observe_label(b"aerie-consistency-v0");
+    (0..slots::MASK_REPS)
+        .map(|_| {
+            let r = challenger.sample_f128_vec(record_vars + 9);
+            let gamma = challenger.sample_f128();
+            (r, gamma)
+        })
+        .collect()
+}
+
+/// The mask sub-cube claim for repetition `rep`: record coordinates
+/// pinned to block 0, plane 15, the repetition's 128-slot range, and the
+/// theta-tensor weights `(1, x^(2^j))` over the seven low slot bits, so
+/// `scale * value = sum_h x^h * mask_bit_h = mask_K`.
+fn mask_claim_point(record_vars: usize, rep: usize) -> (Vec<F128>, F128) {
+    let mut point = vec![F128::ZERO; record_vars];
+    for j in 0..7 {
+        point.push(if (slots::MASK_PLANE >> (6 - j)) & 1 == 1 {
+            F128::ONE
+        } else {
+            F128::ZERO
+        });
+    }
+    // Slot top three bits: the repetition index (rep < 8 shapes fit).
+    for j in 0..3 {
+        point.push(if (rep >> (2 - j)) & 1 == 1 {
+            F128::ONE
+        } else {
+            F128::ZERO
+        });
+    }
+    // x^(2^j) by repeated squaring; x has odd multiplicative order, so
+    // the weights never cancel and every coordinate is defined.
+    let mut x_pows = [F128::ZERO; 7];
+    let mut current = F128 { lo: 2, hi: 0 };
+    for slot in x_pows.iter_mut() {
+        *slot = current;
+        current *= current;
+    }
+    let mut scale = F128::ONE;
+    for j in (0..7).rev() {
+        point.push(weighted_coord(F128::ONE, x_pows[j], &mut scale).expect("odd order"));
+    }
+    (point, scale)
+}
+
+/// Build the consistency claims and tags on the prover side. Returns the
+/// proof material and the claim points to fold into the record opening.
+fn prove_consistency<Ch: Challenger>(
+    record_vars: usize,
+    z_packed: &[F128],
+    challenger: &mut Ch,
+) -> (ConsistencyProof, Vec<Vec<F128>>) {
+    let challenges = consistency_challenges(record_vars, challenger);
+    let mut points = Vec::with_capacity(slots::MASK_REPS * 16);
+    let mut values = Vec::with_capacity(slots::MASK_REPS);
+    let mut tags = Vec::with_capacity(slots::MASK_REPS);
+    for (rep, (r, gamma)) in challenges.iter().enumerate() {
+        let mut rep_points = record::zh_fingerprint_points(record_vars, r);
+        let (mask_point, mask_scale) = mask_claim_point(record_vars, rep);
+        rep_points.push(mask_point);
+        let rep_values: Vec<F128> = rep_points
+            .iter()
+            .map(|p| sponge::gather_eval(z_packed, p))
+            .collect();
+        let v = record::zh_fingerprint_value(&rep_values[..15]);
+        tags.push(*gamma * v + mask_scale * rep_values[15]);
+        points.extend(rep_points);
+        values.push(rep_values);
+    }
+    (ConsistencyProof { values, tags }, points)
+}
+
+/// Verify-side counterpart: re-sample the challenges, check the tag
+/// equations against the claimed values, and return the claim points and
+/// flattened values for the record lane's batched opening verify.
+fn verify_consistency<Ch: Challenger>(
+    record_vars: usize,
+    proof: &ConsistencyProof,
+    challenger: &mut Ch,
+) -> Result<(Vec<Vec<F128>>, Vec<F128>), &'static str> {
+    let challenges = consistency_challenges(record_vars, challenger);
+    if proof.values.len() != slots::MASK_REPS || proof.tags.len() != slots::MASK_REPS {
+        return Err("wrong consistency repetition count");
+    }
+    let mut points = Vec::with_capacity(slots::MASK_REPS * 16);
+    let mut flat_values = Vec::with_capacity(slots::MASK_REPS * 16);
+    for (rep, (r, gamma)) in challenges.iter().enumerate() {
+        let rep_values = &proof.values[rep];
+        if rep_values.len() != 16 {
+            return Err("wrong consistency claim count");
+        }
+        let (mask_point, mask_scale) = mask_claim_point(record_vars, rep);
+        let v = record::zh_fingerprint_value(&rep_values[..15]);
+        if proof.tags[rep] != *gamma * v + mask_scale * rep_values[15] {
+            return Err("a consistency tag equation does not hold");
+        }
+        points.extend(record::zh_fingerprint_points(record_vars, r));
+        points.push(mask_point);
+        flat_values.extend_from_slice(rep_values);
+    }
+    Ok((points, flat_values))
+}
+
 /// Verify the linkage identity (the two weighted sums agree) and return
 /// both claim point lists for the lanes' batched opening verifies.
 pub fn verify_link_claims<Ch: Challenger>(
@@ -310,25 +443,32 @@ pub fn verify_link_claims<Ch: Challenger>(
     Ok((slot_points, keccak_points))
 }
 
-/// The complete private-salt HashToPoint proof: both lanes plus the
-/// linkage. COVERAGE: with the linkage, the committed candidate words
-/// are the genuine XOF stream of the framed (private) salt, so the full
-/// Section 3.2 relation holds; the remaining aerie-side work is the
-/// dual-commitment fingerprint against the Akita lane.
+/// The complete private-salt HashToPoint proof: both lanes, the linkage,
+/// and the masked consistency tags. COVERAGE: with the linkage, the
+/// committed candidate words are the genuine XOF stream of the framed
+/// (private) salt, so the full Section 3.2 relation holds and the tags
+/// bind `MLE_K(Z_H, r_k)`; the remaining aerie-side work is proving the
+/// SAME tags against `C_A` (spec 6.2) and the block-L target derivation.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct HashToPointProof {
     pub sponge: SpongeProof,
     pub record: RecordProof,
     pub link: LinkProof,
+    pub consistency: ConsistencyProof,
 }
 
 /// Transcript order: sponge core, record core, linkage challenges and
-/// values, then the two batched openings (sponge first) with the linkage
-/// claims folded in as extra points. Two openings total.
+/// values, consistency challenges and tags, then the two batched
+/// openings (sponge first) with the linkage and consistency claims
+/// folded in as extra points. Two openings total. In the composed
+/// Section 7 flow the challenger is the joint aerie transcript, seeded
+/// after `C_A` and the public descriptors, so every consistency
+/// challenge already follows both lanes' commitments.
 pub fn prove_hash_to_point<Ch: Challenger>(
     sponge_setup: &SpongeSetup,
     slot_setup: &SlotSetup,
     records: &[SpongeRecord],
+    masks: &[[bool; 128]; slots::MASK_REPS],
     challenger: &mut Ch,
 ) -> HashToPointProof {
     let sponge_core = sponge::prove_sponge_core(sponge_setup, records, challenger);
@@ -341,7 +481,8 @@ pub fn prove_hash_to_point<Ch: Challenger>(
             block
         })
         .collect();
-    let record_core = record::prove_record_core(slot_setup, &blocks, challenger);
+    let slot_record_vars = slot_setup.r1cs.m - slots::K_LOG;
+    let record_core = record::prove_record_core_with_masks(slot_setup, &blocks, masks, challenger);
     let (link, slot_points, keccak_points) = prove_link_claims(
         slot_setup,
         sponge_setup,
@@ -349,13 +490,18 @@ pub fn prove_hash_to_point<Ch: Challenger>(
         &sponge_core.fast.z_packed,
         challenger,
     );
+    let (consistency, consistency_points) =
+        prove_consistency(slot_record_vars, &record_core.z_packed, challenger);
+    let mut record_extra = slot_points;
+    record_extra.extend(consistency_points);
     let (sponge_proof, _) =
         sponge::open_sponge(sponge_setup, sponge_core, &keccak_points, challenger);
-    let (record_proof, _) = record::open_record(slot_setup, record_core, &slot_points, challenger);
+    let (record_proof, _) = record::open_record(slot_setup, record_core, &record_extra, challenger);
     HashToPointProof {
         sponge: sponge_proof,
         record: record_proof,
         link,
+        consistency,
     }
 }
 
@@ -370,6 +516,13 @@ pub fn verify_hash_to_point<Ch: Challenger>(
     let record_core = record::verify_record_core(slot_setup, &proof.record, challenger)?;
     let (slot_points, keccak_points) =
         verify_link_claims(slot_setup, sponge_setup, &proof.link, challenger)?;
+    let slot_record_vars = slot_setup.r1cs.m - slots::K_LOG;
+    let (consistency_points, consistency_values) =
+        verify_consistency(slot_record_vars, &proof.consistency, challenger)?;
+    let mut record_extra_points = slot_points;
+    record_extra_points.extend(consistency_points);
+    let mut record_extra_values = proof.link.slot_values.clone();
+    record_extra_values.extend(consistency_values);
     sponge::verify_sponge_open(
         sponge_setup,
         &proof.sponge,
@@ -382,8 +535,8 @@ pub fn verify_hash_to_point<Ch: Challenger>(
         slot_setup,
         &proof.record,
         record_core,
-        &slot_points,
-        &proof.link.slot_values,
+        &record_extra_points,
+        &record_extra_values,
         challenger,
     )
 }
@@ -501,8 +654,11 @@ mod tests {
             })
             .collect();
 
+        // Nonzero masks so the mask sub-cube openings carry real values.
+        let masks: [[bool; 128]; slots::MASK_REPS] =
+            std::array::from_fn(|rep| std::array::from_fn(|bit| (rep + bit) % 3 == 0));
         let mut prover = FsChallenger::new(b"aerie-hash-to-point");
-        let proof = prove_hash_to_point(&sponge_setup, &slot_setup, &inputs, &mut prover);
+        let proof = prove_hash_to_point(&sponge_setup, &slot_setup, &inputs, &masks, &mut prover);
 
         let mut verifier = FsChallenger::new(b"aerie-hash-to-point");
         verify_hash_to_point(&sponge_setup, &slot_setup, &publics, &proof, &mut verifier)
@@ -529,6 +685,25 @@ mod tests {
                 &mut fresh
             )
             .is_err()
+        );
+
+        // A tampered consistency tag rejects at the tag equation.
+        let mut wrong = proof.clone();
+        wrong.consistency.tags[1] += F128::ONE;
+        let mut fresh = FsChallenger::new(b"aerie-hash-to-point");
+        assert!(
+            verify_hash_to_point(&sponge_setup, &slot_setup, &publics, &wrong, &mut fresh).is_err()
+        );
+
+        // A tampered consistency claim value rejects: either the tag
+        // equation breaks, or (were the tag forged to match) the batched
+        // opening rejects the value — the same authenticated path the
+        // linkage-value tamper above exercises.
+        let mut wrong = proof.clone();
+        wrong.consistency.values[0][7] += F128::ONE;
+        let mut fresh = FsChallenger::new(b"aerie-hash-to-point");
+        assert!(
+            verify_hash_to_point(&sponge_setup, &slot_setup, &publics, &wrong, &mut fresh).is_err()
         );
     }
 }

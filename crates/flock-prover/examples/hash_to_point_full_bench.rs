@@ -17,7 +17,7 @@
 
 use flock_core::challenger::FsChallenger;
 use flock_prover::r1cs_hashes::hash_to_point_link::{prove_hash_to_point, verify_hash_to_point};
-use flock_prover::r1cs_hashes::hash_to_point_slots::SlotSetup;
+use flock_prover::r1cs_hashes::hash_to_point_slots::{MASK_REPS, SlotSetup};
 use flock_prover::r1cs_hashes::hash_to_point_sponge::{SpongePublic, SpongeRecord, SpongeSetup};
 
 fn main() {
@@ -55,9 +55,11 @@ fn main() {
             })
             .collect();
 
+        let masks: [[bool; 128]; MASK_REPS] =
+            std::array::from_fn(|rep| std::array::from_fn(|bit| (n + rep + bit) % 5 == 0));
         let t = std::time::Instant::now();
         let mut prover = FsChallenger::new(b"aerie-hash-to-point-bench");
-        let proof = prove_hash_to_point(&sponge_setup, &slot_setup, &inputs, &mut prover);
+        let proof = prove_hash_to_point(&sponge_setup, &slot_setup, &inputs, &masks, &mut prover);
         let prove_ms = t.elapsed().as_secs_f64() * 1e3;
 
         let proof_bytes = bincode::serialize(&proof).expect("serialize").len();

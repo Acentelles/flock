@@ -47,6 +47,7 @@
 //! ```text
 //! plane 0          constant-one wire at slot 0 (const_pin)
 //! planes 1..15     q bits, accept, 3q products, centering, gate, pins
+//! plane 15         consistency masks (free inputs, first 256 slots)
 //! planes 16..32    x bits (free inputs, SIXTEEN-ALIGNED for the linkage)
 //! planes 32..48    accept-chain products; 48..64 borrow products
 //! planes 64..78    centering products;    78..92 range products
@@ -131,6 +132,7 @@ fn is_input(w: usize) -> bool {
     w == Z_CONST_POS
         || (slot < SLOTS && ((X..X + 16).contains(&plane) || (Q..Q + 3).contains(&plane)))
         || (Z_BASE..Z_BASE + Z_PLANES).contains(&plane)
+        || (plane == MASK_PLANE && slot < MASK_REPS * 128)
 }
 
 /// Falcon rejection bound: accept exactly when `x < 5 * 12,289`.
@@ -369,6 +371,12 @@ fn build_matrices() -> (SparseBinaryMatrix, SparseBinaryMatrix) {
         }
     }
 
+    // The consistency-mask region: free inputs in plane 15, bound by the
+    // masked-fingerprint openings (spec Section 6.1).
+    for slot in 0..MASK_REPS * 128 {
+        builder.input(pos(MASK_PLANE, slot));
+    }
+
     let to_matrix = |rows: Vec<Vec<usize>>| SparseBinaryMatrix {
         num_rows: K,
         num_cols: K,
@@ -419,6 +427,18 @@ pub fn zh_position(j: usize, c: usize) -> usize {
     pos(Z_BASE + (index >> SLOT_VARS), index & (PLANE - 1))
 }
 
+/// Consistency-mask region: `MASK_REPS` 128-bit masks as free inputs in
+/// the otherwise-empty plane 15. The block R1CS makes the region free in
+/// every block; only block 0's cells are written and opened (the mask
+/// claims pin every record coordinate to zero).
+pub const MASK_PLANE: usize = 15;
+pub const MASK_REPS: usize = 2;
+/// Mask bit `bit` of repetition `rep`, inside one block.
+pub fn mask_position(rep: usize, bit: usize) -> usize {
+    debug_assert!(rep < MASK_REPS && bit < 128);
+    pos(MASK_PLANE, rep * 128 + bit)
+}
+
 /// Reusable slot-prover state: the shared block R1CS plus PCS parameters.
 ///
 /// One block is one record. The default Ligerito profile needs `m >= 22`,
@@ -449,8 +469,19 @@ impl SlotSetup {
 
     /// Witness for `n_blocks` record blocks, zero-word blocks as padding
     /// (valid computations with the constant wire set, as `const_pin`
-    /// requires). The counter reset per record is structural.
+    /// requires). The counter reset per record is structural. Zero masks.
     pub fn generate_witness(&self, blocks: &[[u16; SLOTS]]) -> Vec<bool> {
+        self.generate_witness_with_masks(blocks, &[[false; 128]; MASK_REPS])
+    }
+
+    /// [`Self::generate_witness`] with the consistency masks written into
+    /// block 0's mask region (spec Section 6.1: committed before any
+    /// consistency challenge, which holds because they enter `C_H`).
+    pub fn generate_witness_with_masks(
+        &self,
+        blocks: &[[u16; SLOTS]],
+        masks: &[[bool; 128]; MASK_REPS],
+    ) -> Vec<bool> {
         use rayon::prelude::*;
         assert_eq!(blocks.len(), self.n_blocks);
         let padded = 1usize << (self.r1cs.m - K_LOG);
@@ -464,6 +495,11 @@ impl SlotSetup {
                     build_block_witness_with(&self.r1cs.a_0, &self.r1cs.b_0, words);
                 chunk.copy_from_slice(&block);
             });
+        for (rep, mask) in masks.iter().enumerate() {
+            for (bit, &value) in mask.iter().enumerate() {
+                z[mask_position(rep, bit)] = value;
+            }
+        }
         z
     }
 
