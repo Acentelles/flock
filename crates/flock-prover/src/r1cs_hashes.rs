@@ -23,6 +23,9 @@ pub mod hash_to_point_scatter;
 /// Candidate-slot R1CS for the aerie private-salt HashToPoint relation; see
 /// `AERIE-ADAPTER.md`.
 pub mod hash_to_point_slots;
+/// The aerie private-salt sponge lane: Keccak chains with the absorption
+/// edge, salt-free record-start pinning, all as sub-cube openings.
+pub mod hash_to_point_sponge;
 pub mod keccak;
 /// 3-wide Keccak-f[1600] R1CS (3 independent permutations per K_LOG=17 block)
 /// for tighter PCS utilization (~97% vs the single encoder's ~65%).
