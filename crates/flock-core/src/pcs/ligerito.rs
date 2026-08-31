@@ -3292,6 +3292,14 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             let num_queries_last = config.queries[i + 1];
             let queries_last =
                 sample_distinct_queries(challenger, wtns_prev.block_len, num_queries_last);
+            // Mirror the verifier's final-level `yr` binding challenges
+            // (`alpha_last` then `beta_last`, see the terminal branch of the
+            // verifiers). The prover needs neither value (the verifier
+            // computes the enforced sum from the Merkle-bound opened rows on
+            // its own), but the challenger must consume them symmetrically,
+            // or any protocol stage appended after this open desyncs.
+            let _alpha_last = challenger.sample_f128_vec(ceil_log2(num_queries_last));
+            let _beta_last = challenger.sample_f128();
             let _t = std::time::Instant::now();
             let opened_rows_last: Vec<Vec<F128>> = queries_last
                 .iter()
