@@ -3,8 +3,10 @@
 //!
 //! For every record, squeeze block `q` (nine of them), word `w` (68 per
 //! block), and bit `b`, the claim is
-//! `x_b(rec, 68q + w) = state24bit(instance 16 rec + 1 + q, 16w + (b xor 8))`
-//! (the xor is the big-endian byte swap: one address-bit complement).
+//! `x_b(rec, 68q + w) = state24bit(perm 1 + q of rec, 16w + (b xor 8))`
+//! (the xor is the big-endian byte swap: one address-bit complement),
+//! where permutation `e` of a record sits at keccak3 block `e % 4`,
+//! sub-keccak `e / 4`, state_24 slot `2 (e / 4) + 1`.
 //! With post-commitment challenges `(delta, nu, mu, gamma)`, both sides
 //! collapse to transparent-weighted sums
 //!
@@ -15,8 +17,8 @@
 //! and every term is a weighted SUB-CUBE OPENING: the x-planes sit at a
 //! sixteen-aligned base so the `gamma^b` combination is one tensor over
 //! the four low plane bits; the non-power-of-two ranges (`s` in
-//! `[68q, 68q+68)`, instance offsets `1..=10`, words `w < 68`) decompose
-//! into aligned pieces with per-piece base coefficients. No sumchecks;
+//! `[68q, 68q+68)`, source permutations `1..=9`, words `w < 68`)
+//! decompose into aligned pieces with per-piece base coefficients. No sumchecks;
 //! the equality of the two sums binds every cell pairwise with error
 //! about `(records + 93) / 2^128` per challenge tuple.
 //!
@@ -34,7 +36,7 @@ use super::hash_to_point_slots::SlotSetup;
 use super::hash_to_point_sponge::{
     self as sponge, SpongeProof, SpongePublic, SpongeRecord, SpongeSetup,
 };
-use super::keccak::K_LOG as KECCAK_K_LOG;
+use super::keccak3::K_LOG as KECCAK_K_LOG;
 
 /// Greedy aligned decomposition of `[start, end)` into `(base, k)` pieces
 /// with `base % 2^k == 0` and `base + 2^k <= end`.
@@ -144,9 +146,12 @@ pub fn slot_link_claims(
     Some(claims)
 }
 
-/// The Keccak-side claims: instance offsets `1..=10` and words `w < 68`
-/// decompose into aligned pieces; the four position bits carry the
-/// byte-swapped `gamma` weights (bit 3 complemented).
+/// The Keccak-side claims: the source permutations `e in 1..=9` sit at
+/// keccak3 block `e % 4`, sub-keccak `e / 4`, so `nu^(e-1)` factors as a
+/// per-piece base coefficient times a `nu` tensor over the free block
+/// bits within four fixed-sub pieces; words `w < 68` decompose into
+/// aligned pieces; the four position bits carry the byte-swapped `gamma`
+/// weights (bit 3 complemented).
 pub fn keccak_link_claims(
     record_vars: usize,
     delta: F128,
@@ -166,26 +171,36 @@ pub fn keccak_link_claims(
             &mut pos_scale,
         )?);
     }
+    // Squeeze block q reads the OUTPUT of permutation 1 + q for q in
+    // 0..9. Under e = 4 sub + blk the source set 1..=9 tiles into
+    // (sub, block base, free low block bits) pieces:
+    let pieces: [(usize, usize, usize); 4] = [
+        (0, 1, 0), // e = 1
+        (0, 2, 1), // e = 2..=3
+        (1, 0, 2), // e = 4..=7
+        (2, 0, 1), // e = 8..=9
+    ];
     let mut claims = Vec::new();
-    // Squeeze block q reads the OUTPUT of instance 1 + q for q in 0..9,
-    // so the source instances are 1..=9.
-    for (inst_base, ik) in aligned_pieces(1, 10) {
+    for (sub, blk_base, bk) in pieces {
         for (w_base, wk) in aligned_pieces(0, 68) {
             let mut scale = rec_scale * pos_scale;
             let mut point = rec_coords.clone();
-            // Instance low-4 bits: fixed high, nu-tensor free.
-            for j in (ik..4).rev() {
-                point.push(if (inst_base >> j) & 1 == 1 {
+            // Block bits (2, MSB-first): fixed high, nu-tensor free.
+            for j in (bk..2).rev() {
+                point.push(if (blk_base >> j) & 1 == 1 {
                     F128::ONE
                 } else {
                     F128::ZERO
                 });
             }
-            for j in (0..ik).rev() {
+            for j in (0..bk).rev() {
                 point.push(weighted_coord(F128::ONE, pow(nu, 1 << j), &mut scale)?);
             }
-            // Block offset top five: the state_24 slot.
-            point.extend_from_slice(&[F128::ZERO, F128::ZERO, F128::ZERO, F128::ZERO, F128::ONE]);
+            // Slot bits (6, MSB-first): the sub-keccak's state_24 slot.
+            let slot = 2 * sub + 1;
+            for j in (0..6).rev() {
+                point.push(if (slot >> j) & 1 == 1 { F128::ONE } else { F128::ZERO });
+            }
             // Word bits (offset bits 10..4): fixed high, mu-tensor free.
             for j in (wk..7).rev() {
                 point.push(if (w_base >> j) & 1 == 1 {
@@ -198,7 +213,7 @@ pub fn keccak_link_claims(
                 point.push(weighted_coord(F128::ONE, pow(mu, 1 << j), &mut scale)?);
             }
             point.extend_from_slice(&pos_coords);
-            let coefficient = pow(nu, inst_base - 1) * pow(mu, w_base) * scale;
+            let coefficient = pow(nu, 4 * sub + blk_base - 1) * pow(mu, w_base) * scale;
             claims.push(LinkClaim { point, coefficient });
         }
     }
@@ -239,7 +254,7 @@ pub fn prove_link_claims<Ch: Challenger>(
     let mu = challenger.sample_f128();
     let gamma = challenger.sample_f128();
     let slot_record_vars = slot_setup.r1cs.m - slots::K_LOG;
-    let keccak_record_vars = sponge_setup.keccak.r1cs.m - KECCAK_K_LOG - 4;
+    let keccak_record_vars = sponge_setup.keccak.r1cs.m - KECCAK_K_LOG - 2;
 
     let slot_claims =
         slot_link_claims(slot_record_vars, delta, nu, mu, gamma).expect("nondegenerate");
@@ -445,7 +460,7 @@ pub fn verify_link_claims<Ch: Challenger>(
     let mu = challenger.sample_f128();
     let gamma = challenger.sample_f128();
     let slot_record_vars = slot_setup.r1cs.m - slots::K_LOG;
-    let keccak_record_vars = sponge_setup.keccak.r1cs.m - KECCAK_K_LOG - 4;
+    let keccak_record_vars = sponge_setup.keccak.r1cs.m - KECCAK_K_LOG - 2;
 
     let slot_claims =
         slot_link_claims(slot_record_vars, delta, nu, mu, gamma).ok_or("degenerate")?;
@@ -609,34 +624,27 @@ mod tests {
         let slot_setup = SlotSetup::new(records);
         let inputs = test_records(records);
 
-        let zero_state = [false; super::super::keccak::STATE_BITS];
-        let mut initial_states = Vec::new();
+        let mut state_lists = Vec::new();
         let mut blocks = Vec::new();
         for record in &inputs {
             let (states, words) = sponge::sponge_trace(record);
-            initial_states.extend_from_slice(&states);
-            initial_states.extend(std::iter::repeat_n(
-                zero_state,
-                sponge::PERM_SLOTS - sponge::LIVE_PERMS,
-            ));
+            state_lists.push(states);
             let mut block = [0_u16; slots::SLOTS];
             block.copy_from_slice(&words);
             blocks.push(block);
         }
-        while initial_states.len() < sponge_setup.keccak.n_keccak_slots() {
-            initial_states.push(zero_state);
-        }
+        let initial_states = sponge::sponge_initial_states(&state_lists);
         let (keccak_z, _a, _b, _l) =
-            super::super::keccak::generate_witness_with_ab_packed_and_lincheck(
+            super::super::keccak3::generate_witness_with_ab_packed_and_lincheck(
                 &initial_states,
-                sponge_setup.keccak.n_keccaks_log(),
+                sponge_setup.keccak.n_blocks_log(),
             );
         let slot_z_bools = slot_setup.generate_witness(&blocks);
         let slot_z = flock_core::pcs::pack_witness(&slot_z_bools, slot_setup.r1cs.m);
 
         let (delta, nu, mu, gamma) = (small(0x1111), small(0x2323), small(0x4545), small(0x6767));
         let slot_record_vars = slot_setup.r1cs.m - slots::K_LOG;
-        let keccak_record_vars = sponge_setup.keccak.r1cs.m - KECCAK_K_LOG - 4;
+        let keccak_record_vars = sponge_setup.keccak.r1cs.m - KECCAK_K_LOG - 2;
         let slot_claims =
             slot_link_claims(slot_record_vars, delta, nu, mu, gamma).expect("defined");
         let keccak_claims =

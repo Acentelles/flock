@@ -160,9 +160,11 @@ commitment of the region or a sub-cube opening; decide by measurement
    blocks) per aerie spec Section 4, as repeated block-diagonal
    descriptors.
 2. Sponge-chain amendment: DONE in `hash_to_point_sponge.rs`, and
-   simpler than planned: records stride sixteen Keccak instances, so
-   with a post-commitment `delta` every chaining constraint is a
-   transparent-weighted SUB-CUBE OPENING pair (no chain shift sumcheck):
+   simpler than planned: records stride four 3-wide `keccak3` blocks
+   (twelve-permutation capacity, ten live; permutation `e` at block
+   `e % 4`, sub-keccak `e / 4`), so with a post-commitment `delta` every
+   chaining constraint is a transparent-weighted SUB-CUBE OPENING pair
+   (no chain shift sumcheck):
    interior edges `IN_e = OUT_(e-1)`, the absorption edge plus the
    verifier-computed public MLE of the second message blocks, and the
    record-start pinning with the 320 salt bits subtracted as two scaled

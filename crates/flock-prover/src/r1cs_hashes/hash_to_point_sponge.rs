@@ -7,8 +7,10 @@
 //! the sponge chaining as TRANSPARENT-WEIGHTED SUB-CUBE OPENINGS with no
 //! new sumchecks:
 //!
-//! - records stride sixteen instances (ten live), so a within-record
-//!   permutation offset is a Boolean bit-field of the instance index;
+//! - records stride four 3-wide keccak3 blocks (twelve-permutation
+//!   capacity, ten live), so a within-record permutation address is a
+//!   Boolean bit-field: permutation `e` sits at block `e % 4`,
+//!   sub-keccak `e / 4`, state slots `2 (e / 4) + out`;
 //! - with a post-commitment challenge `delta`, each edge class `e` gives
 //!   one delta-power-batched opening pair: `IN_e` (the `state_0` slot at
 //!   offset bits `e`) must equal `OUT_(e-1)` (the `state_24` slot);
@@ -37,15 +39,19 @@ use flock_core::pcs::{self, Commitment, LowBinding};
 use flock_core::zerocheck;
 
 use super::hash_to_point_record::flock_claim_shape;
-use super::keccak::{self, KeccakLincheckCircuit, KeccakSetup, STATE_BITS, State};
+use super::keccak::{self, STATE_BITS, State};
+use super::keccak3::{self, KeccakLincheckCircuit, KeccakSetup};
 
 /// Live permutations per record in the default bucket: two absorption
 /// blocks plus eight further squeezes (the first squeeze block is the
 /// second absorption permutation's output).
 pub const LIVE_PERMS: usize = 10;
-/// Instance stride per record (ten live, six padding), a power of two so
-/// the within-record offset is a Boolean bit-field.
-pub const PERM_SLOTS: usize = 16;
+/// Blocks per record under the 3-wide encoder, a power of two so the
+/// within-record block offset is a Boolean bit-field.
+pub const BLOCKS_PER_RECORD: usize = 4;
+/// Permutation capacity per record: three sub-keccaks in each of the
+/// four blocks (ten live, two padding).
+pub const PERM_CAPACITY: usize = keccak3::N_SUB * BLOCKS_PER_RECORD;
 pub const RATE_BYTES: usize = 136;
 pub const SALT_BYTES: usize = 40;
 pub const SALT_BITS: usize = 8 * SALT_BYTES;
@@ -166,12 +172,12 @@ impl SpongeSetup {
         assert!(records.is_power_of_two(), "records must be a power of two");
         Self {
             records,
-            keccak: KeccakSetup::new(records * PERM_SLOTS),
+            keccak: KeccakSetup::new(records * PERM_CAPACITY),
         }
     }
 
     fn record_vars(&self) -> usize {
-        self.keccak.n_keccaks_log() - 4
+        self.keccak.n_blocks_log() - 2
     }
 }
 
@@ -219,11 +225,16 @@ fn sponge_points(record_vars: usize, delta: F128, r: &[F128]) -> Option<Vec<Vec<
     let boolean = |bit: bool| if bit { F128::ONE } else { F128::ZERO };
     let point = |e: usize, out: bool, offset_high: &[F128], low: &[F128]| -> Vec<F128> {
         let mut p = rec_coords.clone();
-        for j in 0..4 {
-            p.push(boolean((e >> (3 - j)) & 1 == 1));
+        // Permutation e sits at block e % 4, sub-keccak e / 4.
+        let blk = e % BLOCKS_PER_RECORD;
+        for j in (0..2).rev() {
+            p.push(boolean((blk >> j) & 1 == 1));
         }
-        // Block-offset top five bits: (0, 0, 0, 0, sel).
-        p.extend_from_slice(&[F128::ZERO, F128::ZERO, F128::ZERO, F128::ZERO, boolean(out)]);
+        // Slot bits (6, MSB-first): sub-keccak state slot 2 (e / 4) + out.
+        let slot = 2 * (e / BLOCKS_PER_RECORD) + usize::from(out);
+        for j in (0..6).rev() {
+            p.push(boolean((slot >> j) & 1 == 1));
+        }
         p.extend_from_slice(offset_high);
         p.extend_from_slice(low);
         p
@@ -363,6 +374,23 @@ pub fn prove_sponge<Ch: Challenger>(
     (proof, words, artifacts)
 }
 
+/// The flat keccak3 input-state list, block-major within each record:
+/// `initial_states[3 (4 rec + blk) + sub]` is permutation `4 sub + blk`
+/// of record `rec`, with zero states in the two pad positions.
+pub fn sponge_initial_states(traces: &[[State; LIVE_PERMS]]) -> Vec<State> {
+    let zero_state: State = [false; STATE_BITS];
+    let mut initial_states = Vec::with_capacity(traces.len() * PERM_CAPACITY);
+    for states in traces {
+        for blk in 0..BLOCKS_PER_RECORD {
+            for sub in 0..keccak3::N_SUB {
+                let e = BLOCKS_PER_RECORD * sub + blk;
+                initial_states.push(if e < LIVE_PERMS { states[e] } else { zero_state });
+            }
+        }
+    }
+    initial_states
+}
+
 pub fn prove_sponge_core<Ch: Challenger>(
     setup: &SpongeSetup,
     records: &[SpongeRecord],
@@ -382,26 +410,23 @@ pub fn prove_sponge_core<Ch: Challenger>(
         }
         stage = std::time::Instant::now();
     };
-    let zero_state: State = [false; STATE_BITS];
     let traces: Vec<([State; LIVE_PERMS], Vec<u16>)> =
         records.par_iter().map(sponge_trace).collect();
-    let mut initial_states = Vec::with_capacity(setup.keccak.n_keccak_slots());
+    let mut state_lists = Vec::with_capacity(records.len());
     let mut all_words = Vec::with_capacity(records.len());
     for (states, words) in traces {
-        initial_states.extend_from_slice(&states);
-        initial_states.extend(std::iter::repeat_n(zero_state, PERM_SLOTS - LIVE_PERMS));
+        state_lists.push(states);
         all_words.push(words);
     }
-    // Padding records beyond the live count: zero states.
-    while initial_states.len() < setup.keccak.n_keccak_slots() {
-        initial_states.push(zero_state);
-    }
+    // Blocks past the live records are the witness builder's all-zero
+    // padding triples.
+    let initial_states = sponge_initial_states(&state_lists);
     lap("sponge traces");
 
     let (z_packed, a_packed, b_packed, z_lincheck) =
-        keccak::generate_witness_with_ab_packed_and_lincheck(
+        keccak3::generate_witness_with_ab_packed_and_lincheck(
             &initial_states,
-            setup.keccak.n_keccaks_log(),
+            setup.keccak.n_blocks_log(),
         );
     lap("keccak witness");
     let core = crate::prover::prove_fast_core(
