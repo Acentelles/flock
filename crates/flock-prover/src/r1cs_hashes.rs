@@ -32,6 +32,7 @@ pub mod keccak;
 /// 3-wide Keccak-f[1600] R1CS (3 independent permutations per K_LOG=17 block)
 /// for tighter PCS utilization (~97% vs the single encoder's ~65%).
 pub mod keccak3;
+pub mod keccak_gkr;
 /// Generic Merkle-path glue ([`MerkleLayout`]-parameterized prove/verify),
 /// analogous to [`chain_common`] but with a per-row bit selector.
 ///
