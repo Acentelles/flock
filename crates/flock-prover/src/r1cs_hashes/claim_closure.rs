@@ -63,6 +63,8 @@ struct WeightFamilies {
 struct Family {
     tensor: Vec<F128>,
     rel_addr: Vec<usize>,
+    /// Address bit positions of the free coordinates, family order.
+    free_positions: Vec<usize>,
     /// `(fixed offset, mu-power coefficient)` per member.
     members: Vec<(usize, F128)>,
 }
@@ -118,6 +120,7 @@ fn weight_families(points: &[Vec<F128>], mu: F128, vars: usize) -> WeightFamilie
             Family {
                 tensor,
                 rel_addr,
+                free_positions: free.iter().map(|&(bit, _)| bit).collect(),
                 members,
             }
         })
@@ -126,12 +129,104 @@ fn weight_families(points: &[Vec<F128>], mu: F128, vars: usize) -> WeightFamilie
 }
 
 impl WeightFamilies {
-    /// Iterate every `(address, weight)` support entry of `W`.
-    fn for_each_entry(&self, mut sink: impl FnMut(usize, F128)) {
+    /// Accumulate round-1's `(e0, e1)`: the bit-gated sums of `W` over
+    /// the low and high halves. Parallel per member (pure reduction).
+    fn par_e01(&self, bit_at: impl Fn(usize) -> bool + Sync, vars: usize) -> (F128, F128) {
+        use rayon::prelude::*;
+        let top = 1_usize << (vars - 1);
+        let mut e0 = F128::ZERO;
+        let mut e1 = F128::ZERO;
         for family in &self.families {
             for &(fixed, coef) in &family.members {
-                for (offset, &weight) in family.rel_addr.iter().zip(&family.tensor) {
-                    sink(fixed | offset, coef * weight);
+                let (m0, m1) = family
+                    .rel_addr
+                    .par_iter()
+                    .zip(&family.tensor)
+                    .fold(
+                        || (F128::ZERO, F128::ZERO),
+                        |mut acc, (&offset, &weight)| {
+                            let address = fixed | offset;
+                            if bit_at(address) {
+                                if address & top == 0 {
+                                    acc.0 += weight;
+                                } else {
+                                    acc.1 += weight;
+                                }
+                            }
+                            acc
+                        },
+                    )
+                    .reduce(
+                        || (F128::ZERO, F128::ZERO),
+                        |a, b| (a.0 + b.0, a.1 + b.1),
+                    );
+                e0 += coef * m0;
+                e1 += coef * m1;
+            }
+        }
+        (e0, e1)
+    }
+
+    /// Scatter `factor(top_bit) * coef * tensor` into the half-size
+    /// table at each entry's LOW address. Contention-free parallelism:
+    /// within one member the low addresses are distinct unless the
+    /// dropped top bit is a FREE position, in which case the paired
+    /// entries are combined into one write; members run sequentially
+    /// (cross-member collisions are legal and handled by the serial
+    /// outer loop). Exact regrouping of the entry-wise sum.
+    fn par_scatter(&self, table: &mut [F128], vars: usize, f0: F128, f1: F128) {
+        use rayon::prelude::*;
+        let half_mask = table.len() - 1;
+        let top_pos = vars - 1;
+        for family in &self.families {
+            // Tensor bit index of the top address position, if free.
+            let top_tensor_bit = family
+                .free_positions
+                .iter()
+                .position(|&bit| bit == top_pos)
+                .map(|j| family.free_positions.len() - 1 - j);
+            for &(fixed, coef) in &family.members {
+                match top_tensor_bit {
+                    Some(jt) => {
+                        let stride = 1_usize << jt;
+                        // Iterate entries with tensor bit jt = 0; the
+                        // paired entry (bit jt = 1) hits the same slot.
+                        let low_count = family.tensor.len() / 2;
+                        let table = &mut *table;
+                        (0..low_count).into_par_iter().for_each(|k| {
+                            // Index with bit jt cleared: interleave.
+                            let idx0 = (k & !(stride - 1)) << 1 | (k & (stride - 1));
+                            let idx1 = idx0 | stride;
+                            let target = (fixed | family.rel_addr[idx0]) & half_mask;
+                            let value = coef
+                                * (f0 * family.tensor[idx0] + f1 * family.tensor[idx1]);
+                            // SAFETY: targets are distinct across k for
+                            // one member (rel_addr is injective modulo
+                            // the paired top bit).
+                            unsafe {
+                                let slot = table.as_ptr().add(target) as *mut F128;
+                                *slot += value;
+                            }
+                        });
+                    }
+                    None => {
+                        let table = &mut *table;
+                        family
+                            .rel_addr
+                            .par_iter()
+                            .zip(&family.tensor)
+                            .for_each(|(&offset, &weight)| {
+                                let address = fixed | offset;
+                                let factor = if address & (1 << top_pos) == 0 { f0 } else { f1 };
+                                let target = address & half_mask;
+                                // SAFETY: one member's low addresses are
+                                // distinct here (top bit constant).
+                                unsafe {
+                                    let slot = table.as_ptr().add(target) as *mut F128;
+                                    *slot += factor * weight * coef;
+                                }
+                            });
+                    }
                 }
             }
         }
@@ -172,23 +267,11 @@ pub fn prove_closure<Ch: Challenger>(
     let half = 1_usize << (vars - 1);
     let t_node = F128 { lo: 2, hi: 0 };
     let bit_at = |index: usize| crate::chain::read_packed_bit(z_packed, index);
-    let mut e0 = F128::ZERO;
-    let mut e1 = F128::ZERO;
+    let (e0, e1) = families.par_e01(bit_at, vars);
     let mut v_table = vec![F128::ZERO; half];
-    families.for_each_entry(|address, weight| {
-        let top = address >> (vars - 1) & 1 == 1;
-        if bit_at(address) {
-            if top {
-                e1 += weight;
-            } else {
-                e0 += weight;
-            }
-        }
-        // V(y) = W(T, y): the top coordinate contributes (1 + T) for a
-        // 0-half entry and T for a 1-half entry.
-        let factor = if top { t_node } else { F128::ONE + t_node };
-        v_table[address & (half - 1)] += factor * weight;
-    });
+    // V(y) = W(T, y): top coordinate factor (1 + T) on the low half,
+    // T on the high half.
+    families.par_scatter(&mut v_table, vars, F128::ONE + t_node, t_node);
     let e2: F128 = (0..half)
         .into_par_iter()
         .fold(
@@ -224,11 +307,7 @@ pub fn prove_closure<Ch: Challenger>(
         .collect();
     let mut w = v_table;
     w.par_iter_mut().for_each(|slot| *slot = F128::ZERO);
-    families.for_each_entry(|address, weight| {
-        let top = address >> (vars - 1) & 1 == 1;
-        let factor = if top { r0 } else { F128::ONE + r0 };
-        w[address & (half - 1)] += factor * weight;
-    });
+    families.par_scatter(&mut w, vars, F128::ONE + r0, r0);
     rounds.push(evals);
     point.push(r0);
 
