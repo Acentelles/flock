@@ -51,11 +51,23 @@ fn split_boolean(point: &[F128]) -> (usize, Vec<(usize, F128)>) {
     (fixed, free)
 }
 
-/// Dense `W = sum_i mu^i eq(p_i, .)`, built family-shared: one eq
-/// tensor per distinct free-coordinate signature, scattered once per
-/// member at its Boolean offset with the member's `mu` power.
-fn build_weight_table(points: &[Vec<F128>], mu: F128, vars: usize) -> Vec<F128> {
-    use rayon::prelude::*;
+/// The family decomposition of `W = sum_i mu^i eq(p_i, .)`: one eq
+/// tensor and relative-address table per distinct free-coordinate
+/// signature, plus each member's Boolean offset and `mu`-power
+/// coefficient. `W(x) = sum over (member, entry) with `x = fixed |
+/// rel_addr[entry]` of `coef * tensor[entry]`.
+struct WeightFamilies {
+    families: Vec<Family>,
+}
+
+struct Family {
+    tensor: Vec<F128>,
+    rel_addr: Vec<usize>,
+    /// `(fixed offset, mu-power coefficient)` per member.
+    members: Vec<(usize, F128)>,
+}
+
+fn weight_families(points: &[Vec<F128>], mu: F128, vars: usize) -> WeightFamilies {
     let mut split = Vec::with_capacity(points.len());
     for point in points {
         assert_eq!(point.len(), vars, "claims share the bit domain");
@@ -75,43 +87,55 @@ fn build_weight_table(points: &[Vec<F128>], mu: F128, vars: usize) -> Vec<F128> 
         powers.push(power);
         power *= mu;
     }
-    let mut w = vec![F128::ZERO; 1 << vars];
-    for (free, members) in &groups {
-        let free_vars = free.len();
-        // Family tensor over the free coordinates, MSB-first over the
-        // family's free list.
-        let mut tensor = vec![F128::ONE];
-        for &(_, coord) in free {
-            let mut next = Vec::with_capacity(2 * tensor.len());
-            for &value in &tensor {
-                next.push(value * (F128::ONE + coord));
-                next.push(value * coord);
-            }
-            tensor = next;
-        }
-        let rel_addr: Vec<usize> = (0..1_usize << free_vars)
-            .map(|index| {
-                let mut address = 0_usize;
-                for (j, &(bit, _)) in free.iter().enumerate() {
-                    if (index >> (free_vars - 1 - j)) & 1 == 1 {
-                        address |= 1 << bit;
-                    }
+    let families = groups
+        .into_iter()
+        .map(|(free, member_ids)| {
+            let free_vars = free.len();
+            let mut tensor = vec![F128::ONE];
+            for &(_, coord) in &free {
+                let mut next = Vec::with_capacity(2 * tensor.len());
+                for &value in &tensor {
+                    next.push(value * (F128::ONE + coord));
+                    next.push(value * coord);
                 }
-                address
-            })
-            .collect();
-        // Scatter per member; disjoint offsets per member make the
-        // writes racy only ACROSS members sharing an address, so keep
-        // this serial per family (families are few, tensors dominate).
-        for &member in members {
-            let (fixed, _) = &split[member];
-            let scale = powers[member];
-            for (offset, &weight) in rel_addr.iter().zip(&tensor) {
-                w[fixed | offset] += scale * weight;
+                tensor = next;
+            }
+            let rel_addr: Vec<usize> = (0..1_usize << free_vars)
+                .map(|index| {
+                    let mut address = 0_usize;
+                    for (j, &(bit, _)) in free.iter().enumerate() {
+                        if (index >> (free_vars - 1 - j)) & 1 == 1 {
+                            address |= 1 << bit;
+                        }
+                    }
+                    address
+                })
+                .collect();
+            let members = member_ids
+                .iter()
+                .map(|&i| (split[i].0, powers[i]))
+                .collect();
+            Family {
+                tensor,
+                rel_addr,
+                members,
+            }
+        })
+        .collect();
+    WeightFamilies { families }
+}
+
+impl WeightFamilies {
+    /// Iterate every `(address, weight)` support entry of `W`.
+    fn for_each_entry(&self, mut sink: impl FnMut(usize, F128)) {
+        for family in &self.families {
+            for &(fixed, coef) in &family.members {
+                for (offset, &weight) in family.rel_addr.iter().zip(&family.tensor) {
+                    sink(fixed | offset, coef * weight);
+                }
             }
         }
     }
-    w
 }
 
 /// Prove the closure. `points` are full `vars`-coordinate bit-MLE
@@ -132,57 +156,60 @@ pub fn prove_closure<Ch: Challenger>(
     challenger.observe_label(b"aerie-claim-closure-v0");
     challenger.observe_f128_slice(values);
     let mu = challenger.sample_f128();
-    let mut w = build_weight_table(points, mu, vars);
+    let families = weight_families(points, mu, vars);
 
     let mut rounds = Vec::with_capacity(vars);
     let mut point = Vec::with_capacity(vars);
-    // Round 1: gate on witness bits (packed words), no z table yet.
-    // The third evaluation node is the FIELD element T with
-    // representation 2 (the polynomial-basis generator), matching the
-    // scatter convention: f(T) = f0 + T (f0 + f1) in char 2. On bit
-    // pairs, z(T) takes one of {0, 1, T, 1 + T}.
+    // Round 1, entry-wise: the FULL 2^vars weight table never exists.
+    // e0 and e1 accumulate directly over W's support entries, gated on
+    // the packed witness bits; e_T streams ONE scattered half-size
+    // table V(y) = W(T, y) against z(T, y) built from bit pairs (T is
+    // the field element with representation 2, the scatter convention:
+    // f(T) = f0 + T (f0 + f1)). After the challenge the same buffer is
+    // re-scattered into the folded W. Peak memory is one half-size
+    // table; every value is the same field element as the dense path's
+    // (entry-wise sums are exact regroupings).
     let half = 1_usize << (vars - 1);
     let t_node = F128 { lo: 2, hi: 0 };
     let bit_at = |index: usize| crate::chain::read_packed_bit(z_packed, index);
-    let evals: [F128; 3] = (0..half)
+    let mut e0 = F128::ZERO;
+    let mut e1 = F128::ZERO;
+    let mut v_table = vec![F128::ZERO; half];
+    families.for_each_entry(|address, weight| {
+        let top = address >> (vars - 1) & 1 == 1;
+        if bit_at(address) {
+            if top {
+                e1 += weight;
+            } else {
+                e0 += weight;
+            }
+        }
+        // V(y) = W(T, y): the top coordinate contributes (1 + T) for a
+        // 0-half entry and T for a 1-half entry.
+        let factor = if top { t_node } else { F128::ONE + t_node };
+        v_table[address & (half - 1)] += factor * weight;
+    });
+    let e2: F128 = (0..half)
         .into_par_iter()
         .fold(
-            || [F128::ZERO; 3],
-            |mut acc, y| {
+            || F128::ZERO,
+            |acc, y| {
                 let (b0, b1) = (bit_at(y), bit_at(y + half));
-                if !b0 && !b1 {
-                    return acc;
-                }
-                let (w0, w1) = (w[y], w[y + half]);
-                if b0 {
-                    acc[0] += w0;
-                }
-                if b1 {
-                    acc[1] += w1;
-                }
-                let w_t = w0 + t_node * (w0 + w1);
                 let z_t = match (b0, b1) {
+                    (false, false) => return acc,
                     (true, true) => F128::ONE,
-                    (true, false) => F128::ONE + t_node,
                     (false, true) => t_node,
-                    (false, false) => unreachable!(),
+                    (true, false) => F128::ONE + t_node,
                 };
-                acc[2] += w_t * z_t;
-                acc
+                acc + v_table[y] * z_t
             },
         )
-        .reduce(
-            || [F128::ZERO; 3],
-            |mut a, b| {
-                for (x, y) in a.iter_mut().zip(b) {
-                    *x += y;
-                }
-                a
-            },
-        );
+        .reduce(|| F128::ZERO, |a, b| a + b);
+    let evals = [e0, e1, e2];
     challenger.observe_f128_slice(&evals);
     let r0 = challenger.sample_f128();
-    // Densify z at half size and fold w.
+    // Densify z at half size; re-scatter the SAME buffer into the
+    // folded W (top factor lin(., r0)).
     let mut z: Vec<F128> = (0..half)
         .into_par_iter()
         .map(|y| {
@@ -195,13 +222,13 @@ pub fn prove_closure<Ch: Challenger>(
             }
         })
         .collect();
-    {
-        let (low, high) = w.split_at_mut(half);
-        low.par_iter_mut()
-            .zip(&high[..half])
-            .for_each(|(l, &h)| *l += r0 * (*l + h));
-        w.truncate(half);
-    }
+    let mut w = v_table;
+    w.par_iter_mut().for_each(|slot| *slot = F128::ZERO);
+    families.for_each_entry(|address, weight| {
+        let top = address >> (vars - 1) & 1 == 1;
+        let factor = if top { r0 } else { F128::ONE + r0 };
+        w[address & (half - 1)] += factor * weight;
+    });
     rounds.push(evals);
     point.push(r0);
 
