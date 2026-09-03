@@ -273,8 +273,97 @@ pub fn prove<Ch: Challenger>(
     let vars = factors[0].len().trailing_zeros() as usize;
     let mut rounds = Vec::with_capacity(vars);
     let mut point = Vec::with_capacity(vars);
+    let mut first_round = factors[0].len() > 1;
     while factors[0].len() > 1 {
         let half = factors[0].len() / 2;
+        if first_round {
+            first_round = false;
+            // Round-1 bit kernel: before any fold the factor tables are
+            // largely 0/1-valued (slot bits, gates), so a pair
+            // (low, diff = low + high) classifies as (0,0) -> the term
+            // is zero at EVERY evaluation point (whole element skipped
+            // -- honest gated rows are mostly zero), or one of the
+            // classes 1, p_t, 1 + p_t, whose product over the bit
+            // factors depends only on the class COUNTS. Precomputed
+            // power tables close each element in ~3 multiplications per
+            // point plus its dense factors. Pure regrouping of the same
+            // field products: round messages are byte-identical.
+            let max_pow = degree + 1;
+            let pow_of = |base_at: &dyn Fn(usize) -> F128| -> Vec<Vec<F128>> {
+                (0..=degree)
+                    .map(|t| {
+                        let base = base_at(t);
+                        let mut row = Vec::with_capacity(max_pow + 1);
+                        row.push(F128::ONE);
+                        for k in 0..max_pow {
+                            let prev = row[k];
+                            row.push(prev * base);
+                        }
+                        row
+                    })
+                    .collect()
+            };
+            // Class (1,0): value 1 at every t (no table needed).
+            let pow_p = pow_of(&|t| points[t]); // class (0,1): p_t
+            let pow_1p = pow_of(&|t| F128::ONE + points[t]); // class (1,1)
+            let evals = (0..half)
+                .into_par_iter()
+                .fold(
+                    || vec![F128::ZERO; degree + 1],
+                    |mut acc, i| {
+                        let mut n_p = 0usize;
+                        let mut n_1p = 0usize;
+                        let mut dense: [(F128, F128); 32] = [(F128::ZERO, F128::ZERO); 32];
+                        let mut n_dense = 0usize;
+                        for factor in &factors {
+                            let low = factor[i];
+                            let diff = low + factor[half + i];
+                            let low_is_bit = low == F128::ZERO || low == F128::ONE;
+                            let diff_is_bit = diff == F128::ZERO || diff == F128::ONE;
+                            if low_is_bit && diff_is_bit {
+                                match (low == F128::ONE, diff == F128::ONE) {
+                                    (false, false) => return acc, // zero term
+                                    (true, false) => {}
+                                    (false, true) => n_p += 1,
+                                    (true, true) => n_1p += 1,
+                                }
+                            } else {
+                                dense[n_dense] = (low, diff);
+                                n_dense += 1;
+                            }
+                        }
+                        for (t, slot) in acc.iter_mut().enumerate() {
+                            let mut term = pow_p[t][n_p] * pow_1p[t][n_1p];
+                            for &(low, diff) in &dense[..n_dense] {
+                                term *= low + points[t] * diff;
+                            }
+                            *slot += term;
+                        }
+                        acc
+                    },
+                )
+                .reduce(
+                    || vec![F128::ZERO; degree + 1],
+                    |mut a, b| {
+                        for (x, y) in a.iter_mut().zip(&b) {
+                            *x += *y;
+                        }
+                        a
+                    },
+                );
+            challenger.observe_f128_slice(&evals);
+            let challenge = challenger.sample_f128();
+            factors.par_iter_mut().for_each(|factor| {
+                for i in 0..half {
+                    let low = factor[i];
+                    factor[i] = low + challenge * (low + factor[half + i]);
+                }
+                factor.truncate(half);
+            });
+            rounds.push(evals);
+            point.push(challenge);
+            continue;
+        }
         // One pass over the domain: load each factor pair once and extend
         // it to every evaluation point, instead of degree + 1 passes.
         let evals = (0..half)

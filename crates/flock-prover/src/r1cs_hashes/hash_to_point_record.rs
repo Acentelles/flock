@@ -845,16 +845,27 @@ pub fn prove_record_core_with_masks<Ch: Challenger>(
     masks: &[[bool; 128]; slots::MASK_REPS],
     challenger: &mut Ch,
 ) -> RecordCore {
-    let trace = std::env::var("RECORD_TRACE").is_ok();
-    let stage = std::time::Instant::now();
-    let wit = record_witness(setup, blocks, masks);
-    if trace {
-        eprintln!(
-            "  [prove_record] witness generation + pack: {:7.1} ms",
-            stage.elapsed().as_secs_f64() * 1e3
-        );
-    }
+    let trace =
+        std::env::var("RECORD_TRACE").is_ok() || std::env::var("FLOCK_TRACE").is_ok();
+    let mut stage = std::time::Instant::now();
+    let mut lap = |label: &str| {
+        if trace {
+            eprintln!(
+                "  [prove_record] {label}: {:7.1} ms",
+                stage.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        stage = std::time::Instant::now();
+    };
+    // Witgen is block-parallel; the Z_H planes are written inside each
+    // block's builder, so they are part of this lap by construction.
+    let z = setup.generate_witness_with_masks(blocks, masks);
+    lap("witgen (incl. Z_H planes)");
+    let z_packed = pcs::pack_witness(&z, setup.r1cs.m);
+    lap("pack witness");
+    let wit = RecordWitness { z, z_packed };
     let (commitment, prover_data) = pcs::commit(&wit.z_packed, &setup.pcs_params);
+    lap("commit");
     prove_record_core_bound(setup, wit, commitment, Some(prover_data), challenger)
 }
 
@@ -873,7 +884,8 @@ pub fn prove_record_core_bound<Ch: Challenger>(
 ) -> RecordCore {
     let r1cs = &setup.r1cs;
     let record_vars = r1cs.m - slots::K_LOG;
-    let trace = std::env::var("RECORD_TRACE").is_ok();
+    let trace =
+        std::env::var("RECORD_TRACE").is_ok() || std::env::var("FLOCK_TRACE").is_ok();
     let mut stage = std::time::Instant::now();
     let lap = |label: &str, stage: &mut std::time::Instant| {
         if trace {
@@ -950,8 +962,15 @@ pub fn prove_record_core_bound<Ch: Challenger>(
 
     let points = multilinear_points(record_vars, &rs, &r_fp, beta, gamma, delta)
         .expect("derived power coordinates defined");
-    let opening_values = bit_mle_many(&z, &points);
-    lap("opening values", &mut stage);
+    // Points 0..44 are the scatter/discharge/Z_H set (survives the S5
+    // restructure); 44..59 are the fingerprint openings (S5-deletion
+    // candidates) — lapped separately so the S5 dividend is measurable.
+    // The fingerprint points share the r_fp family, so splitting the
+    // call keeps every intra-family tensor share.
+    let mut opening_values = bit_mle_many(&z, &points[..44]);
+    lap("opening values (scatter/discharge/Z_H)", &mut stage);
+    opening_values.extend(bit_mle_many(&z, &points[44..]));
+    lap("opening values (fingerprint)", &mut stage);
     let mut fingerprint_value = F128::ZERO;
     for c in 0..15 {
         fingerprint_value += F128 { lo: 1 << c, hi: 0 } * opening_values[44 + c];
@@ -1012,7 +1031,8 @@ pub fn open_record_with<Ch: Challenger>(
     mode: OpenMode,
     challenger: &mut Ch,
 ) -> (RecordProof, pcs::ProverData) {
-    let trace = std::env::var("RECORD_TRACE").is_ok();
+    let trace =
+        std::env::var("RECORD_TRACE").is_ok() || std::env::var("FLOCK_TRACE").is_ok();
     let stage = std::time::Instant::now();
     assert_eq!(extra_points.len(), extra_values.len());
     let lig_config = setup
