@@ -34,6 +34,7 @@ pub mod keccak;
 /// for tighter PCS utilization (~97% vs the single encoder's ~65%).
 pub mod keccak3;
 pub mod keccak_gkr;
+pub mod carry_gate;
 /// Generic Merkle-path glue ([`MerkleLayout`]-parameterized prove/verify),
 /// analogous to [`chain_common`] but with a per-row bit selector.
 ///
