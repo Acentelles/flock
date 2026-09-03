@@ -512,7 +512,7 @@ pub fn open_sponge<Ch: Challenger>(
     let padding = setup.keccak.r1cs.padding_spec();
     let pcs_open = pcs::open_batch_mixed_ligerito_with_precomputed_s_hat_v(
         fast.z_packed,
-        &fast.prover_data,
+        fast.prover_data.as_ref().expect("own-root core"),
         &fast.commitment,
         &x_refs,
         &precomputed,
@@ -530,7 +530,7 @@ pub fn open_sponge<Ch: Challenger>(
             opening_values: core.opening_values,
             pcs_open,
         },
-        fast.prover_data,
+        fast.prover_data.expect("own-root core"),
     )
 }
 

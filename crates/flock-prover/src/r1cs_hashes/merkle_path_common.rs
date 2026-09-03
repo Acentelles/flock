@@ -425,7 +425,7 @@ pub fn prove_merkle_paths_ligerito_generic<Ch: Challenger>(
     let pre_c: Option<&[F128]> = Some(s_hat_v_c.as_slice());
     let pcs_open = flock_core::pcs::open_batch_mixed_ligerito_with_precomputed_s_hat_v(
         z_packed,
-        &prover_data,
+        prover_data.as_ref().expect("own-root core"),
         &commitment,
         &[ab_x_outer.as_slice(), c_x_outer.as_slice()],
         &[pre_ab, pre_c],

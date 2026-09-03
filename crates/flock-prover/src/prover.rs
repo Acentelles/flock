@@ -241,7 +241,7 @@ pub fn prove_fast_ligerito_from_witness<Ch: Challenger>(
     let pre_c: Option<&[F128]> = Some(s_hat_v_c.as_slice());
     let pcs_open = open_claims_with_precomputed_ligerito(
         z_packed,
-        &prover_data,
+        prover_data.as_ref().expect("own-root core"),
         &commitment,
         &[ab.clone(), c.clone()],
         &[pre_ab, pre_c],
@@ -272,7 +272,9 @@ pub struct ProveCore {
     pub ab: ZClaim,
     pub c: ZClaim,
     pub commitment: Commitment,
-    pub prover_data: pcs::ProverData,
+    /// `None` when the lane rides a shared single-root commitment (the
+    /// root's owner holds the opening data).
+    pub prover_data: Option<pcs::ProverData>,
     pub z_packed: Vec<F128>,
     /// Precomputed `s_hat_v` for the AB claim — derived from lincheck's
     /// pre-sumcheck `z_vec` via [`pcs::ring_switch::s_hat_v_from_z_vec`].
@@ -332,6 +334,40 @@ pub fn prove_fast_core_with_codeword<Ch: Challenger>(
     prefaulted_codeword: Option<Vec<F128>>,
     challenger: &mut Ch,
 ) -> ProveCore {
+    let (commitment, prover_data) = match prefaulted_codeword {
+        Some(buf) => pcs::commit_into(&z_packed, pcs_params, buf),
+        None => pcs::commit(&z_packed, pcs_params),
+    };
+    prove_fast_core_bound(
+        r1cs,
+        z_packed,
+        a_packed_f128,
+        b_packed_f128,
+        z_packed_lincheck,
+        lincheck_circuit,
+        commitment,
+        Some(prover_data),
+        challenger,
+    )
+}
+
+/// The PIOP half of the fast core against an ALREADY-COMMITTED root:
+/// binds the given commitment (which may cover a larger concatenated
+/// witness, e.g. the single-root `C_H`), then runs the zerocheck and
+/// lincheck over THIS lane's tables. `prover_data` is `None` when the
+/// opening belongs to the shared root's owner.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_fast_core_bound<Ch: Challenger>(
+    r1cs: &BlockR1cs,
+    z_packed: Vec<F128>,
+    a_packed_f128: Vec<F128>,
+    b_packed_f128: Vec<F128>,
+    z_packed_lincheck: Vec<u8>,
+    lincheck_circuit: &dyn lincheck::LincheckCircuit,
+    commitment: Commitment,
+    prover_data: Option<pcs::ProverData>,
+    challenger: &mut Ch,
+) -> ProveCore {
     let trace = std::env::var("FLOCK_TRACE").is_ok();
     let mut stage = std::time::Instant::now();
     let mut lap = |label: &str| {
@@ -343,10 +379,6 @@ pub fn prove_fast_core_with_codeword<Ch: Challenger>(
             );
         }
         stage = std::time::Instant::now();
-    };
-    let (commitment, prover_data) = match prefaulted_codeword {
-        Some(buf) => pcs::commit_into(&z_packed, pcs_params, buf),
-        None => pcs::commit(&z_packed, pcs_params),
     };
     bind_statement(challenger, r1cs, &commitment);
     lap("commit");
