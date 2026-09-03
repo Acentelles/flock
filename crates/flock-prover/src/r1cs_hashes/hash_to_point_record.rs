@@ -53,6 +53,81 @@ pub fn flock_claim_shape(point_msb: &[F128]) -> ([F128; 7], Vec<F128>) {
 /// (a gather over the sub-cube) and only the non-Boolean coordinates
 /// arithmetically. The record-lane claims all fix their plane bits, so
 /// this is orders of magnitude cheaper than the dense fold.
+/// Evaluate MANY points of one bool witness, sharing the eq tensor and
+/// relative-address table across points whose free coordinates agree
+/// (see `hash_to_point_sponge::gather_eval_many`; same exactness
+/// argument, direct bool reads).
+pub fn bit_mle_many(bits: &[bool], points: &[Vec<F128>]) -> Vec<F128> {
+    use rayon::prelude::*;
+    let vars = points.first().map_or(0, Vec::len);
+    let mut split: Vec<(usize, Vec<(usize, F128)>)> = Vec::with_capacity(points.len());
+    for point in points {
+        assert_eq!(point.len(), vars);
+        let mut fixed = 0_usize;
+        let mut free = Vec::new();
+        for (i, &coord) in point.iter().enumerate() {
+            let bit = vars - 1 - i;
+            if coord == F128::ZERO {
+            } else if coord == F128::ONE {
+                fixed |= 1 << bit;
+            } else {
+                free.push((bit, coord));
+            }
+        }
+        split.push((fixed, free));
+    }
+    let mut groups: Vec<(Vec<(usize, F128)>, Vec<usize>)> = Vec::new();
+    for (index, (_, free)) in split.iter().enumerate() {
+        if let Some((_, members)) = groups.iter_mut().find(|(sig, _)| sig == free) {
+            members.push(index);
+        } else {
+            groups.push((free.clone(), vec![index]));
+        }
+    }
+    let mut values = vec![F128::ZERO; points.len()];
+    for (free, members) in &groups {
+        let free_vars = free.len();
+        let size = 1_usize << free_vars;
+        let mut tensor = vec![F128::ONE];
+        for &(_, coord) in free {
+            let mut next = Vec::with_capacity(2 * tensor.len());
+            for &value in &tensor {
+                next.push(value * (F128::ONE + coord));
+                next.push(value * coord);
+            }
+            tensor = next;
+        }
+        let rel_addr: Vec<usize> = (0..size)
+            .map(|index| {
+                let mut address = 0_usize;
+                for (j, &(bit, _)) in free.iter().enumerate() {
+                    if (index >> (free_vars - 1 - j)) & 1 == 1 {
+                        address |= 1 << bit;
+                    }
+                }
+                address
+            })
+            .collect();
+        let member_values: Vec<F128> = members
+            .par_iter()
+            .map(|&point_index| {
+                let fixed = split[point_index].0;
+                let mut sum = F128::ZERO;
+                for (offset, &weight) in rel_addr.iter().zip(&tensor) {
+                    if bits[fixed | offset] {
+                        sum += weight;
+                    }
+                }
+                sum
+            })
+            .collect();
+        for (&point_index, value) in members.iter().zip(member_values) {
+            values[point_index] = value;
+        }
+    }
+    values
+}
+
 pub fn bit_mle_fast(bits: &[bool], point_msb: &[F128]) -> F128 {
     let vars = point_msb.len();
     assert_eq!(bits.len(), 1 << vars);
@@ -805,10 +880,7 @@ pub fn prove_record_core_with_masks<Ch: Challenger>(
 
     let points = multilinear_points(record_vars, &rs, &r_fp, beta, gamma, delta)
         .expect("derived power coordinates defined");
-    let opening_values: Vec<F128> = {
-        use rayon::prelude::*;
-        points.par_iter().map(|p| bit_mle_fast(&z, p)).collect()
-    };
+    let opening_values = bit_mle_many(&z, &points);
     lap("opening values", &mut stage);
     let mut fingerprint_value = F128::ZERO;
     for c in 0..15 {

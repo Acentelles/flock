@@ -260,23 +260,20 @@ pub fn prove_link_claims<Ch: Challenger>(
         slot_link_claims(slot_record_vars, delta, nu, mu, gamma).expect("nondegenerate");
     let keccak_claims =
         keccak_link_claims(keccak_record_vars, delta, nu, mu, gamma).expect("nondegenerate");
-    let (slot_values, keccak_values): (Vec<F128>, Vec<F128>) = {
-        use rayon::prelude::*;
-        rayon::join(
-            || {
-                slot_claims
-                    .par_iter()
-                    .map(|claim| sponge::gather_eval(slot_z_packed, &claim.point))
-                    .collect()
-            },
-            || {
-                keccak_claims
-                    .par_iter()
-                    .map(|claim| sponge::gather_eval(keccak_z_packed, &claim.point))
-                    .collect()
-            },
-        )
-    };
+    let (slot_values, keccak_values): (Vec<F128>, Vec<F128>) = rayon::join(
+        || {
+            let points: Vec<Vec<F128>> =
+                slot_claims.iter().map(|claim| claim.point.clone()).collect();
+            sponge::gather_eval_many(slot_z_packed, &points)
+        },
+        || {
+            let points: Vec<Vec<F128>> = keccak_claims
+                .iter()
+                .map(|claim| claim.point.clone())
+                .collect();
+            sponge::gather_eval_many(keccak_z_packed, &points)
+        },
+    );
 
     let slot_points: Vec<Vec<F128>> = slot_claims.into_iter().map(|c| c.point).collect();
     let keccak_points: Vec<Vec<F128>> = keccak_claims.into_iter().map(|c| c.point).collect();
@@ -394,10 +391,7 @@ pub fn prove_consistency_with(
         let mut rep_points = record::zh_fingerprint_points(record_vars, r);
         let (mask_point, mask_scale) = mask_claim_point(record_vars, rep);
         rep_points.push(mask_point);
-        let rep_values: Vec<F128> = rep_points
-            .iter()
-            .map(|p| sponge::gather_eval(z_packed, p))
-            .collect();
+        let rep_values = sponge::gather_eval_many(z_packed, &rep_points);
         let v = record::zh_fingerprint_value(&rep_values[..15]);
         tags.push(*gamma * v + mask_scale * rep_values[15]);
         points.extend(rep_points);
