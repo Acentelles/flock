@@ -189,6 +189,8 @@ pub struct SpongeProof {
     pub lincheck: lincheck::LincheckProof,
     /// Claimed opening values in [`sponge_points`]' fixed order.
     pub opening_values: Vec<F128>,
+    /// The spec-7.3 claim closure (see the record lane).
+    pub closure: super::claim_closure::ClosureProof,
     pub pcs_open: pcs::BatchOpeningProofLigerito,
 }
 
@@ -365,7 +367,7 @@ pub fn prove_sponge<Ch: Challenger>(
     let core = prove_sponge_core(setup, records, challenger);
     let words = core.all_words.clone();
     let z_packed = core.fast.z_packed.clone();
-    let (proof, prover_data) = open_sponge(setup, core, &[], challenger);
+    let (proof, prover_data) = open_sponge(setup, core, &[], &[], challenger);
     let artifacts = LaneArtifacts {
         z_packed,
         prover_data,
@@ -465,11 +467,29 @@ pub fn open_sponge<Ch: Challenger>(
     setup: &SpongeSetup,
     core: SpongeCore,
     extra_points: &[Vec<F128>],
+    extra_values: &[F128],
     challenger: &mut Ch,
 ) -> (SpongeProof, pcs::ProverData) {
+    assert_eq!(extra_points.len(), extra_values.len());
     let fast = core.fast;
     let ab = fast.ab.clone();
     let c = fast.c.clone();
+    // Spec-7.3 closure over every multilinear claim of this lane.
+    let all_points: Vec<Vec<F128>> = core
+        .points
+        .iter()
+        .cloned()
+        .chain(extra_points.iter().cloned())
+        .collect();
+    let mut all_values = core.opening_values.clone();
+    all_values.extend_from_slice(extra_values);
+    let (closure, closed_point) = super::claim_closure::prove_closure(
+        &fast.z_packed,
+        setup.keccak.r1cs.m,
+        &all_points,
+        &all_values,
+        challenger,
+    );
     let mut x_fulls: Vec<Vec<F128>> = vec![
         {
             let mut v = ab.point.x_inner_rest.clone();
@@ -482,18 +502,14 @@ pub fn open_sponge<Ch: Challenger>(
             v
         },
     ];
-    for point in core.points.iter().chain(extra_points) {
-        let (_low, x_outer) = flock_claim_shape(point);
+    {
+        let (_low, x_outer) = flock_claim_shape(&closed_point);
         x_fulls.push(x_outer);
     }
     let x_refs: Vec<&[F128]> = x_fulls.iter().map(|v| v.as_slice()).collect();
     let pre_ab: Option<&[F128]> = fast.s_hat_v_ab.as_deref();
     let pre_c: Option<&[F128]> = Some(fast.s_hat_v_c.as_slice());
-    let mut precomputed: Vec<Option<&[F128]>> = vec![pre_ab, pre_c];
-    precomputed.extend(std::iter::repeat_n(
-        None,
-        core.points.len() + extra_points.len(),
-    ));
+    let precomputed: Vec<Option<&[F128]>> = vec![pre_ab, pre_c, None];
     let lig_config = setup
         .keccak
         .pcs_params
@@ -518,6 +534,7 @@ pub fn open_sponge<Ch: Challenger>(
             zerocheck: fast.zc_proof,
             lincheck: fast.lc_proof,
             opening_values: core.opening_values,
+            closure,
             pcs_open,
         },
         fast.prover_data,
@@ -735,9 +752,21 @@ pub fn verify_sponge_open<Ch: Challenger>(
         return Err("extra claim points and values disagree");
     }
     let SpongeVerifyCore { ab, c, points } = core;
-    let mut claim_values = vec![ab.value, c.value];
-    claim_values.extend_from_slice(&proof.opening_values);
-    claim_values.extend_from_slice(extra_values);
+    let all_points: Vec<Vec<F128>> = points
+        .iter()
+        .cloned()
+        .chain(extra_points.iter().cloned())
+        .collect();
+    let mut all_values = proof.opening_values.clone();
+    all_values.extend_from_slice(extra_values);
+    let (closed_point, closed_value) = super::claim_closure::verify_closure(
+        &proof.closure,
+        setup.keccak.r1cs.m,
+        &all_points,
+        &all_values,
+        challenger,
+    )?;
+    let claim_values = vec![ab.value, c.value, closed_value];
     let mut bindings = vec![
         LowBinding::Quirky {
             z_skip: ab.point.z_skip,
@@ -758,8 +787,8 @@ pub fn verify_sponge_open<Ch: Challenger>(
             v
         },
     ];
-    for point in points.iter().chain(extra_points) {
-        let (x_low, x_outer) = flock_claim_shape(point);
+    {
+        let (x_low, x_outer) = flock_claim_shape(&closed_point);
         bindings.push(LowBinding::Multilinear { x_low });
         x_fulls.push(x_outer);
     }

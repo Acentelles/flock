@@ -540,11 +540,22 @@ pub fn prove_hash_to_point<Ch: Challenger>(
         prove_consistency(slot_record_vars, &record_core.z_packed, challenger);
     lap("consistency claims");
     let mut record_extra = slot_points;
+    let mut record_extra_values = link.slot_values.clone();
     record_extra.extend(consistency_points);
+    for rep_values in &consistency.values {
+        record_extra_values.extend_from_slice(rep_values);
+    }
     let (sponge_proof, _) =
-        sponge::open_sponge(sponge_setup, sponge_core, &keccak_points, challenger);
+        sponge::open_sponge(
+            sponge_setup,
+            sponge_core,
+            &keccak_points,
+            &link.keccak_values,
+            challenger,
+        );
     lap("sponge open (keccak PCS)");
-    let (record_proof, _) = record::open_record(slot_setup, record_core, &record_extra, challenger);
+    let (record_proof, _) =
+        record::open_record(slot_setup, record_core, &record_extra, &record_extra_values, challenger);
     lap("record open (slot PCS)");
     HashToPointProof {
         sponge: sponge_proof,

@@ -13,6 +13,7 @@ pub mod blake3;
 ///
 /// [`ChainLayout`]: chain_common::ChainLayout
 pub mod chain_common;
+pub mod claim_closure;
 pub mod common;
 /// The cross-lane word linkage plus the complete HashToPoint driver.
 pub mod hash_to_point_link;
