@@ -786,6 +786,10 @@ pub struct RecordCore {
     pub s_hat_v_c: Vec<F128>,
     pub opening_values: Vec<F128>,
     pub fingerprint_value: F128,
+    /// The fingerprint leaf point over `(record, output index)`: the
+    /// composed v2 driver reads `(r_fp, fingerprint_value)` as the
+    /// binary content claim `v_H = MLE_K(Z, r_fp)` for the bridge.
+    pub r_fp: Vec<F128>,
     pub points: Vec<Vec<F128>>,
 }
 
@@ -989,6 +993,7 @@ pub fn prove_record_core_bound<Ch: Challenger>(
         s_hat_v_c,
         opening_values,
         fingerprint_value,
+        r_fp,
         points,
     }
 }
