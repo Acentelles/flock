@@ -292,6 +292,27 @@ mod tests {
     }
 
     #[test]
+    fn the_closure_open_mode_roundtrips() {
+        // The spec-7.3 conformance path stays compiled and tested even
+        // though the fused path is the prover-time default.
+        let records = 32;
+        let setup = SlotSetup::new(records);
+        let blocks: Vec<[u16; slots::SLOTS]> = (0..records)
+            .map(|i| core::array::from_fn(|s| ((i * 131 + s * 17) % 65536) as u16))
+            .collect();
+        let masks = [[false; 128]; slots::MASK_REPS];
+        let mut prover = FsChallenger::new(b"record-closure-mode");
+        let core = prove_record_core_with_masks(&setup, &blocks, &masks, &mut prover);
+        let (proof, _) =
+            open_record_with(&setup, core, &[], &[], OpenMode::Closure, &mut prover);
+        assert!(proof.closure.is_some());
+        let mut verifier = FsChallenger::new(b"record-closure-mode");
+        let core = verify_record_core(&setup, &proof, &mut verifier).expect("core verifies");
+        verify_record_open(&setup, &proof, core, &[], &[], &mut verifier)
+            .expect("closure-mode opening verifies");
+    }
+
+    #[test]
     fn record_proof_roundtrips_and_rejects_tampering() {
         // The complete record lane against real commitments: slot R1CS,
         // scatter, discharge, Z_H binding, one batched opening. Coverage
@@ -584,9 +605,10 @@ pub struct RecordProof {
     /// Claimed values of the multilinear openings, in the fixed order
     /// produced by [`multilinear_points`].
     pub opening_values: Vec<F128>,
-    /// The spec-7.3 claim closure collapsing every multilinear claim
-    /// (the lane's own plus the caller's extras) into ONE opened claim.
-    pub closure: super::claim_closure::ClosureProof,
+    /// The spec-7.3 claim closure, when the opening was made with
+    /// [`OpenMode::Closure`]: every multilinear claim collapses into
+    /// ONE opened claim. `None` on the default fused per-claim path.
+    pub closure: Option<super::claim_closure::ClosureProof>,
     /// `MLE_K(Z_H, r)` over the packed leaves at the fingerprint point:
     /// the theta-weighted sum of the fifteen fingerprint openings. The
     /// aerie tag equation consumes this.
@@ -911,11 +933,38 @@ pub fn prove_record_core_with_masks<Ch: Challenger>(
 /// lane's multilinear claims, and any cross-lane `extra_points`
 /// (appended after the lane's own claims, values carried by the caller).
 /// Returns the prover data for callers that keep artifacts.
+/// How the record lane binds its multilinear claims to the PCS.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OpenMode {
+    /// The DEFAULT: the fused per-claim ring-switch path. Host A/B
+    /// (2026-09-04): fastest prover at every measured size.
+    Fused,
+    /// The spec-7.3 claim closure: one opened claim, smaller wire
+    /// (-25%) and faster verify (-45%), but the closure sumcheck's
+    /// dense rounds cost more prover time than the fused folds save
+    /// (host record open 3.0-3.7x at 256..4096). Kept compiled and
+    /// tested as the conformance path for the one-opening S4; the
+    /// gating work item is lazy bit-folding / fused-kernel-quality
+    /// dense rounds.
+    Closure,
+}
+
 pub fn open_record<Ch: Challenger>(
     setup: &SlotSetup,
     core: RecordCore,
     extra_points: &[Vec<F128>],
     extra_values: &[F128],
+    challenger: &mut Ch,
+) -> (RecordProof, pcs::ProverData) {
+    open_record_with(setup, core, extra_points, extra_values, OpenMode::Fused, challenger)
+}
+
+pub fn open_record_with<Ch: Challenger>(
+    setup: &SlotSetup,
+    core: RecordCore,
+    extra_points: &[Vec<F128>],
+    extra_values: &[F128],
+    mode: OpenMode,
     challenger: &mut Ch,
 ) -> (RecordProof, pcs::ProverData) {
     let trace = std::env::var("RECORD_TRACE").is_ok();
@@ -927,23 +976,7 @@ pub fn open_record<Ch: Challenger>(
         .expect("Ligerito config");
     let padding = setup.r1cs.padding_spec();
 
-    // Spec-7.3 closure: every multilinear claim collapses into one.
-    let all_points: Vec<Vec<F128>> = core
-        .points
-        .iter()
-        .cloned()
-        .chain(extra_points.iter().cloned())
-        .collect();
-    let mut all_values = core.opening_values.clone();
-    all_values.extend_from_slice(extra_values);
-    let (closure, closed_point) = super::claim_closure::prove_closure(
-        &core.z_packed,
-        setup.r1cs.m,
-        &all_points,
-        &all_values,
-        challenger,
-    );
-
+    let mut closure = None;
     let mut x_fulls: Vec<Vec<F128>> = vec![
         {
             let mut v = core.ab.point.x_inner_rest.clone();
@@ -956,14 +989,43 @@ pub fn open_record<Ch: Challenger>(
             v
         },
     ];
-    {
-        let (_low, x_outer) = flock_claim_shape(&closed_point);
-        x_fulls.push(x_outer);
-    }
-    let x_refs: Vec<&[F128]> = x_fulls.iter().map(|v| v.as_slice()).collect();
     let pre_ab: Option<&[F128]> = Some(core.s_hat_v_ab.as_slice());
     let pre_c: Option<&[F128]> = Some(core.s_hat_v_c.as_slice());
-    let precomputed: Vec<Option<&[F128]>> = vec![pre_ab, pre_c, None];
+    let mut precomputed: Vec<Option<&[F128]>> = vec![pre_ab, pre_c];
+    match mode {
+        OpenMode::Closure => {
+            let all_points: Vec<Vec<F128>> = core
+                .points
+                .iter()
+                .cloned()
+                .chain(extra_points.iter().cloned())
+                .collect();
+            let mut all_values = core.opening_values.clone();
+            all_values.extend_from_slice(extra_values);
+            let (proof, closed_point) = super::claim_closure::prove_closure(
+                &core.z_packed,
+                setup.r1cs.m,
+                &all_points,
+                &all_values,
+                challenger,
+            );
+            closure = Some(proof);
+            let (_low, x_outer) = flock_claim_shape(&closed_point);
+            x_fulls.push(x_outer);
+            precomputed.push(None);
+        }
+        OpenMode::Fused => {
+            for p in core.points.iter().chain(extra_points) {
+                let (_low, x_outer) = flock_claim_shape(p);
+                x_fulls.push(x_outer);
+            }
+            precomputed.extend(std::iter::repeat_n(
+                None,
+                core.points.len() + extra_points.len(),
+            ));
+        }
+    }
+    let x_refs: Vec<&[F128]> = x_fulls.iter().map(|v| v.as_slice()).collect();
     let pcs_open = pcs::open_batch_mixed_ligerito_with_precomputed_s_hat_v(
         core.z_packed,
         &core.prover_data,
@@ -1113,23 +1175,7 @@ pub fn verify_record_open<Ch: Challenger>(
         return Err("extra claim points and values disagree");
     }
     let RecordVerifyCore { ab, c, points, .. } = core;
-    // Spec-7.3 closure: verify the merge of every multilinear claim,
-    // then open ONLY the closed claim.
-    let all_points: Vec<Vec<F128>> = points
-        .iter()
-        .cloned()
-        .chain(extra_points.iter().cloned())
-        .collect();
-    let mut all_values = proof.opening_values.clone();
-    all_values.extend_from_slice(extra_values);
-    let (closed_point, closed_value) = super::claim_closure::verify_closure(
-        &proof.closure,
-        setup.r1cs.m,
-        &all_points,
-        &all_values,
-        challenger,
-    )?;
-    let claim_values = vec![ab.value, c.value, closed_value];
+    let mut claim_values = vec![ab.value, c.value];
     let mut bindings = vec![
         LowBinding::Quirky {
             z_skip: ab.point.z_skip,
@@ -1150,10 +1196,35 @@ pub fn verify_record_open<Ch: Challenger>(
             v
         },
     ];
-    {
+    if let Some(closure) = &proof.closure {
+        // Spec-7.3 closure: verify the merge, open ONLY the closed claim.
+        let all_points: Vec<Vec<F128>> = points
+            .iter()
+            .cloned()
+            .chain(extra_points.iter().cloned())
+            .collect();
+        let mut all_values = proof.opening_values.clone();
+        all_values.extend_from_slice(extra_values);
+        let (closed_point, closed_value) = super::claim_closure::verify_closure(
+            closure,
+            setup.r1cs.m,
+            &all_points,
+            &all_values,
+            challenger,
+        )?;
+        claim_values.push(closed_value);
         let (x_low, x_outer) = flock_claim_shape(&closed_point);
         bindings.push(LowBinding::Multilinear { x_low });
         x_fulls.push(x_outer);
+    } else {
+        // The default fused per-claim path.
+        claim_values.extend_from_slice(&proof.opening_values);
+        claim_values.extend_from_slice(extra_values);
+        for p in points.iter().chain(extra_points) {
+            let (x_low, x_outer) = flock_claim_shape(p);
+            bindings.push(LowBinding::Multilinear { x_low });
+            x_fulls.push(x_outer);
+        }
     }
     let x_refs: Vec<&[F128]> = x_fulls.iter().map(|v| v.as_slice()).collect();
     let lig_config = setup
