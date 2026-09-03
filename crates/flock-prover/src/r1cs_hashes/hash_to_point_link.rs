@@ -601,6 +601,355 @@ pub fn verify_hash_to_point<Ch: Challenger>(
     )
 }
 
+/// The SINGLE-ROOT composed proof (S4): ONE commitment `C_H` over the
+/// concatenation of both lanes' packed witnesses, both lane PIOPs bound
+/// to it, and ONE batched Ligerito opening carrying every claim from
+/// both lanes, lifted to the concatenated domain.
+///
+/// Witness layout: `m_H = max(m_sponge, m_record) + 1` address bits; the
+/// TOP address bit is the lane (sponge = 0, record = 1); each lane's
+/// witness sits at offset 0 of its half, zero-padded above. Lifting a
+/// lane claim appends `m_H - 1 - m_lane` zero coordinates plus the lane
+/// coordinate at the END of its fold suffix (the top of the address
+/// domain), which restricts the concatenated MLE exactly to the lane
+/// block, so every lane claim value and every precomputed `s_hat_v`
+/// carries over unchanged.
+///
+/// WIRE: this is a different transcript and proof shape from
+/// [`HashToPointProof`] (one commitment and one opening instead of two);
+/// the per-claim ring-switch wire cost stays (flagged debt; the spec-7.3
+/// closure is the eventual fix once its prover regression is closed).
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct HashToPointSingleRootProof {
+    pub commitment: flock_core::pcs::Commitment,
+    pub sponge_zerocheck: flock_core::zerocheck::ZerocheckProof,
+    pub sponge_lincheck: flock_core::lincheck::LincheckProof,
+    pub sponge_opening_values: Vec<F128>,
+    pub record_zerocheck: flock_core::zerocheck::ZerocheckProof,
+    pub record_lincheck: flock_core::lincheck::LincheckProof,
+    pub record_scatter: super::hash_to_point_scatter::ScatterProof,
+    pub record_opening_values: Vec<F128>,
+    pub record_fingerprint_value: F128,
+    pub link: LinkProof,
+    pub consistency: ConsistencyProof,
+    pub pcs_open: flock_core::pcs::BatchOpeningProofLigerito,
+}
+
+/// PCS parameters for the concatenated single root: one variable above
+/// the larger lane, with the lanes' (asserted-equal) rate, batch size,
+/// profile, and Merkle hash.
+pub fn single_root_params(
+    sponge_setup: &SpongeSetup,
+    slot_setup: &SlotSetup,
+) -> flock_core::pcs::PcsParams {
+    let sp = &sponge_setup.keccak.pcs_params;
+    let rp = &slot_setup.pcs_params;
+    assert_eq!(
+        sp.log_inv_rate, rp.log_inv_rate,
+        "lane PCS rates must agree for the single root"
+    );
+    assert_eq!(
+        sp.log_batch_size, rp.log_batch_size,
+        "lane PCS batch sizes must agree for the single root"
+    );
+    flock_core::pcs::PcsParams {
+        m: sp.m.max(rp.m) + 1,
+        log_inv_rate: sp.log_inv_rate,
+        log_batch_size: sp.log_batch_size,
+        profile: sp.profile,
+        merkle_hash: sp.merkle_hash,
+    }
+}
+
+/// Lift one lane fold suffix to the concatenated domain: append the
+/// zero pad coordinates and the lane coordinate at the END (the top of
+/// the address domain). Exact for Boolean appended coordinates: the
+/// lifted eq tensor is the lane tensor supported on the lane block.
+fn lift_to_root(mut x_full: Vec<F128>, lane_m: usize, root_m: usize, lane: bool) -> Vec<F128> {
+    x_full.reserve(root_m - lane_m);
+    x_full.extend(std::iter::repeat_n(F128::ZERO, root_m - 1 - lane_m));
+    x_full.push(if lane { F128::ONE } else { F128::ZERO });
+    x_full
+}
+
+/// Single-root composed prover. Same PIOP content and claim set as
+/// [`prove_hash_to_point`], but ONE commitment before both lane PIOPs
+/// and ONE batched opening after the linkage and consistency claims.
+/// Transcript order: `C_H`, sponge bind + PIOP, record bind + PIOP,
+/// linkage, consistency, the single opening (sponge claims first).
+pub fn prove_hash_to_point_single_root<Ch: Challenger>(
+    sponge_setup: &SpongeSetup,
+    slot_setup: &SlotSetup,
+    records: &[SpongeRecord],
+    masks: &[[bool; 128]; slots::MASK_REPS],
+    challenger: &mut Ch,
+) -> HashToPointSingleRootProof {
+    use flock_core::pcs;
+    let trace = std::env::var("FLOCK_TRACE").is_ok();
+    let mut stage = std::time::Instant::now();
+    let mut lap = |label: &str| {
+        if trace {
+            eprintln!(
+                "[hash_to_point 1root] {label}: {:8.1} ms",
+                stage.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        stage = std::time::Instant::now();
+    };
+    let m_s = sponge_setup.keccak.r1cs.m;
+    let m_r = slot_setup.r1cs.m;
+    let params_h = single_root_params(sponge_setup, slot_setup);
+
+    // Both lanes' witnesses BEFORE any transcript interaction (the
+    // record blocks are the sponge's squeeze words).
+    let sponge_wit = sponge::sponge_witness(sponge_setup, records);
+    let blocks: Vec<[u16; slots::SLOTS]> = sponge_wit
+        .all_words
+        .iter()
+        .map(|w| {
+            let mut block = [0_u16; slots::SLOTS];
+            block.copy_from_slice(w);
+            block
+        })
+        .collect();
+    let record_wit = record::record_witness(slot_setup, &blocks, masks);
+    lap("witness generation (both lanes)");
+
+    // The concatenated root: sponge half then record half, each lane at
+    // offset 0 of its half, zero-padded above.
+    let half_words = 1_usize << (params_h.m - 8);
+    let mut z_h = vec![F128::ZERO; 2 * half_words];
+    z_h[..sponge_wit.z_packed.len()].copy_from_slice(&sponge_wit.z_packed);
+    z_h[half_words..half_words + record_wit.z_packed.len()]
+        .copy_from_slice(&record_wit.z_packed);
+    let (commitment, prover_data) = pcs::commit(&z_h, &params_h);
+    lap("single-root commit");
+
+    let sponge_core =
+        sponge::prove_sponge_core_bound(sponge_setup, sponge_wit, commitment.clone(), None, challenger);
+    lap("sponge core (keccak lane)");
+    let record_core =
+        record::prove_record_core_bound(slot_setup, record_wit, commitment.clone(), None, challenger);
+    lap("record core (slot lane)");
+    let (link, slot_points, keccak_points) = prove_link_claims(
+        slot_setup,
+        sponge_setup,
+        &record_core.z_packed,
+        &sponge_core.fast.z_packed,
+        challenger,
+    );
+    lap("word linkage claims");
+    let slot_record_vars = slot_setup.r1cs.m - slots::K_LOG;
+    let (consistency, consistency_points) =
+        prove_consistency(slot_record_vars, &record_core.z_packed, challenger);
+    lap("consistency claims");
+
+    // The single claim list, lane-grouped: sponge [ab, c, multis…]
+    // lifted at lane 0, then record [ab, c, multis…] lifted at lane 1.
+    // Multilinear order per lane matches the two-root extra sets:
+    // sponge core points, keccak link points; record core points, slot
+    // link points, consistency points.
+    let mut x_fulls: Vec<Vec<F128>> = Vec::new();
+    let mut precomputed: Vec<Option<&[F128]>> = Vec::new();
+    x_fulls.push(lift_to_root(
+        crate::prover::quirky_x_outer_full(&sponge_core.fast.ab.point),
+        m_s,
+        params_h.m,
+        false,
+    ));
+    precomputed.push(sponge_core.fast.s_hat_v_ab.as_deref());
+    x_fulls.push(lift_to_root(
+        crate::prover::quirky_x_outer_full(&sponge_core.fast.c.point),
+        m_s,
+        params_h.m,
+        false,
+    ));
+    precomputed.push(Some(sponge_core.fast.s_hat_v_c.as_slice()));
+    for point in sponge_core.points.iter().chain(&keccak_points) {
+        let (_low, x_outer) = record::flock_claim_shape(point);
+        x_fulls.push(lift_to_root(x_outer, m_s, params_h.m, false));
+        precomputed.push(None);
+    }
+    x_fulls.push(lift_to_root(
+        crate::prover::quirky_x_outer_full(&record_core.ab.point),
+        m_r,
+        params_h.m,
+        true,
+    ));
+    precomputed.push(Some(record_core.s_hat_v_ab.as_slice()));
+    x_fulls.push(lift_to_root(
+        crate::prover::quirky_x_outer_full(&record_core.c.point),
+        m_r,
+        params_h.m,
+        true,
+    ));
+    precomputed.push(Some(record_core.s_hat_v_c.as_slice()));
+    for point in record_core
+        .points
+        .iter()
+        .chain(&slot_points)
+        .chain(&consistency_points)
+    {
+        let (_low, x_outer) = record::flock_claim_shape(point);
+        x_fulls.push(lift_to_root(x_outer, m_r, params_h.m, true));
+        precomputed.push(None);
+    }
+    let x_refs: Vec<&[F128]> = x_fulls.iter().map(|v| v.as_slice()).collect();
+    let lig_config = params_h
+        .ligerito_prover_config()
+        .expect("Ligerito config for the merged domain");
+    let pcs_open = pcs::open_batch_mixed_ligerito_with_precomputed_s_hat_v(
+        z_h,
+        &prover_data,
+        &commitment,
+        &x_refs,
+        &precomputed,
+        &[],
+        &flock_core::zerocheck::PaddingSpec::dense(params_h.m),
+        &lig_config,
+        challenger,
+    );
+    lap("single batched open");
+    drop(precomputed);
+
+    HashToPointSingleRootProof {
+        commitment,
+        sponge_zerocheck: sponge_core.fast.zc_proof,
+        sponge_lincheck: sponge_core.fast.lc_proof,
+        sponge_opening_values: sponge_core.opening_values,
+        record_zerocheck: record_core.zc_proof,
+        record_lincheck: record_core.lc_proof,
+        record_scatter: record_core.scatter_proof,
+        record_opening_values: record_core.opening_values,
+        record_fingerprint_value: record_core.fingerprint_value,
+        link,
+        consistency,
+        pcs_open,
+    }
+}
+
+pub fn verify_hash_to_point_single_root<Ch: Challenger>(
+    sponge_setup: &SpongeSetup,
+    slot_setup: &SlotSetup,
+    publics: &[SpongePublic],
+    proof: &HashToPointSingleRootProof,
+    challenger: &mut Ch,
+) -> Result<(), &'static str> {
+    use flock_core::pcs::{self, LowBinding};
+    let m_s = sponge_setup.keccak.r1cs.m;
+    let m_r = slot_setup.r1cs.m;
+    let params_h = single_root_params(sponge_setup, slot_setup);
+
+    let sponge_core = sponge::verify_sponge_core_parts(
+        sponge_setup,
+        publics,
+        &proof.commitment,
+        &proof.sponge_zerocheck,
+        &proof.sponge_lincheck,
+        &proof.sponge_opening_values,
+        challenger,
+    )?;
+    let record_core = record::verify_record_core_parts(
+        slot_setup,
+        &proof.commitment,
+        &proof.record_zerocheck,
+        &proof.record_lincheck,
+        &proof.record_scatter,
+        &proof.record_opening_values,
+        proof.record_fingerprint_value,
+        challenger,
+    )?;
+    let (slot_points, keccak_points) =
+        verify_link_claims(slot_setup, sponge_setup, &proof.link, challenger)?;
+    let slot_record_vars = slot_setup.r1cs.m - slots::K_LOG;
+    let (consistency_points, consistency_values) =
+        verify_consistency(slot_record_vars, &proof.consistency, challenger)?;
+
+    // The prover's claim order: sponge [ab, c, multis…], record
+    // [ab, c, multis…].
+    let mut claim_values: Vec<F128> = Vec::new();
+    let mut bindings: Vec<LowBinding> = Vec::new();
+    let mut x_fulls: Vec<Vec<F128>> = Vec::new();
+    claim_values.push(sponge_core.ab.value);
+    bindings.push(LowBinding::Quirky {
+        z_skip: sponge_core.ab.point.z_skip,
+    });
+    x_fulls.push(lift_to_root(
+        crate::prover::quirky_x_outer_full(&sponge_core.ab.point),
+        m_s,
+        params_h.m,
+        false,
+    ));
+    claim_values.push(sponge_core.c.value);
+    bindings.push(LowBinding::Quirky {
+        z_skip: sponge_core.c.point.z_skip,
+    });
+    x_fulls.push(lift_to_root(
+        crate::prover::quirky_x_outer_full(&sponge_core.c.point),
+        m_s,
+        params_h.m,
+        false,
+    ));
+    claim_values.extend_from_slice(&proof.sponge_opening_values);
+    claim_values.extend_from_slice(&proof.link.keccak_values);
+    for point in sponge_core.points.iter().chain(&keccak_points) {
+        let (x_low, x_outer) = record::flock_claim_shape(point);
+        bindings.push(LowBinding::Multilinear { x_low });
+        x_fulls.push(lift_to_root(x_outer, m_s, params_h.m, false));
+    }
+    claim_values.push(record_core.ab.value);
+    bindings.push(LowBinding::Quirky {
+        z_skip: record_core.ab.point.z_skip,
+    });
+    x_fulls.push(lift_to_root(
+        crate::prover::quirky_x_outer_full(&record_core.ab.point),
+        m_r,
+        params_h.m,
+        true,
+    ));
+    claim_values.push(record_core.c.value);
+    bindings.push(LowBinding::Quirky {
+        z_skip: record_core.c.point.z_skip,
+    });
+    x_fulls.push(lift_to_root(
+        crate::prover::quirky_x_outer_full(&record_core.c.point),
+        m_r,
+        params_h.m,
+        true,
+    ));
+    claim_values.extend_from_slice(&proof.record_opening_values);
+    claim_values.extend_from_slice(&proof.link.slot_values);
+    claim_values.extend_from_slice(&consistency_values);
+    for point in record_core
+        .points
+        .iter()
+        .chain(&slot_points)
+        .chain(&consistency_points)
+    {
+        let (x_low, x_outer) = record::flock_claim_shape(point);
+        bindings.push(LowBinding::Multilinear { x_low });
+        x_fulls.push(lift_to_root(x_outer, m_r, params_h.m, true));
+    }
+    if claim_values.len() != x_fulls.len() || bindings.len() != x_fulls.len() {
+        return Err("single-root claim bookkeeping disagrees");
+    }
+    let x_refs: Vec<&[F128]> = x_fulls.iter().map(|v| v.as_slice()).collect();
+    let lig_config = params_h
+        .ligerito_verifier_config()
+        .expect("verifier config for the merged domain");
+    pcs::verify_opening_batch_ligerito_mixed_bound(
+        &proof.commitment,
+        &claim_values,
+        &bindings,
+        &x_refs,
+        &[],
+        &proof.pcs_open,
+        &lig_config,
+        challenger,
+    )
+    .map_err(|_| "single-root batched opening verification failed")
+}
+
 #[cfg(test)]
 mod tests {
     use flock_core::challenger::FsChallenger;
@@ -757,6 +1106,105 @@ mod tests {
         let mut fresh = FsChallenger::new(b"aerie-hash-to-point");
         assert!(
             verify_hash_to_point(&sponge_setup, &slot_setup, &publics, &wrong, &mut fresh).is_err()
+        );
+    }
+
+    #[test]
+    fn single_root_hash_to_point_roundtrips() {
+        // S4: the complete relation under ONE concatenated commitment and
+        // ONE batched opening. Same claim content as the two-root path.
+        let records = 32;
+        let sponge_setup = SpongeSetup::new(records);
+        let slot_setup = SlotSetup::new(records);
+        let inputs = test_records(records);
+        let publics: Vec<SpongePublic> = inputs
+            .iter()
+            .map(|r| SpongePublic {
+                hpk: r.hpk,
+                message: r.message.clone(),
+            })
+            .collect();
+        let masks: [[bool; 128]; slots::MASK_REPS] =
+            std::array::from_fn(|rep| std::array::from_fn(|bit| (rep + bit) % 3 == 0));
+
+        let mut prover = FsChallenger::new(b"aerie-hash-to-point-1root");
+        let proof = prove_hash_to_point_single_root(
+            &sponge_setup,
+            &slot_setup,
+            &inputs,
+            &masks,
+            &mut prover,
+        );
+
+        let mut verifier = FsChallenger::new(b"aerie-hash-to-point-1root");
+        verify_hash_to_point_single_root(
+            &sponge_setup,
+            &slot_setup,
+            &publics,
+            &proof,
+            &mut verifier,
+        )
+        .expect("the single-root HashToPoint proof verifies");
+
+        // A tampered linkage value rejects through the single opening.
+        let mut wrong = proof.clone();
+        wrong.link.slot_values[3] += F128::ONE;
+        let mut fresh = FsChallenger::new(b"aerie-hash-to-point-1root");
+        assert!(
+            verify_hash_to_point_single_root(
+                &sponge_setup,
+                &slot_setup,
+                &publics,
+                &wrong,
+                &mut fresh
+            )
+            .is_err()
+        );
+
+        // A tampered public message rejects (the sponge pinning term moves).
+        let mut wrong_publics = publics.clone();
+        wrong_publics[5].message[0] ^= 1;
+        let mut fresh = FsChallenger::new(b"aerie-hash-to-point-1root");
+        assert!(
+            verify_hash_to_point_single_root(
+                &sponge_setup,
+                &slot_setup,
+                &wrong_publics,
+                &proof,
+                &mut fresh
+            )
+            .is_err()
+        );
+
+        // A tampered record opening value rejects.
+        let mut wrong = proof.clone();
+        wrong.record_opening_values[10] += F128::ONE;
+        let mut fresh = FsChallenger::new(b"aerie-hash-to-point-1root");
+        assert!(
+            verify_hash_to_point_single_root(
+                &sponge_setup,
+                &slot_setup,
+                &publics,
+                &wrong,
+                &mut fresh
+            )
+            .is_err()
+        );
+
+        // A tampered sponge opening value rejects (either a chain edge
+        // or the single opening).
+        let mut wrong = proof.clone();
+        wrong.sponge_opening_values[4] += F128::ONE;
+        let mut fresh = FsChallenger::new(b"aerie-hash-to-point-1root");
+        assert!(
+            verify_hash_to_point_single_root(
+                &sponge_setup,
+                &slot_setup,
+                &publics,
+                &wrong,
+                &mut fresh
+            )
+            .is_err()
         );
     }
 }

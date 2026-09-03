@@ -773,7 +773,9 @@ fn reconstruct_terminal(
 /// their points into [`open_record`].
 pub struct RecordCore {
     pub z_packed: Vec<F128>,
-    pub prover_data: pcs::ProverData,
+    /// `None` when the lane rides a shared single-root commitment (the
+    /// root's owner holds the opening data).
+    pub prover_data: Option<pcs::ProverData>,
     pub commitment: Commitment,
     pub zc_proof: zerocheck::ZerocheckProof,
     pub lc_proof: lincheck::LincheckProof,
@@ -814,12 +816,59 @@ pub fn prove_record_core<Ch: Challenger>(
     prove_record_core_with_masks(setup, blocks, &[[false; 128]; slots::MASK_REPS], challenger)
 }
 
+/// The record lane's witness bundle, built before any transcript
+/// interaction: the bit witness (kept for the gather evaluators) and
+/// its packed form.
+pub struct RecordWitness {
+    pub z: Vec<bool>,
+    pub z_packed: Vec<F128>,
+}
+
+/// Pure witness generation for the record lane. No commitment, no
+/// transcript. The single-root driver commits the concatenation of this
+/// witness with the sponge lane's before either lane's PIOP runs.
+pub fn record_witness(
+    setup: &SlotSetup,
+    blocks: &[[u16; SLOTS]],
+    masks: &[[bool; 128]; slots::MASK_REPS],
+) -> RecordWitness {
+    let z = setup.generate_witness_with_masks(blocks, masks);
+    let z_packed = pcs::pack_witness(&z, setup.r1cs.m);
+    RecordWitness { z, z_packed }
+}
+
 /// [`prove_record_core`] with the consistency masks written into the
 /// witness before the commitment (spec Section 6.1 step 2).
 pub fn prove_record_core_with_masks<Ch: Challenger>(
     setup: &SlotSetup,
     blocks: &[[u16; SLOTS]],
     masks: &[[bool; 128]; slots::MASK_REPS],
+    challenger: &mut Ch,
+) -> RecordCore {
+    let trace = std::env::var("RECORD_TRACE").is_ok();
+    let stage = std::time::Instant::now();
+    let wit = record_witness(setup, blocks, masks);
+    if trace {
+        eprintln!(
+            "  [prove_record] witness generation + pack: {:7.1} ms",
+            stage.elapsed().as_secs_f64() * 1e3
+        );
+    }
+    let (commitment, prover_data) = pcs::commit(&wit.z_packed, &setup.pcs_params);
+    prove_record_core_bound(setup, wit, commitment, Some(prover_data), challenger)
+}
+
+/// The record lane's PIOP against an already-committed root (the
+/// single-root `C_H`, or the lane's own commitment on the two-root
+/// path). Binds the slot R1CS statement to `commitment`, then runs
+/// zerocheck/lincheck/scatter and the opening-point derivation exactly
+/// as before. `prover_data` is `None` when the shared root's owner
+/// holds the opening data.
+pub fn prove_record_core_bound<Ch: Challenger>(
+    setup: &SlotSetup,
+    wit: RecordWitness,
+    commitment: Commitment,
+    prover_data: Option<pcs::ProverData>,
     challenger: &mut Ch,
 ) -> RecordCore {
     let r1cs = &setup.r1cs;
@@ -835,14 +884,10 @@ pub fn prove_record_core_with_masks<Ch: Challenger>(
         }
         *stage = std::time::Instant::now();
     };
-    let z = setup.generate_witness_with_masks(blocks, masks);
-    lap("witness generation", &mut stage);
-    let z_packed = pcs::pack_witness(&z, r1cs.m);
-    lap("pack_witness", &mut stage);
+    let RecordWitness { z, z_packed } = wit;
 
-    let (commitment, prover_data) = pcs::commit(&z_packed, &setup.pcs_params);
     bind_statement(challenger, r1cs, &commitment);
-    lap("commit", &mut stage);
+    lap("bind", &mut stage);
 
     // Base R1CS: zerocheck + lincheck, exactly the generic prover's path.
     let a_packed_f128 = r1cs.apply_a_packed(&z_packed);
@@ -1028,7 +1073,7 @@ pub fn open_record_with<Ch: Challenger>(
     let x_refs: Vec<&[F128]> = x_fulls.iter().map(|v| v.as_slice()).collect();
     let pcs_open = pcs::open_batch_mixed_ligerito_with_precomputed_s_hat_v(
         core.z_packed,
-        &core.prover_data,
+        core.prover_data.as_ref().expect("own-root core"),
         &core.commitment,
         &x_refs,
         &precomputed,
@@ -1055,7 +1100,7 @@ pub fn open_record_with<Ch: Challenger>(
             fingerprint_value: core.fingerprint_value,
             pcs_open,
         },
-        core.prover_data,
+        core.prover_data.expect("own-root core"),
     )
 }
 
@@ -1095,13 +1140,38 @@ pub fn verify_record_core<Ch: Challenger>(
     proof: &RecordProof,
     challenger: &mut Ch,
 ) -> Result<RecordVerifyCore, &'static str> {
+    verify_record_core_parts(
+        setup,
+        &proof.commitment,
+        &proof.zerocheck,
+        &proof.lincheck,
+        &proof.scatter,
+        &proof.opening_values,
+        proof.fingerprint_value,
+        challenger,
+    )
+}
+
+/// [`verify_record_core`] against a caller-supplied commitment (the
+/// single-root `C_H` on the S4 path) and the lane's sub-proof pieces.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_record_core_parts<Ch: Challenger>(
+    setup: &SlotSetup,
+    commitment: &Commitment,
+    zc_proof: &zerocheck::ZerocheckProof,
+    lc_proof: &lincheck::LincheckProof,
+    scatter_proof: &scatter::ScatterProof,
+    opening_values: &[F128],
+    claimed_fingerprint: F128,
+    challenger: &mut Ch,
+) -> Result<RecordVerifyCore, &'static str> {
     let r1cs = &setup.r1cs;
     let record_vars = r1cs.m - slots::K_LOG;
     let (ab, c) = flock_core::verifier::verify_core(
         r1cs,
-        &proof.zerocheck,
-        &proof.lincheck,
-        &proof.commitment,
+        zc_proof,
+        lc_proof,
+        commitment,
         r1cs.csc_lincheck_circuit(),
         challenger,
     )
@@ -1116,22 +1186,22 @@ pub fn verify_record_core<Ch: Challenger>(
 
     let factor_count = 3 + COUNTER_BITS;
     let (rs, terminal) = scatter::verify(
-        &proof.scatter,
+        scatter_proof,
         record_vars + SLOT_VARS,
         factor_count,
         challenger,
     )?;
 
     // Claimed opening values, in the fixed order.
-    if proof.opening_values.len() != 59 {
+    if opening_values.len() != 59 {
         return Err("wrong opening value count");
     }
-    let values = &proof.opening_values;
+    let values = opening_values;
     let mut fingerprint_value = F128::ZERO;
     for c in 0..15 {
         fingerprint_value += F128 { lo: 1 << c, hi: 0 } * values[44 + c];
     }
-    if fingerprint_value != proof.fingerprint_value {
+    if fingerprint_value != claimed_fingerprint {
         return Err("the fingerprint value does not match its openings");
     }
 
@@ -1145,7 +1215,7 @@ pub fn verify_record_core<Ch: Challenger>(
     // equals beta times the scaled sub-cube opening of the Z region.
     let (_zh_point, zh_scale) =
         zh_power_point(record_vars, beta, gamma, delta).ok_or("degenerate power point")?;
-    if proof.scatter.claim != beta * zh_scale * values[43] {
+    if scatter_proof.claim != beta * zh_scale * values[43] {
         return Err("the Z_H power sum does not match the scatter claim");
     }
 

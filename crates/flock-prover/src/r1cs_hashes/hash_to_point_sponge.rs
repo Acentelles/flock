@@ -391,13 +391,80 @@ pub fn sponge_initial_states(traces: &[[State; LIVE_PERMS]]) -> Vec<State> {
     initial_states
 }
 
+/// The sponge lane's witness bundle, built before any transcript
+/// interaction: the packed keccak witness, the a/b apply results, the
+/// lincheck stripes, and the squeeze words the record lane consumes.
+pub struct SpongeWitness {
+    pub z_packed: Vec<F128>,
+    pub a_packed: Vec<F128>,
+    pub b_packed: Vec<F128>,
+    pub z_lincheck: Vec<u8>,
+    pub all_words: Vec<Vec<u16>>,
+}
+
+/// Pure witness generation for the sponge lane: traces + keccak3 witness.
+/// No commitment, no transcript. The single-root driver commits the
+/// concatenation of this witness with the record lane's before either
+/// lane's PIOP runs.
+pub fn sponge_witness(setup: &SpongeSetup, records: &[SpongeRecord]) -> SpongeWitness {
+    use rayon::prelude::*;
+    assert_eq!(records.len(), setup.records);
+    let traces: Vec<([State; LIVE_PERMS], Vec<u16>)> =
+        records.par_iter().map(sponge_trace).collect();
+    let mut state_lists = Vec::with_capacity(records.len());
+    let mut all_words = Vec::with_capacity(records.len());
+    for (states, words) in traces {
+        state_lists.push(states);
+        all_words.push(words);
+    }
+    // Blocks past the live records are the witness builder's all-zero
+    // padding triples.
+    let initial_states = sponge_initial_states(&state_lists);
+    let (z_packed, a_packed, b_packed, z_lincheck) =
+        keccak3::generate_witness_with_ab_packed_and_lincheck(
+            &initial_states,
+            setup.keccak.n_blocks_log(),
+        );
+    SpongeWitness {
+        z_packed,
+        a_packed,
+        b_packed,
+        z_lincheck,
+        all_words,
+    }
+}
+
 pub fn prove_sponge_core<Ch: Challenger>(
     setup: &SpongeSetup,
     records: &[SpongeRecord],
     challenger: &mut Ch,
 ) -> SpongeCore {
-    use rayon::prelude::*;
-    assert_eq!(records.len(), setup.records);
+    let trace = std::env::var("RECORD_TRACE").is_ok();
+    let stage = std::time::Instant::now();
+    let wit = sponge_witness(setup, records);
+    if trace {
+        eprintln!(
+            "  [prove_sponge] traces + keccak witness: {:7.1} ms",
+            stage.elapsed().as_secs_f64() * 1e3
+        );
+    }
+    let (commitment, prover_data) = pcs::commit(&wit.z_packed, &setup.keccak.pcs_params);
+    prove_sponge_core_bound(setup, wit, commitment, Some(prover_data), challenger)
+}
+
+/// The sponge lane's PIOP against an already-committed root (the
+/// single-root `C_H`, or the lane's own commitment on the two-root
+/// path). Binds the keccak R1CS statement to `commitment`, then runs
+/// zerocheck/lincheck and the chaining claim derivation exactly as
+/// before. `prover_data` is `None` when the shared root's owner holds
+/// the opening data.
+pub fn prove_sponge_core_bound<Ch: Challenger>(
+    setup: &SpongeSetup,
+    wit: SpongeWitness,
+    commitment: Commitment,
+    prover_data: Option<pcs::ProverData>,
+    challenger: &mut Ch,
+) -> SpongeCore {
     let record_vars = setup.record_vars();
     let trace = std::env::var("RECORD_TRACE").is_ok();
     let mut stage = std::time::Instant::now();
@@ -410,36 +477,19 @@ pub fn prove_sponge_core<Ch: Challenger>(
         }
         stage = std::time::Instant::now();
     };
-    let traces: Vec<([State; LIVE_PERMS], Vec<u16>)> =
-        records.par_iter().map(sponge_trace).collect();
-    let mut state_lists = Vec::with_capacity(records.len());
-    let mut all_words = Vec::with_capacity(records.len());
-    for (states, words) in traces {
-        state_lists.push(states);
-        all_words.push(words);
-    }
-    // Blocks past the live records are the witness builder's all-zero
-    // padding triples.
-    let initial_states = sponge_initial_states(&state_lists);
-    lap("sponge traces");
-
-    let (z_packed, a_packed, b_packed, z_lincheck) =
-        keccak3::generate_witness_with_ab_packed_and_lincheck(
-            &initial_states,
-            setup.keccak.n_blocks_log(),
-        );
-    lap("keccak witness");
-    let core = crate::prover::prove_fast_core(
+    let all_words = wit.all_words;
+    let core = crate::prover::prove_fast_core_bound(
         &setup.keccak.r1cs,
-        &setup.keccak.pcs_params,
-        z_packed,
-        a_packed,
-        b_packed,
-        z_lincheck,
+        wit.z_packed,
+        wit.a_packed,
+        wit.b_packed,
+        wit.z_lincheck,
         &KeccakLincheckCircuit,
+        commitment,
+        prover_data,
         challenger,
     );
-    lap("keccak core (commit + zerocheck + lincheck)");
+    lap("keccak core (bind + zerocheck + lincheck)");
 
     challenger.observe_label(b"aerie-sponge-challenges-v0");
     let delta = challenger.sample_f128();
@@ -684,13 +734,35 @@ pub fn verify_sponge_core<Ch: Challenger>(
     proof: &SpongeProof,
     challenger: &mut Ch,
 ) -> Result<SpongeVerifyCore, &'static str> {
+    verify_sponge_core_parts(
+        setup,
+        publics,
+        &proof.commitment,
+        &proof.zerocheck,
+        &proof.lincheck,
+        &proof.opening_values,
+        challenger,
+    )
+}
+
+/// [`verify_sponge_core`] against a caller-supplied commitment (the
+/// single-root `C_H` on the S4 path) and the lane's sub-proof pieces.
+pub fn verify_sponge_core_parts<Ch: Challenger>(
+    setup: &SpongeSetup,
+    publics: &[SpongePublic],
+    commitment: &Commitment,
+    zc_proof: &zerocheck::ZerocheckProof,
+    lc_proof: &lincheck::LincheckProof,
+    opening_values: &[F128],
+    challenger: &mut Ch,
+) -> Result<SpongeVerifyCore, &'static str> {
     assert_eq!(publics.len(), setup.records);
     let record_vars = setup.record_vars();
     let (ab, c) = flock_core::verifier::verify_core(
         &setup.keccak.r1cs,
-        &proof.zerocheck,
-        &proof.lincheck,
-        &proof.commitment,
+        zc_proof,
+        lc_proof,
+        commitment,
         &KeccakLincheckCircuit,
         challenger,
     )
@@ -700,10 +772,10 @@ pub fn verify_sponge_core<Ch: Challenger>(
     let delta = challenger.sample_f128();
     let r = challenger.sample_f128_vec(11);
 
-    if proof.opening_values.len() != 22 {
+    if opening_values.len() != 22 {
         return Err("wrong opening value count");
     }
-    let values = &proof.opening_values;
+    let values = opening_values;
     let scale = record_scale(record_vars, delta).ok_or("degenerate delta")?;
     let (xor_term, frame_term) = public_terms(publics, record_vars, delta, &r);
 
