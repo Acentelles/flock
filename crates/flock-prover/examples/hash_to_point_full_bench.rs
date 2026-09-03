@@ -16,7 +16,10 @@
 //! Timings are only comparable within one quiet host session.
 
 use flock_core::challenger::FsChallenger;
-use flock_prover::r1cs_hashes::hash_to_point_link::{prove_hash_to_point, verify_hash_to_point};
+use flock_prover::r1cs_hashes::hash_to_point_link::{
+    prove_hash_to_point, prove_hash_to_point_single_root, verify_hash_to_point,
+    verify_hash_to_point_single_root,
+};
 use flock_prover::r1cs_hashes::hash_to_point_slots::{MASK_REPS, SlotSetup};
 use flock_prover::r1cs_hashes::hash_to_point_sponge::{SpongePublic, SpongeRecord, SpongeSetup};
 
@@ -36,7 +39,7 @@ fn main() {
         "# NOT included: the aerie-side dual-commitment consistency and the Section 7 transcript."
     );
     println!("# NOT a Falcon aggregate-signature result.");
-    println!("records\tprove_ms\tverify_ms\tproof_bytes");
+    println!("records\tpath\tprove_ms\tverify_ms\tproof_bytes");
     for &n in &counts {
         let sponge_setup = SpongeSetup::new(n);
         let slot_setup = SlotSetup::new(n);
@@ -70,6 +73,24 @@ fn main() {
             .expect("verifies");
         let verify_ms = t.elapsed().as_secs_f64() * 1e3;
 
-        println!("{n}\t{prove_ms:.1}\t{verify_ms:.1}\t{proof_bytes}");
+        println!("{n}\ttwo-root\t{prove_ms:.1}\t{verify_ms:.1}\t{proof_bytes}");
+
+        // The S4 single-root path: one concatenated commitment, one
+        // batched opening. Same claim content, different wire.
+        let t = std::time::Instant::now();
+        let mut prover = FsChallenger::new(b"aerie-hash-to-point-bench-1root");
+        let proof =
+            prove_hash_to_point_single_root(&sponge_setup, &slot_setup, &inputs, &masks, &mut prover);
+        let prove_ms = t.elapsed().as_secs_f64() * 1e3;
+
+        let proof_bytes = bincode::serialize(&proof).expect("serialize").len();
+
+        let t = std::time::Instant::now();
+        let mut verifier = FsChallenger::new(b"aerie-hash-to-point-bench-1root");
+        verify_hash_to_point_single_root(&sponge_setup, &slot_setup, &publics, &proof, &mut verifier)
+            .expect("verifies");
+        let verify_ms = t.elapsed().as_secs_f64() * 1e3;
+
+        println!("{n}\tone-root\t{prove_ms:.1}\t{verify_ms:.1}\t{proof_bytes}");
     }
 }

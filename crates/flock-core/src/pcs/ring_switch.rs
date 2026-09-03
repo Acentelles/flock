@@ -2248,6 +2248,69 @@ pub fn prove<Ch: Challenger>(
     )
 }
 
+/// Compute `s_hat_v` for many claims WITHOUT transcript interaction: the
+/// fold stage of [`prove_batched_padded`] alone (same classification, same
+/// kernels, same values). Each result is a valid `precomputed_s_hat_v`
+/// entry for a later batched open of the SAME claims.
+///
+/// The single-root use case: a lane witness that embeds into a larger
+/// committed domain as a Boolean-indexed sub-block (the claim suffix
+/// extended with Boolean lane/pad coordinates at its end). The fold
+/// against the extended suffix on the concatenated witness restricts
+/// exactly to the lane block, so this lane-local fold — over the SMALL
+/// lane witness with the UNLIFTED suffix — equals the embedded claim's
+/// fold on the big root, at a fraction of the streaming cost.
+pub fn s_hat_v_multi_padded(
+    packed_witness: &[F128],
+    x_outers: &[&[F128]],
+    padding: &PaddingSpec,
+) -> Vec<Vec<F128>> {
+    let l = packed_witness.len();
+    for x in x_outers {
+        assert!(!x.is_empty());
+        assert_eq!(l, 1 << (x.len() - 1));
+    }
+    // Classification identical to prove_batched_padded_with_precomputed.
+    let mut out: Vec<Vec<F128>> = vec![Vec::new(); x_outers.len()];
+    let mut dense_suffixes: Vec<&[F128]> = Vec::new();
+    let mut dense_to_orig: Vec<usize> = Vec::new();
+    for (orig, x) in x_outers.iter().enumerate() {
+        let suffix = &x[1..];
+        let n_zeros = suffix.iter().filter(|&&c| c == F128::ZERO).count();
+        if n_zeros >= SPARSE_ZERO_THRESHOLD {
+            out[orig] = fold_1b_rows_sparse(packed_witness, &build_eq_sparse(suffix));
+        } else {
+            dense_to_orig.push(orig);
+            dense_suffixes.push(suffix);
+        }
+    }
+    let use_split = l.is_multiple_of(16);
+    if use_split {
+        if dense_suffixes.len() == 2 {
+            let (lo0, hi0) = build_eq_split(dense_suffixes[0], split_n_lo(dense_suffixes[0].len()));
+            let (lo1, hi1) = build_eq_split(dense_suffixes[1], split_n_lo(dense_suffixes[1].len()));
+            let (a, b) =
+                fold_1b_rows_split_2way(packed_witness, &lo0, &hi0, &lo1, &hi1, padding);
+            out[dense_to_orig[0]] = a;
+            out[dense_to_orig[1]] = b;
+        } else {
+            for (&orig, suffix) in dense_to_orig.iter().zip(&dense_suffixes) {
+                let (eq_lo, eq_hi) = build_eq_split(suffix, split_n_lo(suffix.len()));
+                out[orig] = fold_1b_rows_split(packed_witness, &eq_lo, &eq_hi, padding);
+            }
+        }
+    } else if !dense_suffixes.is_empty() {
+        let dense_tensors: Vec<Vec<F128>> =
+            dense_suffixes.iter().map(|s| build_eq_parallel(s)).collect();
+        let dense_refs: Vec<&[F128]> = dense_tensors.iter().map(|t| t.as_slice()).collect();
+        let folded = fold_1b_rows_multi_padded(packed_witness, &dense_refs, padding);
+        for (&orig, v) in dense_to_orig.iter().zip(folded) {
+            out[orig] = v;
+        }
+    }
+    out
+}
+
 /// Batched prover: produce ring-switching proofs for `x_outers.len()` opening
 /// points in one pass. Shares a single fused `fold_1b_rows` bit-scan over
 /// `packed_witness`. Challenger interaction is byte-identical to calling

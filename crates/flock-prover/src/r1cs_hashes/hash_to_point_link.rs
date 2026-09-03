@@ -749,6 +749,38 @@ pub fn prove_hash_to_point_single_root<Ch: Challenger>(
     // Multilinear order per lane matches the two-root extra sets:
     // sponge core points, keccak link points; record core points, slot
     // link points, consistency points.
+    //
+    // Every multilinear claim's `s_hat_v` is PRECOMPUTED on its own lane
+    // witness with the unlifted suffix (`ring_switch::s_hat_v_multi_padded`;
+    // the Boolean-extended suffix restricts the concatenated MLE exactly
+    // to the lane block, so the lane-local fold is the lifted fold).
+    // Without this, every fold inside the open streams the full 2^m_H
+    // domain per claim — the measured 2.8x ring-switch regression.
+    let sponge_x_outers: Vec<Vec<F128>> = sponge_core
+        .points
+        .iter()
+        .chain(&keccak_points)
+        .map(|p| record::flock_claim_shape(p).1)
+        .collect();
+    let record_x_outers: Vec<Vec<F128>> = record_core
+        .points
+        .iter()
+        .chain(&slot_points)
+        .chain(&consistency_points)
+        .map(|p| record::flock_claim_shape(p).1)
+        .collect();
+    let sponge_pre: Vec<Vec<F128>> = flock_core::pcs::ring_switch::s_hat_v_multi_padded(
+        &sponge_core.fast.z_packed,
+        &sponge_x_outers.iter().map(|v| v.as_slice()).collect::<Vec<_>>(),
+        &sponge_setup.keccak.r1cs.padding_spec(),
+    );
+    let record_pre: Vec<Vec<F128>> = flock_core::pcs::ring_switch::s_hat_v_multi_padded(
+        &record_core.z_packed,
+        &record_x_outers.iter().map(|v| v.as_slice()).collect::<Vec<_>>(),
+        &slot_setup.r1cs.padding_spec(),
+    );
+    lap("lane-local s_hat_v precomputes");
+
     let mut x_fulls: Vec<Vec<F128>> = Vec::new();
     let mut precomputed: Vec<Option<&[F128]>> = Vec::new();
     x_fulls.push(lift_to_root(
@@ -765,10 +797,9 @@ pub fn prove_hash_to_point_single_root<Ch: Challenger>(
         false,
     ));
     precomputed.push(Some(sponge_core.fast.s_hat_v_c.as_slice()));
-    for point in sponge_core.points.iter().chain(&keccak_points) {
-        let (_low, x_outer) = record::flock_claim_shape(point);
+    for (x_outer, pre) in sponge_x_outers.into_iter().zip(&sponge_pre) {
         x_fulls.push(lift_to_root(x_outer, m_s, params_h.m, false));
-        precomputed.push(None);
+        precomputed.push(Some(pre.as_slice()));
     }
     x_fulls.push(lift_to_root(
         crate::prover::quirky_x_outer_full(&record_core.ab.point),
@@ -784,20 +815,22 @@ pub fn prove_hash_to_point_single_root<Ch: Challenger>(
         true,
     ));
     precomputed.push(Some(record_core.s_hat_v_c.as_slice()));
-    for point in record_core
-        .points
-        .iter()
-        .chain(&slot_points)
-        .chain(&consistency_points)
-    {
-        let (_low, x_outer) = record::flock_claim_shape(point);
+    for (x_outer, pre) in record_x_outers.into_iter().zip(&record_pre) {
         x_fulls.push(lift_to_root(x_outer, m_r, params_h.m, true));
-        precomputed.push(None);
+        precomputed.push(Some(pre.as_slice()));
     }
     let x_refs: Vec<&[F128]> = x_fulls.iter().map(|v| v.as_slice()).collect();
     let lig_config = params_h
         .ligerito_prover_config()
         .expect("Ligerito config for the merged domain");
+    // The concatenated witness is zero above the record lane's data: one
+    // block covering the whole domain with the useful prefix
+    // `2^(m_H-1) + 2^(m_record)` bits (sponge half + record data). The
+    // fold kernels skip the padding chunks; prover-only, exact.
+    let padding_h = flock_core::zerocheck::PaddingSpec {
+        k_log: params_h.m,
+        useful_bits_per_block: (1_usize << (params_h.m - 1)) + (1_usize << m_r),
+    };
     let pcs_open = pcs::open_batch_mixed_ligerito_with_precomputed_s_hat_v(
         z_h,
         &prover_data,
@@ -805,7 +838,7 @@ pub fn prove_hash_to_point_single_root<Ch: Challenger>(
         &x_refs,
         &precomputed,
         &[],
-        &flock_core::zerocheck::PaddingSpec::dense(params_h.m),
+        &padding_h,
         &lig_config,
         challenger,
     );
