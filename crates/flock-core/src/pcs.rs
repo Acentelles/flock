@@ -281,6 +281,22 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
             _ => None,
         })
         .collect();
+    // Windowed claims (trailing-Boolean suffixes: the S4 lane lift, zero
+    // pads) are handled by a block-fold post-pass over their window only,
+    // in both the fast and general paths.
+    let rs_windowed: Vec<(usize, &[F128], &[F128], &[F128])> = rs_results
+        .iter()
+        .filter_map(|(_, o)| match &o.rs_eq_ind {
+            ring_switch::RsEqInd::Windowed {
+                offset,
+                eq_lo,
+                eq_hi,
+                table,
+                ..
+            } => Some((*offset, eq_lo.as_slice(), eq_hi.as_slice(), table.as_slice())),
+            _ => None,
+        })
+        .collect();
     let pd_dense: Vec<(&[F128], F128)> = packed_direct
         .iter()
         .zip(gammas_pd.iter())
@@ -307,8 +323,9 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
     // incremental round-0 prime adjustment), so they only require
     // `pd_dense.is_empty()`, not `packed_direct.is_empty()`. This keeps the two
     // big ab/c claims on the fused fold instead of materializing them.
-    let use_fast =
-        !rs_deferred.is_empty() && rs_deferred.len() == rs_results.len() && pd_dense.is_empty();
+    let use_fast = !rs_deferred.is_empty()
+        && rs_deferred.len() + rs_windowed.len() == rs_results.len()
+        && pd_dense.is_empty();
 
     let (mut round0_u0, mut round0_u2) = if use_fast {
         let b = rs_deferred[0].0.len(); // eq_lo.len(); shared across claims (same split)
@@ -397,6 +414,43 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         }
         prime
     };
+    // Windowed post-pass: fold each claim's deferred window straight into
+    // its block of b_combined, accumulating the round-0 prime delta over
+    // the touched pairs in the same pass (windows are pair-aligned: size
+    // is a power of two >= 2 and the offset a multiple of it).
+    for &(offset, eq_lo, eq_hi, table) in &rs_windowed {
+        let b = eq_lo.len();
+        let window = b * eq_hi.len();
+        debug_assert!(offset % 2 == 0 && window % 2 == 0);
+        let (du0, du2) = b_combined[offset..offset + window]
+            .par_chunks_mut(b)
+            .enumerate()
+            .map(|(hi, out_block)| {
+                let e_hi = eq_hi[hi];
+                let base = offset + hi * b;
+                let mut u0 = F128::ZERO;
+                let mut u2 = F128::ZERO;
+                let mut t = 0;
+                while t < out_block.len() {
+                    let d0 = ring_switch::fold_one_slot(eq_lo[t] * e_hi, table);
+                    let d1 = ring_switch::fold_one_slot(eq_lo[t + 1] * e_hi, table);
+                    out_block[t] += d0;
+                    out_block[t + 1] += d1;
+                    let a0 = packed_witness[base + t];
+                    let a1 = packed_witness[base + t + 1];
+                    u0 += a0 * d0;
+                    u2 += (a0 + a1) * (d0 + d1);
+                    t += 2;
+                }
+                (u0, u2)
+            })
+            .reduce(
+                || (F128::ZERO, F128::ZERO),
+                |(x0, x2), (y0, y2)| (x0 + y0, x2 + y2),
+            );
+        round0_u0 += du0;
+        round0_u2 += du2;
+    }
     let mut adjust_prime_for_delta = |idx: usize, delta: F128| {
         let pair = idx / 2;
         let a0 = packed_witness[2 * pair];

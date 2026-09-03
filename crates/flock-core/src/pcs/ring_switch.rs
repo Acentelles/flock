@@ -355,6 +355,28 @@ pub fn split_n_lo(n: usize) -> usize {
     (n / 2).clamp(4, n)
 }
 
+/// The trailing run of BOOLEAN coordinates of a fold suffix: returns
+/// `(strip_count, offset)` where the stripped coordinates (the HIGH
+/// index bits, since coordinate `j` selects index bit `j`) are exactly
+/// 0 or 1 and pin the claim's eq support to the window of size
+/// `2^(n - strip_count)` at `offset`.
+pub(crate) fn trailing_boolean_strip(suffix: &[F128]) -> (usize, usize) {
+    let n = suffix.len();
+    let mut strip = 0;
+    let mut offset = 0usize;
+    for j in (0..n).rev() {
+        if suffix[j] == F128::ZERO {
+            strip += 1;
+        } else if suffix[j] == F128::ONE {
+            strip += 1;
+            offset |= 1usize << j;
+        } else {
+            break;
+        }
+    }
+    (strip, offset)
+}
+
 /// Build the 16-entry subset-sum lookup table over 4 F128 elements.
 ///
 /// `sums[mask]` = `Σ_{k=0..4 : bit_k(mask) = 1} elems[k]` for `mask ∈ 0..16`.
@@ -2078,6 +2100,21 @@ pub enum RsEqInd {
         len: usize,
         entries: Vec<(usize, F128)>,
     },
+    /// Windowed deferred dense: the claim's fold suffix ends in a run of
+    /// BOOLEAN coordinates (the S4 lane lift, zero pads, or any Boolean
+    /// sub-cube tail), so its eq tensor vanishes outside one contiguous
+    /// block of size `eq_lo.len() * eq_hi.len()` at `offset`. The split
+    /// factors cover the STRIPPED suffix only; values inside the window
+    /// equal the full-suffix fold exactly (the stripped coordinates
+    /// contribute a 0/1 indicator), zero outside. γ is baked into
+    /// `table` as in [`RsEqInd::DeferredDense`].
+    Windowed {
+        len: usize,
+        offset: usize,
+        eq_lo: Vec<F128>,
+        eq_hi: Vec<F128>,
+        table: Vec<F128>,
+    },
 }
 
 impl RsEqInd {
@@ -2087,6 +2124,7 @@ impl RsEqInd {
             Self::Dense(v) => v.len(),
             Self::DeferredDense { eq_lo, eq_hi, .. } => eq_lo.len() * eq_hi.len(),
             Self::Sparse { len, .. } => *len,
+            Self::Windowed { len, .. } => *len,
         }
     }
 
@@ -2119,6 +2157,19 @@ impl RsEqInd {
                     out[idx] += gamma * val;
                 }
             }
+            Self::Windowed {
+                offset,
+                eq_lo,
+                eq_hi,
+                table,
+                ..
+            } => {
+                let log_b = eq_lo.len().trailing_zeros() as usize;
+                let window = eq_lo.len() * eq_hi.len();
+                for (j, o) in out[*offset..*offset + window].iter_mut().enumerate() {
+                    *o += gamma * deferred_dense_value(eq_lo, eq_hi, table, log_b, j);
+                }
+            }
         }
     }
 
@@ -2144,6 +2195,21 @@ impl RsEqInd {
                 }
                 out
             }
+            Self::Windowed {
+                len,
+                offset,
+                eq_lo,
+                eq_hi,
+                table,
+            } => {
+                let log_b = eq_lo.len().trailing_zeros() as usize;
+                let window = eq_lo.len() * eq_hi.len();
+                let mut out = vec![F128::ZERO; *len];
+                for (j, slot) in out[*offset..*offset + window].iter_mut().enumerate() {
+                    *slot = deferred_dense_value(eq_lo, eq_hi, table, log_b, j);
+                }
+                out
+            }
         }
     }
 
@@ -2152,7 +2218,7 @@ impl RsEqInd {
     pub fn into_dense(self) -> Vec<F128> {
         match self {
             Self::Dense(v) => v,
-            Self::DeferredDense { .. } => self.to_dense(),
+            Self::DeferredDense { .. } | Self::Windowed { .. } => self.to_dense(),
             Self::Sparse { len, entries } => {
                 let mut out = vec![F128::ZERO; len];
                 for (idx, val) in entries {
@@ -2582,27 +2648,78 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
         .enumerate()
         .map(|(i, (w, &g))| {
             let scaled_eq_r_dprime: Vec<F128> = w.eq_r_dprime.iter().map(|x| g * *x).collect();
-            let rs_eq_ind = match kinds[i] {
-                Kind::Dense(d) => {
-                    if use_split {
-                        // Defer the fold: carry the split factors + γ-baked byte
-                        // table so pcs's combine folds each slot directly into
-                        // `b_combined` (no 2^(m-7) materialize + readback). The
-                        // table build is the only work done here (16·256 adds).
-                        let (eq_lo, eq_hi) = &dense_splits[d];
-                        RsEqInd::DeferredDense {
-                            eq_lo: eq_lo.clone(),
-                            eq_hi: eq_hi.clone(),
-                            table: build_fold_byte_table(&scaled_eq_r_dprime),
-                        }
-                    } else {
-                        RsEqInd::Dense(fold_b128_elems(&dense_tensors[d], &scaled_eq_r_dprime))
+            // A trailing run of Boolean suffix coordinates pins the eq
+            // support to one window (the S4 lane lift and zero pads):
+            // build the fold ingredients over the STRIPPED suffix only.
+            // Values are the full-suffix fold's exactly (the stripped
+            // coordinates contribute a 0/1 indicator), so proofs are
+            // unchanged; only the combine's work shrinks to the window.
+            let suffix = &x_outers[i][1..];
+            let (strip, win_offset) = trailing_boolean_strip(suffix);
+            let rs_eq_ind = if strip > 0 {
+                let effective = &suffix[..suffix.len() - strip];
+                if effective.is_empty() {
+                    // Fully Boolean suffix: a single live index.
+                    RsEqInd::Sparse {
+                        len: l,
+                        entries: vec![(
+                            win_offset,
+                            fold_one_slot(F128::ONE, &build_fold_byte_table(&scaled_eq_r_dprime)),
+                        )],
+                    }
+                } else if effective
+                    .iter()
+                    .filter(|&&c| c == F128::ZERO)
+                    .count()
+                    >= SPARSE_ZERO_THRESHOLD
+                {
+                    let support = build_eq_sparse(effective);
+                    let mut entries =
+                        fold_b128_elems_sparse_pairs(&support, &scaled_eq_r_dprime);
+                    for entry in &mut entries {
+                        entry.0 += win_offset;
+                    }
+                    RsEqInd::Sparse { len: l, entries }
+                } else {
+                    let n_eff = effective.len();
+                    let n_lo = if n_eff >= 4 { split_n_lo(n_eff) } else { n_eff };
+                    let (eq_lo, eq_hi) = build_eq_split(effective, n_lo);
+                    RsEqInd::Windowed {
+                        len: l,
+                        offset: win_offset,
+                        eq_lo,
+                        eq_hi,
+                        table: build_fold_byte_table(&scaled_eq_r_dprime),
                     }
                 }
-                Kind::Sparse(s) => RsEqInd::Sparse {
-                    len: l,
-                    entries: fold_b128_elems_sparse_pairs(&sparse_supports[s], &scaled_eq_r_dprime),
-                },
+            } else {
+                match kinds[i] {
+                    Kind::Dense(d) => {
+                        if use_split {
+                            // Defer the fold: carry the split factors + γ-baked
+                            // byte table so pcs's combine folds each slot
+                            // directly into `b_combined`.
+                            let (eq_lo, eq_hi) = &dense_splits[d];
+                            RsEqInd::DeferredDense {
+                                eq_lo: eq_lo.clone(),
+                                eq_hi: eq_hi.clone(),
+                                table: build_fold_byte_table(&scaled_eq_r_dprime),
+                            }
+                        } else {
+                            RsEqInd::Dense(fold_b128_elems(
+                                &dense_tensors[d],
+                                &scaled_eq_r_dprime,
+                            ))
+                        }
+                    }
+                    Kind::Sparse(s) => RsEqInd::Sparse {
+                        len: l,
+                        entries: fold_b128_elems_sparse_pairs(
+                            &sparse_supports[s],
+                            &scaled_eq_r_dprime,
+                        ),
+                    },
+                }
             };
             (
                 RingSwitchProof { s_hat_v: w.s_hat_v },
@@ -3291,6 +3408,48 @@ mod tests {
     /// `build_eq_split` factors `build_eq` exactly: the outer product of the
     /// two halves reconstructs every full-tensor entry bit-for-bit.
     #[test]
+    fn windowed_rs_eq_ind_matches_the_full_dense_fold() {
+        // A suffix ending in Boolean coordinates: the windowed fold must
+        // equal the full-suffix dense fold inside the window and zero
+        // outside, for every trailing pattern.
+        let mut rng = Rng::new(0x51ce);
+        for (n, booleans) in [(9usize, vec![F128::ZERO, F128::ONE]), (8, vec![F128::ONE]), (10, vec![F128::ZERO, F128::ZERO, F128::ONE])] {
+            let mut suffix: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
+            let k = booleans.len();
+            for (j, b) in booleans.iter().enumerate() {
+                suffix[n - k + j] = *b;
+            }
+            let scaled: Vec<F128> = (0..(1 << LOG_PACKING)).map(|_| rng.f128()).collect();
+            let reference = fold_b128_elems(&build_eq_parallel(&suffix), &scaled);
+
+            let (strip, offset) = trailing_boolean_strip(&suffix);
+            assert!(strip >= k, "strip must cover the planted run");
+            let effective = &suffix[..n - strip];
+            let n_lo = if effective.len() >= 4 {
+                split_n_lo(effective.len())
+            } else {
+                effective.len()
+            };
+            let (eq_lo, eq_hi) = build_eq_split(effective, n_lo);
+            let windowed = RsEqInd::Windowed {
+                len: 1 << n,
+                offset,
+                eq_lo,
+                eq_hi,
+                table: build_fold_byte_table(&scaled),
+            };
+            assert_eq!(windowed.to_dense(), reference, "n={n} k={k}");
+            // add_scaled_into agrees with the dense accumulate.
+            let mut a = vec![F128::ZERO; 1 << n];
+            let mut b = vec![F128::ZERO; 1 << n];
+            let gamma = rng.f128();
+            windowed.add_scaled_into(gamma, &mut a);
+            RsEqInd::Dense(reference).add_scaled_into(gamma, &mut b);
+            assert_eq!(a, b, "scaled accumulate n={n} k={k}");
+        }
+    }
+
+    #[test]
     fn build_eq_split_reconstructs_full() {
         let mut rng = Rng::new(0x9911);
         for &l in &[4usize, 7, 10] {
@@ -3783,9 +3942,15 @@ mod tests {
             assert_eq!(results[0].0, p_ab, "s_hat_v[ab] mismatch at m={m}");
             assert_eq!(results[1].0, p_c, "s_hat_v[c]  mismatch at m={m}");
             assert_eq!(results[2].0, p_chain, "s_hat_v[chain] mismatch at m={m}");
+            // Trailing zeros now route to the windowed representation
+            // (the support is one contiguous block); interior-zero claims
+            // still route sparse. Both are value-equivalent to dense.
             assert!(
-                matches!(results[2].1.rs_eq_ind, RsEqInd::Sparse { .. }),
-                "chain claim should be sparse"
+                matches!(
+                    results[2].1.rs_eq_ind,
+                    RsEqInd::Sparse { .. } | RsEqInd::Windowed { .. }
+                ),
+                "chain claim should avoid the dense route"
             );
             // Dense routing = either the materialized `Dense` (non-split l) or
             // the fused `DeferredDense` (split l, l % 16 == 0).
