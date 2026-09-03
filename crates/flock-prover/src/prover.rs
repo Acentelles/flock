@@ -332,11 +332,24 @@ pub fn prove_fast_core_with_codeword<Ch: Challenger>(
     prefaulted_codeword: Option<Vec<F128>>,
     challenger: &mut Ch,
 ) -> ProveCore {
+    let trace = std::env::var("FLOCK_TRACE").is_ok();
+    let mut stage = std::time::Instant::now();
+    let mut lap = |label: &str| {
+        if trace {
+            eprintln!(
+                "  [prove_core m={}] {label}: {:7.1} ms",
+                r1cs.m,
+                stage.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        stage = std::time::Instant::now();
+    };
     let (commitment, prover_data) = match prefaulted_codeword {
         Some(buf) => pcs::commit_into(&z_packed, pcs_params, buf),
         None => pcs::commit(&z_packed, pcs_params),
     };
     bind_statement(challenger, r1cs, &commitment);
+    lap("commit");
 
     let padding = r1cs.padding_spec();
     let (zc_proof, zc_claim, s_hat_v_c) = {
@@ -368,6 +381,7 @@ pub fn prove_fast_core_with_codeword<Ch: Challenger>(
     // of carrying them through lincheck and the PCS open.
     flock_core::scratch::give_f128(a_packed_f128);
     flock_core::scratch::give_f128(b_packed_f128);
+    lap("zerocheck");
 
     let x_ab = r1cs.x_ab_from_mlv(zc_claim.z, &zc_claim.mlv_challenges);
 
@@ -386,6 +400,7 @@ pub fn prove_fast_core_with_codeword<Ch: Challenger>(
     // The lincheck stripe copy of z is dead from here on; free it before the
     // PCS open (2^(m-3) bytes — 64 MB at m = 29).
     drop(z_packed_lincheck);
+    lap("lincheck");
 
     let ab = ZClaim {
         point: r1cs.ab_claim_point(lc_claim.r_inner_skip, &lc_claim.r_inner_rest, &x_ab.x_outer),
@@ -409,6 +424,7 @@ pub fn prove_fast_core_with_codeword<Ch: Challenger>(
         None
     };
 
+    lap("s_hat_v_ab");
     ProveCore {
         zc_proof,
         lc_proof,

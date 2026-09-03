@@ -509,7 +509,19 @@ pub fn prove_hash_to_point<Ch: Challenger>(
     masks: &[[bool; 128]; slots::MASK_REPS],
     challenger: &mut Ch,
 ) -> HashToPointProof {
+    let trace = std::env::var("FLOCK_TRACE").is_ok();
+    let mut stage = std::time::Instant::now();
+    let mut lap = |label: &str| {
+        if trace {
+            eprintln!(
+                "[hash_to_point] {label}: {:8.1} ms",
+                stage.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        stage = std::time::Instant::now();
+    };
     let sponge_core = sponge::prove_sponge_core(sponge_setup, records, challenger);
+    lap("sponge core (keccak lane)");
     let blocks: Vec<[u16; slots::SLOTS]> = sponge_core
         .all_words
         .iter()
@@ -521,6 +533,7 @@ pub fn prove_hash_to_point<Ch: Challenger>(
         .collect();
     let slot_record_vars = slot_setup.r1cs.m - slots::K_LOG;
     let record_core = record::prove_record_core_with_masks(slot_setup, &blocks, masks, challenger);
+    lap("record core (slot lane)");
     let (link, slot_points, keccak_points) = prove_link_claims(
         slot_setup,
         sponge_setup,
@@ -528,13 +541,17 @@ pub fn prove_hash_to_point<Ch: Challenger>(
         &sponge_core.fast.z_packed,
         challenger,
     );
+    lap("word linkage claims");
     let (consistency, consistency_points) =
         prove_consistency(slot_record_vars, &record_core.z_packed, challenger);
+    lap("consistency claims");
     let mut record_extra = slot_points;
     record_extra.extend(consistency_points);
     let (sponge_proof, _) =
         sponge::open_sponge(sponge_setup, sponge_core, &keccak_points, challenger);
+    lap("sponge open (keccak PCS)");
     let (record_proof, _) = record::open_record(slot_setup, record_core, &record_extra, challenger);
+    lap("record open (slot PCS)");
     HashToPointProof {
         sponge: sponge_proof,
         record: record_proof,

@@ -761,6 +761,7 @@ pub fn prove_record_core_with_masks<Ch: Challenger>(
         &padding,
         challenger,
     );
+    lap("zerocheck", &mut stage);
     let x_ab = r1cs.x_ab_from_mlv(zc_claim.z, &zc_claim.mlv_challenges);
     let lc_circuit =
         lincheck::SparseMatrixCircuit::new(&r1cs.a_0, &r1cs.b_0).with_const_pin(r1cs.const_pin);
@@ -782,8 +783,9 @@ pub fn prove_record_core_with_masks<Ch: Challenger>(
         point: r1cs.c_claim_point(zc_claim.z, &zc_claim.r_rest),
         value: zc_claim.c_eval,
     };
+    lap("lincheck", &mut stage);
     let s_hat_v_ab = pcs::ring_switch::s_hat_v_from_z_vec(&z_vec_pre, &lc_claim.r_inner_rest[1..]);
-    lap("zerocheck + lincheck", &mut stage);
+    lap("s_hat_v_ab", &mut stage);
 
     // Scatter challenges, post-commitment and post-R1CS.
     challenger.observe_label(b"aerie-record-scatter-challenges-v0");
