@@ -36,6 +36,8 @@
 //! exactly on accepted slots from a structural zero, so gated slots hit
 //! indices `0..512` in order.
 
+pub(crate) mod polynomial_product;
+
 use flock_core::challenger::Challenger;
 use flock_core::field::F128;
 
@@ -286,7 +288,11 @@ fn affine_nodes(low: F128, high: F128, out: &mut [F128]) {
     let diff = low + high;
     let mut power = 1;
     while power < out.len() {
-        let shift = if power == 1 { diff } else { diff * small(power as u64) };
+        let shift = if power == 1 {
+            diff
+        } else {
+            diff * small(power as u64)
+        };
         for j in 0..power.min(out.len() - power) {
             out[power + j] = out[j] + shift;
         }
@@ -399,44 +405,48 @@ pub(crate) fn prove_remaining<Ch: Challenger>(
         }
         // One pass over the domain: load each factor pair once and extend
         // it to every evaluation point, instead of degree + 1 passes.
-        let evals = (0..half)
-            .into_par_iter()
-            .fold(
-                || vec![F128::ZERO; degree + 1],
-                |mut acc, i| {
-                    let mut terms = [F128::ONE; 32];
-                    let terms = &mut terms[..degree + 1];
-                    let mut values = [F128::ZERO; 32];
-                    let values = &mut values[..degree + 1];
-                    for factor in &factors {
-                        let low = factor[i];
-                        let high = factor[half + i];
-                        // A zero affine factor annihilates this pair at
-                        // every node. Padding gates stay zero through all
-                        // record-coordinate rounds, including dense rounds.
-                        if low == F128::ZERO && high == F128::ZERO {
-                            return acc;
+        let evals = if degree == 13 && factors[0].len() >= (1 << 18) {
+            polynomial_product::round(&factors)
+        } else {
+            (0..half)
+                .into_par_iter()
+                .fold(
+                    || vec![F128::ZERO; degree + 1],
+                    |mut acc, i| {
+                        let mut terms = [F128::ONE; 32];
+                        let terms = &mut terms[..degree + 1];
+                        let mut values = [F128::ZERO; 32];
+                        let values = &mut values[..degree + 1];
+                        for factor in &factors {
+                            let low = factor[i];
+                            let high = factor[half + i];
+                            // A zero affine factor annihilates this pair at
+                            // every node. Padding gates stay zero through all
+                            // record-coordinate rounds, including dense rounds.
+                            if low == F128::ZERO && high == F128::ZERO {
+                                return acc;
+                            }
+                            affine_nodes(low, high, values);
+                            for (term, &value) in terms.iter_mut().zip(values.iter()) {
+                                *term *= value;
+                            }
                         }
-                        affine_nodes(low, high, values);
-                        for (term, &value) in terms.iter_mut().zip(values.iter()) {
-                            *term *= value;
+                        for (t, term) in terms.iter().enumerate() {
+                            acc[t] += *term;
                         }
-                    }
-                    for (t, term) in terms.iter().enumerate() {
-                        acc[t] += *term;
-                    }
-                    acc
-                },
-            )
-            .reduce(
-                || vec![F128::ZERO; degree + 1],
-                |mut a, b| {
-                    for (x, y) in a.iter_mut().zip(&b) {
-                        *x += *y;
-                    }
-                    a
-                },
-            );
+                        acc
+                    },
+                )
+                .reduce(
+                    || vec![F128::ZERO; degree + 1],
+                    |mut a, b| {
+                        for (x, y) in a.iter_mut().zip(&b) {
+                            *x += *y;
+                        }
+                        a
+                    },
+                )
+        };
         challenger.observe_f128_slice(&evals);
         let challenge = challenger.sample_f128();
         factors.par_iter_mut().for_each(|factor| {
@@ -700,8 +710,22 @@ mod tests {
     use super::super::hash_to_point_slots::build_block_witness;
     #[test]
     fn affine_nodes_match_distinct_field_encodings() {
-        for low in [F128::ZERO, F128::ONE, F128 { lo: 0x98765432, hi: 0xabcdef89 }] {
-            for high in [F128::ZERO, F128::ONE, F128 { lo: 0xfedcba98, hi: 0x87654321 }] {
+        for low in [
+            F128::ZERO,
+            F128::ONE,
+            F128 {
+                lo: 0x98765432,
+                hi: 0xabcdef89,
+            },
+        ] {
+            for high in [
+                F128::ZERO,
+                F128::ONE,
+                F128 {
+                    lo: 0xfedcba98,
+                    hi: 0x87654321,
+                },
+            ] {
                 for len in 1..=32 {
                     let mut values = vec![F128::ZERO; len];
                     affine_nodes(low, high, &mut values);

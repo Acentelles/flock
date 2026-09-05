@@ -1,11 +1,15 @@
-//! Exact two-round compact prefix for the thirteen-factor record scatter.
+//! Exact compact prefix for the thirteen-factor record scatter.
 //! The counter factors remain evaluations of the committed counter bits.
-//! Tables indexed by two or four input bits eliminate their early dense
-//! expansion; the remaining sumcheck and its opening claims are unchanged.
+//! Large batches retain counter bit codes through five record rounds.
+//! Polynomial products change only how round messages are computed; the
+//! interpolation nodes, transcript and opening claims remain unchanged.
 
-use super::{frobenius, scatter, slot_residue_bits, slots, COUNTER_BITS, SLOTS, SLOT_VARS};
+use super::{COUNTER_BITS, SLOT_VARS, SLOTS, frobenius, scatter, slot_residue_bits, slots};
 use flock_core::{challenger::Challenger, field::F128};
 use rayon::prelude::*;
+
+mod counter_prefix;
+mod counter_tail;
 
 const DEGREE: usize = 3 + COUNTER_BITS;
 const SLOT_COUNT: usize = 1 << SLOT_VARS;
@@ -30,11 +34,7 @@ fn affine(low: F128, high: F128, r: F128) -> F128 {
     low + r * (low + high)
 }
 fn bit(value: bool) -> F128 {
-    if value {
-        F128::ONE
-    } else {
-        F128::ZERO
-    }
+    if value { F128::ONE } else { F128::ZERO }
 }
 
 impl Factors {
@@ -157,6 +157,16 @@ impl Factors {
         self,
         challenger: &mut Ch,
     ) -> (scatter::ScatterProof, Vec<F128>) {
+        // Lookup construction is amortized on large record batches.
+        let compact = self.record_vars >= 10;
+        self.prove_impl(challenger, compact)
+    }
+
+    fn prove_impl<Ch: Challenger>(
+        self,
+        challenger: &mut Ch,
+        compact: bool,
+    ) -> (scatter::ScatterProof, Vec<F128>) {
         let n = self.rows.len();
         let mut rounds = Vec::with_capacity(self.record_vars + SLOT_VARS);
         let mut point = Vec::with_capacity(self.record_vars + SLOT_VARS);
@@ -167,66 +177,71 @@ impl Factors {
         for round in 0..2 {
             let half = n >> (round + 1);
             let delta_step = self.delta_powers[self.record_vars - 1 - round];
-            let nodes: Vec<_> = (0..=DEGREE)
-                .map(|t| F128 {
-                    lo: t as u64,
-                    hi: 0,
-                })
-                .collect();
-            let tables: Vec<_> = nodes
-                .iter()
-                .map(|&t| self.counter_tables(&point, t))
-                .collect();
-            let delta_at: Vec<_> = nodes
-                .iter()
-                .map(|&t| delta_prefix * affine(F128::ONE, delta_step, t))
-                .collect();
-            let evals = (0..half / SLOT_COUNT)
-                .into_par_iter()
-                .fold(
-                    || vec![F128::ZERO; DEGREE + 1],
-                    |mut total, record| {
-                        let mut sums = [F128::ZERO; DEGREE + 1];
-                        for slot in 0..SLOTS {
-                            let i = record * SLOT_COUNT + slot;
-                            let (g0, g1, v0, v1) = if round == 0 {
-                                let (a, b) = (self.rows[i], self.rows[i + half]);
-                                (
-                                    bit(a.gate),
-                                    bit(b.gate),
-                                    self.gamma[usize::from(a.value)],
-                                    self.gamma[usize::from(b.value)],
-                                )
-                            } else {
-                                (gates[i], gates[i + half], values[i], values[i + half])
-                            };
-                            if g0 == F128::ZERO && g1 == F128::ZERO {
-                                continue;
-                            }
-                            let codes = self.counter_codes(i, round);
-                            for t in 0..=DEGREE {
-                                let mut term = affine(g0, g1, nodes[t]) * affine(v0, v1, nodes[t]);
-                                for (table, &code) in tables[t].iter().zip(&codes) {
-                                    term *= table[code];
+            let evals = if compact && round == 0 {
+                self.first_round_polynomial()
+            } else {
+                let nodes: Vec<_> = (0..=DEGREE)
+                    .map(|t| F128 {
+                        lo: t as u64,
+                        hi: 0,
+                    })
+                    .collect();
+                let tables: Vec<_> = nodes
+                    .iter()
+                    .map(|&t| self.counter_tables(&point, t))
+                    .collect();
+                let delta_at: Vec<_> = nodes
+                    .iter()
+                    .map(|&t| delta_prefix * affine(F128::ONE, delta_step, t))
+                    .collect();
+                (0..half / SLOT_COUNT)
+                    .into_par_iter()
+                    .fold(
+                        || vec![F128::ZERO; DEGREE + 1],
+                        |mut total, record| {
+                            let mut sums = [F128::ZERO; DEGREE + 1];
+                            for slot in 0..SLOTS {
+                                let i = record * SLOT_COUNT + slot;
+                                let (g0, g1, v0, v1) = if round == 0 {
+                                    let (a, b) = (self.rows[i], self.rows[i + half]);
+                                    (
+                                        bit(a.gate),
+                                        bit(b.gate),
+                                        self.gamma[usize::from(a.value)],
+                                        self.gamma[usize::from(b.value)],
+                                    )
+                                } else {
+                                    (gates[i], gates[i + half], values[i], values[i + half])
+                                };
+                                if g0 == F128::ZERO && g1 == F128::ZERO {
+                                    continue;
                                 }
-                                sums[t] += term;
+                                let codes = self.counter_codes(i, round);
+                                for t in 0..=DEGREE {
+                                    let mut term =
+                                        affine(g0, g1, nodes[t]) * affine(v0, v1, nodes[t]);
+                                    for (table, &code) in tables[t].iter().zip(&codes) {
+                                        term *= table[code];
+                                    }
+                                    sums[t] += term;
+                                }
                             }
-                        }
-                        for (t, sum) in sums.into_iter().enumerate() {
-                            total[t] += sum * self.delta[record] * delta_at[t];
-                        }
-                        total
-                    },
-                )
-                .reduce(
-                    || vec![F128::ZERO; DEGREE + 1],
-                    |mut a, b| {
-                        for (a, b) in a.iter_mut().zip(b) {
-                            *a += b;
-                        }
-                        a
-                    },
-                );
+                            for (t, sum) in sums.into_iter().enumerate() {
+                                total[t] += sum * self.delta[record] * delta_at[t];
+                            }
+                            total
+                        },
+                    )
+                    .reduce(
+                        || vec![F128::ZERO; DEGREE + 1],
+                        |mut a, b| {
+                            for (a, b) in a.iter_mut().zip(b) {
+                                *a += b;
+                            }
+                            a
+                        },
+                    )
+            };
             if round == 0 {
                 claim = evals[0] + evals[1];
                 challenger.observe_label(b"aerie-scatter-v0");
@@ -262,38 +277,50 @@ impl Factors {
             rounds.push(evals);
             point.push(r);
         }
-        let quarter = n / 4;
-        let mut factors = Vec::with_capacity(DEGREE);
-        factors.push(
-            (0..quarter)
-                .into_par_iter()
-                .map(|i| delta_prefix * self.delta[i >> SLOT_VARS])
-                .collect(),
-        );
-        factors.push(gates);
-        for b in 0..COUNTER_BITS {
-            let lut: Vec<_> = (0..16)
-                .map(|code| self.counter_value(b, code, &point[..1], point[1]))
-                .collect();
+        if compact {
+            self.continue_compact(
+                gates,
+                values,
+                delta_prefix,
+                challenger,
+                &mut rounds,
+                &mut point,
+            );
+        } else {
+            let quarter = n / 4;
+            let mut factors = Vec::with_capacity(DEGREE);
             factors.push(
                 (0..quarter)
                     .into_par_iter()
-                    .map(|i| {
-                        let mut code = 0;
-                        for (j, offset) in [0, n / 2, n / 4, 3 * n / 4].into_iter().enumerate() {
-                            code |= (usize::from(self.rows[i + offset].count >> b) & 1) << j;
-                        }
-                        lut[code]
-                    })
+                    .map(|i| delta_prefix * self.delta[i >> SLOT_VARS])
                     .collect(),
             );
+            factors.push(gates);
+            for b in 0..COUNTER_BITS {
+                let lut: Vec<_> = (0..16)
+                    .map(|code| self.counter_value(b, code, &point[..1], point[1]))
+                    .collect();
+                factors.push(
+                    (0..quarter)
+                        .into_par_iter()
+                        .map(|i| {
+                            let mut code = 0;
+                            for (j, offset) in [0, n / 2, n / 4, 3 * n / 4].into_iter().enumerate()
+                            {
+                                code |= (usize::from(self.rows[i + offset].count >> b) & 1) << j;
+                            }
+                            lut[code]
+                        })
+                        .collect(),
+                );
+            }
+            factors.push(values);
+            // Multiplication is commutative. Put the gate first so the dense
+            // kernel can skip padding pairs before extending any other factor.
+            factors.swap(0, 1);
+            drop(self);
+            scatter::prove_remaining(factors, challenger, false, &mut rounds, &mut point);
         }
-        factors.push(values);
-        // Multiplication is commutative. Put the gate first so the dense
-        // kernel can skip padding pairs before extending any other factor.
-        factors.swap(0, 1);
-        drop(self);
-        scatter::prove_remaining(factors, challenger, false, &mut rounds, &mut point);
         (scatter::ScatterProof { claim, rounds }, point)
     }
 }

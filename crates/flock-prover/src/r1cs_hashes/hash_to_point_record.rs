@@ -314,8 +314,7 @@ mod tests {
         let masks = [[false; 128]; slots::MASK_REPS];
         let mut prover = FsChallenger::new(b"record-closure-mode");
         let core = prove_record_core_with_masks(&setup, &blocks, &masks, &mut prover);
-        let (proof, _) =
-            open_record_with(&setup, core, &[], &[], OpenMode::Closure, &mut prover);
+        let (proof, _) = open_record_with(&setup, core, &[], &[], OpenMode::Closure, &mut prover);
         assert!(proof.closure.is_some());
         let mut verifier = FsChallenger::new(b"record-closure-mode");
         let core = verify_record_core(&setup, &proof, &mut verifier).expect("core verifies");
@@ -477,6 +476,7 @@ fn slot_residue_bits(bit_at: &impl Fn(usize) -> bool, base: usize, slot: usize) 
 /// full witness: the transparent delta-power record factor, the gate, ten
 /// counter factors (per-record prefix parity of the accept flags), and
 /// the gamma-combined value.
+#[cfg(test)]
 fn record_factor_tables(
     bit_at: impl Fn(usize) -> bool,
     record_vars: usize,
@@ -859,8 +859,7 @@ pub fn prove_record_core_with_masks<Ch: Challenger>(
     masks: &[[bool; 128]; slots::MASK_REPS],
     challenger: &mut Ch,
 ) -> RecordCore {
-    let trace =
-        std::env::var("RECORD_TRACE").is_ok() || std::env::var("FLOCK_TRACE").is_ok();
+    let trace = std::env::var("RECORD_TRACE").is_ok() || std::env::var("FLOCK_TRACE").is_ok();
     let mut stage = std::time::Instant::now();
     let mut lap = |label: &str| {
         if trace {
@@ -895,8 +894,7 @@ pub fn prove_record_core_bound<Ch: Challenger>(
 ) -> RecordCore {
     let r1cs = &setup.r1cs;
     let record_vars = r1cs.m - slots::K_LOG;
-    let trace =
-        std::env::var("RECORD_TRACE").is_ok() || std::env::var("FLOCK_TRACE").is_ok();
+    let trace = std::env::var("RECORD_TRACE").is_ok() || std::env::var("FLOCK_TRACE").is_ok();
     let mut stage = std::time::Instant::now();
     let lap = |label: &str, stage: &mut std::time::Instant| {
         if trace {
@@ -966,11 +964,17 @@ pub fn prove_record_core_bound<Ch: Challenger>(
     challenger.observe_label(b"aerie-record-fingerprint-v0");
     let r_fp = challenger.sample_f128_vec(record_vars + 9);
 
-    let factors = compact_scatter::Factors::new(|address| {
-        let word = z_packed[address / 128];
-        let limb = if address % 128 < 64 { word.lo } else { word.hi };
-        limb >> (address % 64) & 1 != 0
-    }, record_vars, beta, gamma, delta);
+    let factors = compact_scatter::Factors::new(
+        |address| {
+            let word = z_packed[address / 128];
+            let limb = if address % 128 < 64 { word.lo } else { word.hi };
+            limb >> (address % 64) & 1 != 0
+        },
+        record_vars,
+        beta,
+        gamma,
+        delta,
+    );
     lap("factor tables", &mut stage);
     let (scatter_proof, rs) = factors.prove(challenger);
     lap("scatter sumcheck", &mut stage);
@@ -1044,7 +1048,11 @@ pub fn open_record<Ch: Challenger>(
     extra_values: &[F128],
     challenger: &mut Ch,
 ) -> (RecordProof, pcs::ProverData) {
-    let mode = if cfg!(feature = "face-batching") { OpenMode::Faces } else { OpenMode::Fused };
+    let mode = if cfg!(feature = "face-batching") {
+        OpenMode::Faces
+    } else {
+        OpenMode::Fused
+    };
     open_record_with(setup, core, extra_points, extra_values, mode, challenger)
 }
 
@@ -1056,8 +1064,7 @@ pub fn open_record_with<Ch: Challenger>(
     mode: OpenMode,
     challenger: &mut Ch,
 ) -> (RecordProof, pcs::ProverData) {
-    let trace =
-        std::env::var("RECORD_TRACE").is_ok() || std::env::var("FLOCK_TRACE").is_ok();
+    let trace = std::env::var("RECORD_TRACE").is_ok() || std::env::var("FLOCK_TRACE").is_ok();
     let stage = std::time::Instant::now();
     assert_eq!(extra_points.len(), extra_values.len());
     let lig_config = setup
@@ -1105,10 +1112,27 @@ pub fn open_record_with<Ch: Challenger>(
             precomputed.push(None);
         }
         OpenMode::Faces => {
-            let all_points: Vec<_> = core.points.iter().cloned().chain(extra_points.iter().cloned()).collect();
-            let all_values: Vec<_> = core.opening_values.iter().copied().chain(extra_values.iter().copied()).collect();
-            let closed = super::face_closure::close_faces(&all_points, &all_values, challenger).expect("valid face claims");
-            if trace { eprintln!("  [prove_record] face claims: {} -> {}", all_points.len(), closed.len()); }
+            let all_points: Vec<_> = core
+                .points
+                .iter()
+                .cloned()
+                .chain(extra_points.iter().cloned())
+                .collect();
+            let all_values: Vec<_> = core
+                .opening_values
+                .iter()
+                .copied()
+                .chain(extra_values.iter().copied())
+                .collect();
+            let closed = super::face_closure::close_faces(&all_points, &all_values, challenger)
+                .expect("valid face claims");
+            if trace {
+                eprintln!(
+                    "  [prove_record] face claims: {} -> {}",
+                    all_points.len(),
+                    closed.len()
+                );
+            }
             for claim in &closed {
                 let (_, x_outer) = flock_claim_shape(&claim.point);
                 x_fulls.push(x_outer);
@@ -1347,8 +1371,17 @@ pub fn verify_record_open<Ch: Challenger>(
         bindings.push(LowBinding::Multilinear { x_low });
         x_fulls.push(x_outer);
     } else if proof.face_closure {
-        let all_points: Vec<_> = points.iter().cloned().chain(extra_points.iter().cloned()).collect();
-        let all_values: Vec<_> = proof.opening_values.iter().copied().chain(extra_values.iter().copied()).collect();
+        let all_points: Vec<_> = points
+            .iter()
+            .cloned()
+            .chain(extra_points.iter().cloned())
+            .collect();
+        let all_values: Vec<_> = proof
+            .opening_values
+            .iter()
+            .copied()
+            .chain(extra_values.iter().copied())
+            .collect();
         for claim in super::face_closure::close_faces(&all_points, &all_values, challenger)? {
             claim_values.push(claim.value);
             let (x_low, x_outer) = flock_claim_shape(&claim.point);

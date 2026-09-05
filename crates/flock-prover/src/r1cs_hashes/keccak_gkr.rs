@@ -30,14 +30,15 @@
 use flock_core::challenger::Challenger;
 use flock_core::field::F128;
 
-use super::keccak::{
-    iota_lanes, rho_pi_lanes, state_to_lanes, theta_lanes, Lanes, State, STATE_BITS,
-};
+use super::keccak::{Lanes, STATE_BITS, rho_pi_lanes, theta_lanes};
+#[cfg(test)]
+use super::keccak::{State, iota_lanes, state_to_lanes};
 
 /// Padded state cube: 1,600 bits in 2^11.
 pub const STATE_VARS: usize = 11;
 const CUBE: usize = 1 << STATE_VARS;
 
+#[cfg(test)]
 fn lanes_to_bits(lanes: &Lanes) -> Vec<bool> {
     let mut bits = vec![false; CUBE];
     for (i, slot) in bits.iter_mut().enumerate().take(STATE_BITS) {
@@ -47,6 +48,7 @@ fn lanes_to_bits(lanes: &Lanes) -> Vec<bool> {
     bits
 }
 
+#[cfg(test)]
 fn state_bits(state: &State) -> Vec<bool> {
     lanes_to_bits(&state_to_lanes(state))
 }
@@ -191,12 +193,7 @@ pub fn prove_layer<Ch: Challenger>(
             let x0 = [a0[i], a0[half + i]];
             let x1 = [a1[i], a1[half + i]];
             let x2 = [a2[i], a2[half + i]];
-            let (df, d0, d1, d2) = (
-                f[1] + f[0],
-                x0[1] + x0[0],
-                x1[1] + x1[0],
-                x2[1] + x2[0],
-            );
+            let (df, d0, d1, d2) = (f[1] + f[0], x0[1] + x0[0], x1[1] + x1[0], x2[1] + x2[0]);
             let (mut ft, mut t0, mut t1, mut t2) = (f[0], x0[0], x1[0], x2[0]);
             for slot in &mut evals {
                 *slot += ft * (t0 + t2 + t1 * t2);
@@ -295,7 +292,9 @@ mod tests {
         let mut state = [false; STATE_BITS];
         let mut acc = seed | 1;
         for slot in state.iter_mut() {
-            acc = acc.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            acc = acc
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             *slot = acc >> 63 == 1;
         }
         state
@@ -314,8 +313,7 @@ mod tests {
         let mut b: Lanes = [0; 25];
         for x in 0..5 {
             for y in 0..5 {
-                b[x + 5 * y] =
-                    a[x + 5 * y] ^ (!a[(x + 1) % 5 + 5 * y] & a[(x + 2) % 5 + 5 * y]);
+                b[x + 5 * y] = a[x + 5 * y] ^ (!a[(x + 1) % 5 + 5 * y] & a[(x + 2) % 5 + 5 * y]);
             }
         }
         iota_lanes(&mut b, round);
@@ -365,8 +363,7 @@ mod tests {
         for round in (0..24).rev() {
             // Peel iota: the chi output claim.
             let chi_claim = claim + round_constant_mle(round, &point);
-            let (proof, next_point) =
-                prove_layer(&taps, &states[round], &point, &mut challenger);
+            let (proof, next_point) = prove_layer(&taps, &states[round], &point, &mut challenger);
             // Sum rule at round 1 of the chi sumcheck.
             assert_eq!(
                 proof.chi_rounds[0][0] + proof.chi_rounds[0][1],

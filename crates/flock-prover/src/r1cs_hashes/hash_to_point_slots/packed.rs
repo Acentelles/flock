@@ -61,7 +61,10 @@ fn same_shifted_row(row: &[usize], first: &[usize], slot: usize) -> bool {
 
 impl Program {
     pub(super) fn new(a: &SparseBinaryMatrix, b: &SparseBinaryMatrix) -> Option<Self> {
-        if a.rows.len() != K || b.rows.len() != K || SLOTS % 4 != 0 || SLOTS >= (1 << COUNTER_BITS)
+        if a.rows.len() != K
+            || b.rows.len() != K
+            || !SLOTS.is_multiple_of(4)
+            || SLOTS >= (1 << COUNTER_BITS)
         {
             return None;
         }
@@ -256,11 +259,7 @@ mod tests {
         }
         for accepted in [0, 1, 255, 256, 511, 512, 513, SLOTS] {
             compare(&std::array::from_fn(|slot| {
-                if slot < accepted {
-                    0
-                } else {
-                    u16::MAX
-                }
+                if slot < accepted { 0 } else { u16::MAX }
             }));
             compare(&std::array::from_fn(|slot| {
                 if slot >= SLOTS - accepted {

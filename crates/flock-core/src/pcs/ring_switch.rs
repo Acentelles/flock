@@ -1719,7 +1719,10 @@ pub(crate) fn fold_b128_from_table(eq_lo: &[F128], eq_hi: &[F128], tables: &[F12
 const SPARSE_BOOLEAN_THRESHOLD: usize = 3;
 
 fn boolean_coordinate_count(coords: &[F128]) -> usize {
-    coords.iter().filter(|&&c| c == F128::ZERO || c == F128::ONE).count()
+    coords
+        .iter()
+        .filter(|&&c| c == F128::ZERO || c == F128::ONE)
+        .count()
 }
 
 /// Sparse representation of `build_eq(coords)` when `coords` contains exact
@@ -1791,11 +1794,19 @@ pub fn build_eq_sparse(coords: &[F128]) -> SparseEqTensor {
         .iter()
         .enumerate()
         .filter_map(|(i, &c)| {
-            if c == F128::ZERO || c == F128::ONE { None } else { Some(i) }
+            if c == F128::ZERO || c == F128::ONE {
+                None
+            } else {
+                Some(i)
+            }
         })
         .collect();
     let fixed_ones = coords.iter().enumerate().fold(0usize, |mask, (i, &c)| {
-        if c == F128::ONE { mask | (1usize << i) } else { mask }
+        if c == F128::ONE {
+            mask | (1usize << i)
+        } else {
+            mask
+        }
     });
     let live_coords: Vec<F128> = live_positions.iter().map(|&i| coords[i]).collect();
     // Sequential build_eq. `build_eq_parallel` *does* save ~0.4 ms on the build
@@ -2390,8 +2401,7 @@ pub fn s_hat_v_multi_padded(
         if dense_suffixes.len() == 2 {
             let (lo0, hi0) = build_eq_split(dense_suffixes[0], split_n_lo(dense_suffixes[0].len()));
             let (lo1, hi1) = build_eq_split(dense_suffixes[1], split_n_lo(dense_suffixes[1].len()));
-            let (a, b) =
-                fold_1b_rows_split_2way(packed_witness, &lo0, &hi0, &lo1, &hi1, padding);
+            let (a, b) = fold_1b_rows_split_2way(packed_witness, &lo0, &hi0, &lo1, &hi1, padding);
             out[dense_to_orig[0]] = a;
             out[dense_to_orig[1]] = b;
         } else {
@@ -2401,8 +2411,10 @@ pub fn s_hat_v_multi_padded(
             }
         }
     } else if !dense_suffixes.is_empty() {
-        let dense_tensors: Vec<Vec<F128>> =
-            dense_suffixes.iter().map(|s| build_eq_parallel(s)).collect();
+        let dense_tensors: Vec<Vec<F128>> = dense_suffixes
+            .iter()
+            .map(|s| build_eq_parallel(s))
+            .collect();
         let dense_refs: Vec<&[F128]> = dense_tensors.iter().map(|t| t.as_slice()).collect();
         let folded = fold_1b_rows_multi_padded(packed_witness, &dense_refs, padding);
         for (&orig, v) in dense_to_orig.iter().zip(folded) {
@@ -2517,13 +2529,12 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
         // Reuse only computed claims: each caller-supplied precompute keeps
         // its own slot even if it disagrees with another supplied value.
         // Per-claim messages, observations and challenges below stay intact.
-        if !has_precomputed(orig) {
-            if let Some(previous) = (0..orig).find(|&previous| {
-                !has_precomputed(previous) && x_outers[previous][1..] == *suffix
-            }) {
-                kinds.push(kinds[previous]);
-                continue;
-            }
+        if !has_precomputed(orig)
+            && let Some(previous) = (0..orig)
+                .find(|&previous| !has_precomputed(previous) && x_outers[previous][1..] == *suffix)
+        {
+            kinds.push(kinds[previous]);
+            continue;
         }
         if boolean_coordinate_count(suffix) >= SPARSE_BOOLEAN_THRESHOLD {
             kinds.push(Kind::Sparse(sparse_suffixes.len()));
@@ -2540,7 +2551,9 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
         let groups = dense_suffixes.len() + sparse_suffixes.len();
         eprintln!(
             "    [rs::prove_batched] gather groups: claims={}, groups={}, reused={}",
-            n, groups, n - groups,
+            n,
+            groups,
+            n - groups,
         );
     }
 
@@ -2721,11 +2734,9 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
                             fold_one_slot(F128::ONE, &build_fold_byte_table(&scaled_eq_r_dprime)),
                         )],
                     }
-                } else if boolean_coordinate_count(effective) >= SPARSE_BOOLEAN_THRESHOLD
-                {
+                } else if boolean_coordinate_count(effective) >= SPARSE_BOOLEAN_THRESHOLD {
                     let support = build_eq_sparse(effective);
-                    let mut entries =
-                        fold_b128_elems_sparse_pairs(&support, &scaled_eq_r_dprime);
+                    let mut entries = fold_b128_elems_sparse_pairs(&support, &scaled_eq_r_dprime);
                     for entry in &mut entries {
                         entry.0 += win_offset;
                     }
@@ -2756,10 +2767,7 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
                                 table: build_fold_byte_table(&scaled_eq_r_dprime),
                             }
                         } else {
-                            RsEqInd::Dense(fold_b128_elems(
-                                &dense_tensors[d],
-                                &scaled_eq_r_dprime,
-                            ))
+                            RsEqInd::Dense(fold_b128_elems(&dense_tensors[d], &scaled_eq_r_dprime))
                         }
                     }
                     Kind::Sparse(s) => RsEqInd::Sparse {
@@ -3463,7 +3471,11 @@ mod tests {
         // equal the full-suffix dense fold inside the window and zero
         // outside, for every trailing pattern.
         let mut rng = Rng::new(0x51ce);
-        for (n, booleans) in [(9usize, vec![F128::ZERO, F128::ONE]), (8, vec![F128::ONE]), (10, vec![F128::ZERO, F128::ZERO, F128::ONE])] {
+        for (n, booleans) in [
+            (9usize, vec![F128::ZERO, F128::ONE]),
+            (8, vec![F128::ONE]),
+            (10, vec![F128::ZERO, F128::ZERO, F128::ONE]),
+        ] {
             let mut suffix: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
             let k = booleans.len();
             for (j, b) in booleans.iter().enumerate() {
@@ -3922,16 +3934,24 @@ mod tests {
         let mut rng = Rng::new(0xB001_EA11);
         for n in [0, 1, 4, 8, 12] {
             for pattern in 0..7 {
-                let coords: Vec<F128> = (0..n).map(|i| match pattern {
-                    1 => F128::ZERO,
-                    2 => F128::ONE,
-                    3 => if i % 2 == 0 { F128::ZERO } else { F128::ONE },
-                    4 if i % 3 == 0 => F128::ZERO,
-                    5 if i % 3 == 0 => F128::ONE,
-                    6 if i % 3 == 0 => F128::ZERO,
-                    6 if i % 3 == 1 => F128::ONE,
-                    _ => rng.f128(),
-                }).collect();
+                let coords: Vec<F128> = (0..n)
+                    .map(|i| match pattern {
+                        1 => F128::ZERO,
+                        2 => F128::ONE,
+                        3 => {
+                            if i % 2 == 0 {
+                                F128::ZERO
+                            } else {
+                                F128::ONE
+                            }
+                        }
+                        4 if i % 3 == 0 => F128::ZERO,
+                        5 if i % 3 == 0 => F128::ONE,
+                        6 if i % 3 == 0 => F128::ZERO,
+                        6 if i % 3 == 1 => F128::ONE,
+                        _ => rng.f128(),
+                    })
+                    .collect();
                 let dense = build_eq(&coords);
                 let sparse = build_eq_sparse(&coords);
                 let entries = sparse.materialize();
@@ -3975,12 +3995,18 @@ mod tests {
             points[3][1..].fill(F128::ONE);
             points[4][1..].fill(F128::ZERO);
             for (i, coord) in points[5][1..].iter_mut().enumerate() {
-                if i % 3 == 0 { *coord = F128::ONE; }
-                if i % 3 == 1 { *coord = F128::ZERO; }
+                if i % 3 == 0 {
+                    *coord = F128::ONE;
+                }
+                if i % 3 == 1 {
+                    *coord = F128::ZERO;
+                }
             }
             let mut reference = FsChallenger::new(b"boolean-sparse-batch");
-            let expected: Vec<_> = points.iter()
-                .map(|point| prove(&packed, point, &mut reference)).collect();
+            let expected: Vec<_> = points
+                .iter()
+                .map(|point| prove(&packed, point, &mut reference))
+                .collect();
             let gammas: Vec<F128> = (0..points.len()).map(|_| reference.sample_f128()).collect();
             let refs: Vec<&[F128]> = points.iter().map(Vec::as_slice).collect();
             let mut challenger = FsChallenger::new(b"boolean-sparse-batch");
@@ -3994,8 +4020,14 @@ mod tests {
                 assert_eq!(proof, want_proof);
                 assert_eq!(precomputed[i], want_proof.s_hat_v);
                 assert_eq!(output.sumcheck_claim, want_output.sumcheck_claim);
-                assert_eq!(output.rs_eq_ind.to_dense(), want_output.rs_eq_ind.iter()
-                    .map(|&value| gammas[i] * value).collect::<Vec<_>>());
+                assert_eq!(
+                    output.rs_eq_ind.to_dense(),
+                    want_output
+                        .rs_eq_ind
+                        .iter()
+                        .map(|&value| gammas[i] * value)
+                        .collect::<Vec<_>>()
+                );
             }
         }
     }
