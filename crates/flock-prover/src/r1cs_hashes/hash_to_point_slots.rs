@@ -60,6 +60,8 @@ use flock_core::r1cs::{BlockR1cs, SparseBinaryMatrix};
 
 use super::common::build_block_r1cs_with_matrices;
 
+mod packed;
+
 pub const K_LOG: usize = 17;
 pub const K: usize = 1 << K_LOG;
 pub const K_SKIP: usize = 6;
@@ -503,6 +505,45 @@ impl SlotSetup {
         z
     }
 
+    /// Generate directly into packed storage, evaluating slot-local matrix
+    /// rows on 128 candidate bits at once. A checked specialization handles
+    /// the running counter; other matrix shapes retain the scalar evaluator.
+    /// Padding records, forced-zero cells, and masks retain their exact bits.
+    pub fn generate_packed_witness_with_masks(
+        &self, blocks: &[[u16; SLOTS]], masks: &[[bool; 128]; MASK_REPS],
+    ) -> Vec<flock_core::field::F128> {
+        use flock_core::field::F128;
+        use rayon::prelude::*;
+        assert_eq!(blocks.len(), self.n_blocks);
+        let stride = 1 << (K_LOG - 7);
+        let mut packed = vec![F128::ZERO; 1 << (self.r1cs.m - 7)];
+        let zero_block = [0_u16; SLOTS];
+        let program = packed::Program::new(&self.r1cs.a_0, &self.r1cs.b_0);
+        packed.par_chunks_mut(stride).enumerate().for_each(|(index, out)| {
+            let words = blocks.get(index).unwrap_or(&zero_block);
+            if let Some(program) = &program {
+                program.write(words, out);
+                return;
+            }
+            let (block, _) = build_block_witness_with(&self.r1cs.a_0, &self.r1cs.b_0, words);
+            for (word, bits) in out.iter_mut().zip(block.chunks_exact(128)) {
+                for (bit, &set) in bits.iter().enumerate() {
+                    if set { if bit < 64 { word.lo |= 1 << bit; } else { word.hi |= 1 << (bit - 64); } }
+                }
+            }
+        });
+        for (rep, mask) in masks.iter().enumerate() {
+            for (bit, &set) in mask.iter().enumerate() {
+                let address = mask_position(rep, bit);
+                let word = &mut packed[address / 128];
+                let limb = if address % 128 < 64 { &mut word.lo } else { &mut word.hi };
+                let mask = 1_u64 << (address % 64);
+                *limb = (*limb & !mask) | if set { mask } else { 0 };
+            }
+        }
+        packed
+    }
+
     /// Generic matrix-driven prover over the packed witness.
     pub fn prove_ligerito<Ch: flock_core::challenger::Challenger>(
         &self,
@@ -513,8 +554,7 @@ impl SlotSetup {
         flock_core::pcs::Commitment,
         flock_core::proof::R1csClaim,
     ) {
-        let z = self.generate_witness(blocks);
-        let z_packed = flock_core::pcs::pack_witness(&z, self.r1cs.m);
+        let z_packed = self.generate_packed_witness_with_masks(blocks, &[[false; 128]; MASK_REPS]);
         crate::prover::prove_ligerito(&self.r1cs, z_packed, &self.pcs_params, challenger)
     }
 
@@ -669,6 +709,18 @@ mod tests {
             z.extend_from_slice(z_block);
         }
         z
+    }
+
+    #[test]
+    fn packed_witness_matches_full_witness_with_masks_and_padding() {
+        for records in [3,8,32] {
+            let setup = SlotSetup::new(records);
+            let blocks = vec![word_battery(); records];
+            let masks = std::array::from_fn(|rep| std::array::from_fn(|bit| (rep + bit) % 3 == 0));
+            let full = setup.generate_witness_with_masks(&blocks, &masks);
+            assert_eq!(setup.generate_packed_witness_with_masks(&blocks, &masks),
+                flock_core::pcs::pack_witness(&full, setup.r1cs.m));
+        }
     }
 
     #[test]

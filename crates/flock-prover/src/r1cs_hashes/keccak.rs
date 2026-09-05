@@ -421,9 +421,13 @@ pub fn keccak_round(s: &mut State, round_idx: usize) {
 
 /// Full Keccak-f[1600] (24 rounds).
 pub fn keccak_f(s: &mut State) {
+    // Keep all 24 rounds in lane form. Only the permutation boundary
+    // needs the public bit-state layout; per-round conversion is redundant.
+    let mut lanes = state_to_lanes(s);
     for r in 0..24 {
-        keccak_round(s, r);
+        keccak_round_lanes(&mut lanes, r);
     }
+    *s = lanes_to_state(&lanes);
 }
 
 // ===========================================================================

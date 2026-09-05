@@ -37,6 +37,8 @@ use crate::field::F128;
 use crate::zerocheck::PaddingSpec;
 use serde::{Deserialize, Serialize};
 
+mod basis_composition;
+
 /// Batched opening proof: ring-switching frontend + Ligerito backend.
 /// The combined `b_combined` + target_combined feed
 /// [`ligerito::recursive_prover_with_basis`] (see ligerito module docs).
@@ -318,28 +320,48 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
     // Neither the per-claim `γ_k·B_k` buffer nor a combine readback is ever
     // materialized (saves ~2·L writes + 2·L reads of the 2^(m-7) basis).
     //
-    // SPARSE packed-direct claims (the chain/merkle I/O claim) do NOT disable
-    // this path: they're scatter-added onto b_combined after the fold (with an
+    // Sparse ring-switch and packed-direct claims do not disable this path:
+    // they're scatter-added onto b_combined after the fold (with an
     // incremental round-0 prime adjustment), so they only require
     // `pd_dense.is_empty()`, not `packed_direct.is_empty()`. This keeps the two
     // big ab/c claims on the fused fold instead of materializing them.
     let use_fast = !rs_deferred.is_empty()
-        && rs_deferred.len() + rs_windowed.len() == rs_results.len()
+        && rs_baked.is_empty()
         && pd_dense.is_empty();
+    if trace {
+        let sparse = rs_results.iter().filter(|(_, out)| {
+            matches!(out.rs_eq_ind, ring_switch::RsEqInd::Sparse { .. })
+        }).count();
+        eprintln!("  [open_batch] basis: deferred={}, sparse={}, windowed={}, fused={use_fast}",
+            rs_deferred.len(), sparse, rs_windowed.len());
+    }
 
     let (mut round0_u0, mut round0_u2) = if use_fast {
         let b = rs_deferred[0].0.len(); // eq_lo.len(); shared across claims (same split)
         debug_assert!(b >= 2 && b.is_multiple_of(2));
         debug_assert!(rs_deferred.iter().all(|d| d.0.len() == b));
+        // Composition-table setup pays off on the measured large blocks.
+        // Keep the original path for shorter domains.
+        let compose = b >= basis_composition::MIN_BLOCK_CELLS;
+        if trace && compose {
+            eprintln!("  [open_batch] block-map composition: block_cells={b}");
+        }
+        let scratch = || {
+            if compose { vec![F128::ZERO; 4096] } else { Vec::new() }
+        };
         b_combined
             .par_chunks_mut(b)
             .enumerate()
-            .map(|(hi, out_block)| {
+            .map_init(scratch, |composed, (hi, out_block)| {
                 // Accumulate each claim's block: first claim writes, rest add.
                 // `e_hi` is read once per claim per block, then swept over eq_lo.
                 for (ci, (eq_lo, eq_hi, table, _)) in rs_deferred.iter().enumerate() {
                     let e_hi = eq_hi[hi];
-                    if ci == 0 {
+                    if compose {
+                        basis_composition::compose_and_fold(
+                            eq_lo, e_hi, table, out_block, composed, ci != 0,
+                        );
+                    } else if ci == 0 {
                         for (slot, &lo) in out_block.iter_mut().zip(eq_lo.iter()) {
                             *slot = ring_switch::fold_one_slot(lo * e_hi, table);
                         }
@@ -451,21 +473,14 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         round0_u0 += du0;
         round0_u2 += du2;
     }
-    let mut adjust_prime_for_delta = |idx: usize, delta: F128| {
-        let pair = idx / 2;
-        let a0 = packed_witness[2 * pair];
-        let a1 = packed_witness[2 * pair + 1];
-        if idx & 1 == 0 {
-            round0_u0 += a0 * delta;
-        }
-        round0_u2 += (a0 + a1) * delta;
-    };
     for (_, output) in rs_results.iter() {
         if let ring_switch::RsEqInd::Sparse { entries, .. } = &output.rs_eq_ind {
-            for &(idx, val) in entries {
-                b_combined[idx] += val;
-                adjust_prime_for_delta(idx, val);
-            }
+            let (du0, du2) = scatter_add_indexed_parallel(
+                &mut b_combined, packed_witness, entries.len(),
+                |i| entries[i].0, |i| entries[i].1,
+            );
+            round0_u0 += du0;
+            round0_u2 += du2;
         }
     }
     for (pd, g) in packed_direct.iter().zip(gammas_pd.iter()) {
@@ -527,9 +542,22 @@ fn sparse_scatter_add_parallel(
     eq: &SparseEqTensor,
     gamma: F128,
 ) -> (F128, F128) {
-    use rayon::prelude::*;
+    scatter_add_indexed_parallel(
+        b_combined, packed_witness, eq.live_tensor.len(),
+        |i| eq.scatter_idx(i), |i| gamma * eq.live_tensor[i],
+    )
+}
 
-    let c_total = eq.live_tensor.len();
+/// Scatter an injective, increasing sequence of indices into disjoint
+/// output ranges, and accumulate its exact round-zero prime contribution.
+fn scatter_add_indexed_parallel(
+    b_combined: &mut [F128],
+    packed_witness: &[F128],
+    c_total: usize,
+    index: impl Fn(usize) -> usize + Sync,
+    value: impl Fn(usize) -> F128 + Sync,
+) -> (F128, F128) {
+    use rayon::prelude::*;
     if c_total == 0 {
         return (F128::ZERO, F128::ZERO);
     }
@@ -549,7 +577,7 @@ fn sparse_scatter_add_parallel(
             } else if i == actual_n_chunks {
                 b_combined.len()
             } else {
-                eq.scatter_idx(i * c_per_chunk)
+                index(i * c_per_chunk)
             }
         })
         .collect();
@@ -577,9 +605,8 @@ fn sparse_scatter_add_parallel(
             let mut du0 = F128::ZERO;
             let mut du2 = F128::ZERO;
             for c in c_lo..c_hi {
-                let val = eq.live_tensor[c];
-                let idx = eq.scatter_idx(c);
-                let delta = gamma * val;
+                let idx = index(c);
+                let delta = value(c);
                 slice[idx - b_lo] += delta;
                 // Round-0 prime delta for this scattered position.
                 let pair = idx / 2;
@@ -829,6 +856,98 @@ mod tests {
                 lo: self.next_u64(),
                 hi: self.next_u64(),
             }
+        }
+    }
+
+    #[test]
+    fn parallel_sparse_add_matches_serial_even_and_odd_indices() {
+        let mut rng = Rng::new(8192);
+        for count in [0_usize, 1, 17, 129, 65536] {
+            let len = (3 * count + 8).next_power_of_two();
+            let witness: Vec<_> = (0..len).map(|_| rng.f128()).collect();
+            let mut actual: Vec<_> = (0..len).map(|_| rng.f128()).collect();
+            let mut expected = actual.clone();
+            let values: Vec<_> = (0..count).map(|_| rng.f128()).collect();
+            let mut prime = (F128::ZERO, F128::ZERO);
+            for (i, &delta) in values.iter().enumerate() {
+                let idx = 3 * i + 1;
+                expected[idx] += delta;
+                let pair = idx / 2;
+                if idx % 2 == 0 {
+                    prime.0 += witness[2 * pair] * delta;
+                }
+                prime.1 += (witness[2 * pair] + witness[2 * pair + 1]) * delta;
+            }
+            let got = scatter_add_indexed_parallel(
+                &mut actual,
+                &witness,
+                count,
+                |i| 3 * i + 1,
+                |i| values[i],
+            );
+            assert_eq!(actual, expected);
+            assert_eq!(got, prime);
+        }
+    }
+
+    #[test]
+    fn fused_sparse_claims_match_materialized_basis_and_transcript() {
+        for m in [16, 18] {
+            let mut rng = Rng::new(1729 + m as u64);
+            let witness: Vec<_> = (0..1 << (m - LOG_PACKING)).map(|_| rng.f128()).collect();
+            let mut points: Vec<Vec<_>> = (0..4)
+                .map(|_| (0..m - 6).map(|_| rng.f128()).collect())
+                .collect();
+            for axis in [2, 4, 6] {
+                points[2][axis] = F128::ZERO;
+            }
+            points[3].fill(F128::ONE);
+            let refs: Vec<_> = points.iter().map(Vec::as_slice).collect();
+            let padding = PaddingSpec::dense(m);
+            let mut prover = FsChallenger::new(b"mixed sparse basis");
+            let result = compute_combined_basis_and_target(
+                &witness,
+                &refs,
+                &[],
+                &[],
+                &padding,
+                &mut prover,
+                false,
+            );
+            let mut reference = FsChallenger::new(b"mixed sparse basis");
+            reference.observe_label(b"flock-pcs-open-batch-v0");
+            let (outputs, gammas) = ring_switch::prove_batched_padded_with_precomputed(
+                &witness,
+                &refs,
+                &[],
+                &padding,
+                &mut reference,
+            );
+            assert!(outputs
+                .iter()
+                .any(|(_, o)| matches!(o.rs_eq_ind, ring_switch::RsEqInd::DeferredDense { .. })));
+            assert!(outputs
+                .iter()
+                .any(|(_, o)| matches!(o.rs_eq_ind, ring_switch::RsEqInd::Sparse { .. })));
+            let mut expected = vec![F128::ZERO; witness.len()];
+            let mut target = F128::ZERO;
+            for ((proof, out), (&gamma, actual)) in
+                outputs.iter().zip(gammas.iter().zip(&result.ring_switches))
+            {
+                assert_eq!(proof, actual);
+                out.rs_eq_ind.add_scaled_into(F128::ONE, &mut expected);
+                target += gamma * out.sumcheck_claim;
+            }
+            let prime = witness
+                .chunks_exact(2)
+                .zip(expected.chunks_exact(2))
+                .fold((F128::ZERO, F128::ZERO), |(u0, u2), (a, b)| {
+                    (u0 + a[0] * b[0], u2 + (a[0] + a[1]) * (b[0] + b[1]))
+                });
+            assert_eq!(result.b_combined, expected);
+            assert_eq!(result.target_combined, target);
+            assert_eq!(result.round0_prime, prime);
+            assert_eq!(prover.sample_f128(), reference.sample_f128());
         }
     }
 

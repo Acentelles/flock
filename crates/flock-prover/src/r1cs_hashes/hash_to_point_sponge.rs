@@ -75,6 +75,7 @@ pub struct SpongePublic {
     pub message: Vec<u8>,
 }
 
+#[cfg(test)]
 fn state_from_physical_bytes(bytes: &[u8; 200]) -> State {
     let mut state = [false; STATE_BITS];
     for p in 0..STATE_BITS {
@@ -84,6 +85,7 @@ fn state_from_physical_bytes(bytes: &[u8; 200]) -> State {
     state
 }
 
+#[cfg(test)]
 fn state_to_physical_bytes(state: &State) -> [u8; 200] {
     let mut bytes = [0_u8; 200];
     for p in 0..STATE_BITS {
@@ -119,6 +121,48 @@ pub fn framed_blocks(record: &SpongeRecord) -> ([u8; RATE_BYTES], [u8; RATE_BYTE
 /// The ten live `state_0` states plus the 612 squeezed big-endian words.
 pub fn sponge_trace(record: &SpongeRecord) -> ([State; LIVE_PERMS], Vec<u16>) {
     let (block1, block2) = framed_blocks(record);
+    let mut lanes = [0_u64; 25];
+    for (lane, bytes) in lanes.iter_mut().zip(block1.chunks_exact(8)) {
+        *lane = u64::from_le_bytes(bytes.try_into().unwrap());
+    }
+    let mut states = [[false; STATE_BITS]; LIVE_PERMS];
+    states[0] = keccak::lanes_to_state(&lanes);
+    let mut words = Vec::with_capacity(612);
+    for instance in 1..LIVE_PERMS {
+        for round in 0..24 {
+            keccak::keccak_round_lanes(&mut lanes, round);
+        }
+        if instance == 1 {
+            for (lane, bytes) in lanes.iter_mut().zip(block2.chunks_exact(8)) {
+                *lane ^= u64::from_le_bytes(bytes.try_into().unwrap());
+            }
+        }
+        // Materialize the committed input state only at a permutation
+        // boundary. Absorption and squeezing read the same little-endian lanes.
+        states[instance] = keccak::lanes_to_state(&lanes);
+        if instance >= 2 {
+            squeeze_lane_words(&lanes, &mut words);
+        }
+    }
+    for round in 0..24 {
+        keccak::keccak_round_lanes(&mut lanes, round);
+    }
+    squeeze_lane_words(&lanes, &mut words);
+    (states, words)
+}
+
+fn squeeze_lane_words(lanes: &keccak::Lanes, words: &mut Vec<u16>) {
+    for &lane in &lanes[..RATE_BYTES / 8] {
+        let bytes = lane.to_le_bytes();
+        for word in bytes.chunks_exact(2) {
+            words.push(u16::from_be_bytes([word[0], word[1]]));
+        }
+    }
+}
+
+#[cfg(test)]
+fn sponge_trace_reference(record: &SpongeRecord) -> ([State; LIVE_PERMS], Vec<u16>) {
+    let (block1, block2) = framed_blocks(record);
     let mut states = [[false; STATE_BITS]; LIVE_PERMS];
     let mut bytes = [0_u8; 200];
     bytes[..RATE_BYTES].copy_from_slice(&block1);
@@ -153,6 +197,7 @@ pub fn sponge_trace(record: &SpongeRecord) -> ([State; LIVE_PERMS], Vec<u16>) {
     (states, words)
 }
 
+#[cfg(test)]
 fn keccak_f_output_words(state: &mut State, words: &mut Vec<u16>) {
     keccak::keccak_f(state);
     let squeezed = state_to_physical_bytes(state);
@@ -189,6 +234,8 @@ pub struct SpongeProof {
     pub lincheck: lincheck::LincheckProof,
     /// Claimed opening values in [`sponge_points`]' fixed order.
     pub opening_values: Vec<F128>,
+    /// Complete Boolean faces were reduced before the batched opening.
+    pub face_closure: bool,
     pub pcs_open: pcs::BatchOpeningProofLigerito,
 }
 
@@ -518,15 +565,17 @@ pub fn open_sponge<Ch: Challenger>(
     extra_values: &[F128],
     challenger: &mut Ch,
 ) -> (SpongeProof, pcs::ProverData) {
-    // The sponge lane keeps per-claim ring switches: its bit domain is
-    // three variables LARGER than the record lane's (m = log2(4N) + 17,
-    // already 29 at 1024 records), so the closure's dense weight table
-    // and folded witness blow past memory exactly where the lane's
-    // claim count (~32) makes the closure least valuable. The staged
-    // family-form closure for this lane is documented in the profile
-    // note as the 16K follow-up.
     assert_eq!(extra_points.len(), extra_values.len());
-    let _ = extra_values;
+    let face_closure = cfg!(feature = "face-batching");
+    let closed = if face_closure {
+        let all_points: Vec<_> = core.points.iter().cloned().chain(extra_points.iter().cloned()).collect();
+        let all_values: Vec<_> = core.opening_values.iter().copied().chain(extra_values.iter().copied()).collect();
+        let closed = super::face_closure::close_faces(&all_points, &all_values, challenger).expect("valid face claims");
+        if std::env::var_os("FLOCK_TRACE").is_some() {
+            eprintln!("  [prove_sponge] face claims: {} -> {}", all_points.len(), closed.len());
+        }
+        Some(closed)
+    } else { None };
     let fast = core.fast;
     let ab = fast.ab.clone();
     let c = fast.c.clone();
@@ -542,9 +591,16 @@ pub fn open_sponge<Ch: Challenger>(
             v
         },
     ];
-    for point in core.points.iter().chain(extra_points) {
-        let (_low, x_outer) = flock_claim_shape(point);
-        x_fulls.push(x_outer);
+    if let Some(closed) = &closed {
+        for claim in closed {
+            let (_, x_outer) = flock_claim_shape(&claim.point);
+            x_fulls.push(x_outer);
+        }
+    } else {
+        for point in core.points.iter().chain(extra_points) {
+            let (_, x_outer) = flock_claim_shape(point);
+            x_fulls.push(x_outer);
+        }
     }
     let x_refs: Vec<&[F128]> = x_fulls.iter().map(|v| v.as_slice()).collect();
     let pre_ab: Option<&[F128]> = fast.s_hat_v_ab.as_deref();
@@ -552,7 +608,7 @@ pub fn open_sponge<Ch: Challenger>(
     let mut precomputed: Vec<Option<&[F128]>> = vec![pre_ab, pre_c];
     precomputed.extend(std::iter::repeat_n(
         None,
-        core.points.len() + extra_points.len(),
+        x_fulls.len() - 2,
     ));
     let lig_config = setup
         .keccak
@@ -578,6 +634,7 @@ pub fn open_sponge<Ch: Challenger>(
             zerocheck: fast.zc_proof,
             lincheck: fast.lc_proof,
             opening_values: core.opening_values,
+            face_closure,
             pcs_open,
         },
         fast.prover_data.expect("own-root core"),
@@ -600,6 +657,15 @@ pub fn gather_eval(z_packed: &[F128], point: &[F128]) -> F128 {
 /// equal to [`gather_eval`] per point (the tensor dot IS the
 /// multilinear fold, and field addition regroups exactly).
 pub fn gather_eval_many(z_packed: &[F128], points: &[Vec<F128>]) -> Vec<F128> {
+    if cfg!(feature = "reference-gather") {
+        gather_eval_many_reference(z_packed, points)
+    } else {
+        super::packed_mle::evaluate_packed(z_packed, points)
+    }
+}
+
+/// Previous tensor evaluator, retained as an exact differential oracle.
+pub fn gather_eval_many_reference(z_packed: &[F128], points: &[Vec<F128>]) -> Vec<F128> {
     use rayon::prelude::*;
     // Group point indices by their free-coordinate signature.
     let mut split: Vec<(usize, Vec<(usize, F128)>)> = Vec::with_capacity(points.len());
@@ -818,8 +884,6 @@ pub fn verify_sponge_open<Ch: Challenger>(
     }
     let SpongeVerifyCore { ab, c, points } = core;
     let mut claim_values = vec![ab.value, c.value];
-    claim_values.extend_from_slice(&proof.opening_values);
-    claim_values.extend_from_slice(extra_values);
     let mut bindings = vec![
         LowBinding::Quirky {
             z_skip: ab.point.z_skip,
@@ -840,10 +904,23 @@ pub fn verify_sponge_open<Ch: Challenger>(
             v
         },
     ];
-    for point in points.iter().chain(extra_points) {
-        let (x_low, x_outer) = flock_claim_shape(point);
-        bindings.push(LowBinding::Multilinear { x_low });
-        x_fulls.push(x_outer);
+    if proof.face_closure {
+        let all_points: Vec<_> = points.iter().cloned().chain(extra_points.iter().cloned()).collect();
+        let all_values: Vec<_> = proof.opening_values.iter().copied().chain(extra_values.iter().copied()).collect();
+        for claim in super::face_closure::close_faces(&all_points, &all_values, challenger)? {
+            claim_values.push(claim.value);
+            let (x_low, x_outer) = flock_claim_shape(&claim.point);
+            bindings.push(LowBinding::Multilinear { x_low });
+            x_fulls.push(x_outer);
+        }
+    } else {
+        claim_values.extend_from_slice(&proof.opening_values);
+        claim_values.extend_from_slice(extra_values);
+        for point in points.iter().chain(extra_points) {
+            let (x_low, x_outer) = flock_claim_shape(point);
+            bindings.push(LowBinding::Multilinear { x_low });
+            x_fulls.push(x_outer);
+        }
     }
     let x_refs: Vec<&[F128]> = x_fulls.iter().map(|v| v.as_slice()).collect();
     let lig_config = setup
@@ -851,6 +928,9 @@ pub fn verify_sponge_open<Ch: Challenger>(
         .pcs_params
         .ligerito_verifier_config()
         .expect("verifier config");
+    if proof.pcs_open.ring_switches.len() != claim_values.len() {
+        return Err("opening shape does not match the selected reduction mode");
+    }
     pcs::verify_opening_batch_ligerito_mixed_bound(
         &proof.commitment,
         &claim_values,
@@ -875,6 +955,15 @@ mod tests {
             salt: [seed.wrapping_add(1); SALT_BYTES],
             hpk: [seed.wrapping_mul(3).wrapping_add(7); 64],
             message: (0..33).map(|i| seed.wrapping_add(i)).collect(),
+        }
+    }
+
+    #[test]
+    fn lane_trace_matches_every_state_for_all_bucket_lengths() {
+        for len in MESSAGE_BYTES {
+            let mut record = test_record(len as u8);
+            record.message = (0..len).map(|i| (i as u8).wrapping_mul(173)).collect();
+            assert_eq!(sponge_trace(&record), sponge_trace_reference(&record));
         }
     }
 

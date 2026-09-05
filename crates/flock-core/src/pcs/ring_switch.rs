@@ -1700,26 +1700,30 @@ pub(crate) fn fold_b128_from_table(eq_lo: &[F128], eq_hi: &[F128], tables: &[F12
 // ---------------------------------------------------------------------------
 // Sparse-tensor fast path.
 //
-// When the suffix `x_outer[1..]` has `k` coords exactly equal to `F128::ZERO`
+// When the suffix `x_outer[1..]` has `k` Boolean coords
 // (as is the case for the hash-chain ẑ-opening, whose `x_inner_rest` is padded
-// with trailing zeros), `build_eq` zeros out half the table per zero coord —
+// with trailing zeros), `build_eq` zeros out half the table per Boolean coord:
 // so `1 − 2^{-k}` of the suffix tensor is zero and contributes nothing to
 // `s_hat_v` (in `fold_1b_rows`) or `rs_eq_ind` (in `fold_b128_elems`). The
 // sparse kernels touch only the `2^{-k}` support and produce byte-identical
 // outputs to the dense kernels.
 //
-// Claims with fewer than `SPARSE_ZERO_THRESHOLD` zero coords stay on the dense
+// Claims with fewer than `SPARSE_BOOLEAN_THRESHOLD` Boolean coords stay on the dense
 // (MFR / 8-wide) path; the crossover threshold of 3 is conservative — at 3
-// zeros the support is 1/8 of the suffix length, plenty to amortize the
+// fixed coordinates the support is 1/8 of the suffix length, plenty to amortize the
 // sparse fold's per-entry overhead.
 // ---------------------------------------------------------------------------
 
-/// Minimum number of exactly-zero suffix coords for a claim to be routed
+/// Minimum number of Boolean suffix coords for a claim to be routed
 /// through the sparse kernels instead of the dense MFR fold.
-const SPARSE_ZERO_THRESHOLD: usize = 3;
+const SPARSE_BOOLEAN_THRESHOLD: usize = 3;
+
+fn boolean_coordinate_count(coords: &[F128]) -> usize {
+    coords.iter().filter(|&&c| c == F128::ZERO || c == F128::ONE).count()
+}
 
 /// Sparse representation of `build_eq(coords)` when `coords` contains exact
-/// `F128::ZERO` entries: stores values at the compact (live) tensor positions
+/// Boolean entries: stores values at the compact (live) tensor positions
 /// and a `live_positions` table that maps compact bit `j` → original coord
 /// position. Avoids materializing the scattered `(full_idx, val)` pairs —
 /// consumers compute the scattered idx on-the-fly via [`Self::scatter_idx`]
@@ -1732,6 +1736,8 @@ pub struct SparseEqTensor {
     /// `j` of an enumeration index maps to bit `live_positions[j]` of the full
     /// scattered index.
     pub live_positions: Vec<usize>,
+    /// Index bits pinned to one. Disjoint from every live position.
+    pub fixed_ones: usize,
 }
 
 impl SparseEqTensor {
@@ -1746,7 +1752,7 @@ impl SparseEqTensor {
     /// the noise floor.)
     #[inline(always)]
     pub fn scatter_idx(&self, c: usize) -> usize {
-        let mut full = 0usize;
+        let mut full = self.fixed_ones;
         for (j, &pos) in self.live_positions.iter().enumerate() {
             full |= ((c >> j) & 1) << pos;
         }
@@ -1774,9 +1780,9 @@ impl SparseEqTensor {
     }
 }
 
-/// Build the sparse `build_eq(coords)` representation, skipping the zero-coord
+/// Build the sparse `build_eq(coords)` representation, skipping the Boolean-coord
 /// halvings. The output's `live_tensor` is the `build_eq` table over only the
-/// nonzero coords (length `2^live_count`); the scattered (full) index for
+/// non-Boolean coords (length `2^live_count`); the scattered (full) index for
 /// compact entry `c` is reconstructed lazily via [`SparseEqTensor::scatter_idx`].
 ///
 /// O(2^live_count) time and memory, vs the dense `build_eq`'s `O(2^coords.len())`.
@@ -1784,8 +1790,13 @@ pub fn build_eq_sparse(coords: &[F128]) -> SparseEqTensor {
     let live_positions: Vec<usize> = coords
         .iter()
         .enumerate()
-        .filter_map(|(i, &c)| if c == F128::ZERO { None } else { Some(i) })
+        .filter_map(|(i, &c)| {
+            if c == F128::ZERO || c == F128::ONE { None } else { Some(i) }
+        })
         .collect();
+    let fixed_ones = coords.iter().enumerate().fold(0usize, |mask, (i, &c)| {
+        if c == F128::ONE { mask | (1usize << i) } else { mask }
+    });
     let live_coords: Vec<F128> = live_positions.iter().map(|&i| coords[i]).collect();
     // Sequential build_eq. `build_eq_parallel` *does* save ~0.4 ms on the build
     // itself at 19 live coords, but the downstream `fold_1b_rows_sparse` /
@@ -1796,6 +1807,7 @@ pub fn build_eq_sparse(coords: &[F128]) -> SparseEqTensor {
     SparseEqTensor {
         live_tensor,
         live_positions,
+        fixed_ones,
     }
 }
 
@@ -1807,7 +1819,7 @@ pub fn build_eq_sparse(coords: &[F128]) -> SparseEqTensor {
 ///
 /// Produces the same 128-entry `s_hat_v` as
 /// `fold_1b_rows_naive(packed_witness, build_eq(coords))`, since `build_eq`'s
-/// zero-coord halvings would otherwise contribute zero to every accumulator.
+/// Boolean-coord halvings would otherwise contribute zero to every accumulator.
 pub fn fold_1b_rows_sparse(packed_witness: &[F128], eq: &SparseEqTensor) -> Vec<F128> {
     // Tried: MFR fast path via `fold_1b_rows_sparse_mfr_block4` for the chain's
     // block-of-4 / stride-128 support pattern. **Measured a regression on
@@ -2010,6 +2022,12 @@ pub fn fold_b128_elems_sparse_pairs(
     eq: &SparseEqTensor,
     eq_r_dprime: &[F128],
 ) -> Vec<(usize, F128)> {
+    if eq.live_tensor.len() >= 1 << 17 {
+        if eq.live_tensor.len() == 1 << 17 && std::env::var_os("PCS_TRACE").is_some() {
+            eprintln!("    [rs::sparse_basis] byte lookup: support_cells=131072");
+        }
+        return fold_b128_elems_sparse_pairs_byte(eq, eq_r_dprime);
+    }
     use rayon::prelude::*;
     assert_eq!(eq_r_dprime.len(), 1 << LOG_PACKING);
     eq.live_tensor
@@ -2029,6 +2047,24 @@ pub fn fold_b128_elems_sparse_pairs(
                 acc += eq_r_dprime[64 | b];
                 hi &= hi - 1;
             }
+            // Scatter compact c → original index via per-byte LUT (inlined).
+            (eq.scatter_idx(c), acc)
+        })
+        .collect()
+}
+
+fn fold_b128_elems_sparse_pairs_byte(
+    eq: &SparseEqTensor,
+    eq_r_dprime: &[F128],
+) -> Vec<(usize, F128)> {
+    use rayon::prelude::*;
+    assert_eq!(eq_r_dprime.len(), 1 << LOG_PACKING);
+    let table = build_fold_byte_table(eq_r_dprime);
+    eq.live_tensor
+        .par_iter()
+        .enumerate()
+        .map(|(c, &tensor_val)| {
+            let acc = fold_one_slot(tensor_val, &table);
             // Scatter compact c → original index via per-byte LUT (inlined).
             (eq.scatter_idx(c), acc)
         })
@@ -2342,8 +2378,7 @@ pub fn s_hat_v_multi_padded(
     let mut dense_to_orig: Vec<usize> = Vec::new();
     for (orig, x) in x_outers.iter().enumerate() {
         let suffix = &x[1..];
-        let n_zeros = suffix.iter().filter(|&&c| c == F128::ZERO).count();
-        if n_zeros >= SPARSE_ZERO_THRESHOLD {
+        if boolean_coordinate_count(suffix) >= SPARSE_BOOLEAN_THRESHOLD {
             out[orig] = fold_1b_rows_sparse(packed_witness, &build_eq_sparse(suffix));
         } else {
             dense_to_orig.push(orig);
@@ -2459,7 +2494,7 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
         |orig: usize| -> bool { precomputed_s_hat_v.get(orig).copied().flatten().is_some() };
 
     // 1. Classify each claim. Claims whose suffix `x_outer[1..]` has at least
-    //    `SPARSE_ZERO_THRESHOLD` exactly-zero coords (e.g. the hash-chain
+    //    `SPARSE_BOOLEAN_THRESHOLD` Boolean coords (e.g. the hash-chain
     //    ẑ-claim) skip the dense kernels entirely; the rest fuse through the
     //    existing MFR/8-wide multi-fold. Pulling sparse claims out also
     //    restores k==2 (the MFR fast-path threshold in `fold_1b_rows_multi`)
@@ -2478,8 +2513,19 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
     let mut sparse_to_orig: Vec<usize> = Vec::new();
     for (orig, x) in x_outers.iter().enumerate() {
         let suffix = &x[1..];
-        let n_zeros = suffix.iter().filter(|&&c| c == F128::ZERO).count();
-        if n_zeros >= SPARSE_ZERO_THRESHOLD {
+        // The gather depends only on this suffix and the fixed witness.
+        // Reuse only computed claims: each caller-supplied precompute keeps
+        // its own slot even if it disagrees with another supplied value.
+        // Per-claim messages, observations and challenges below stay intact.
+        if !has_precomputed(orig) {
+            if let Some(previous) = (0..orig).find(|&previous| {
+                !has_precomputed(previous) && x_outers[previous][1..] == *suffix
+            }) {
+                kinds.push(kinds[previous]);
+                continue;
+            }
+        }
+        if boolean_coordinate_count(suffix) >= SPARSE_BOOLEAN_THRESHOLD {
             kinds.push(Kind::Sparse(sparse_suffixes.len()));
             sparse_to_orig.push(orig);
             sparse_suffixes.push(suffix);
@@ -2488,6 +2534,14 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
             dense_to_orig.push(orig);
             dense_suffixes.push(suffix);
         }
+    }
+
+    if trace {
+        let groups = dense_suffixes.len() + sparse_suffixes.len();
+        eprintln!(
+            "    [rs::prove_batched] gather groups: claims={}, groups={}, reused={}",
+            n, groups, n - groups,
+        );
     }
 
     // 2. Build suffix representations. Dense claims use the tensor-split
@@ -2667,11 +2721,7 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
                             fold_one_slot(F128::ONE, &build_fold_byte_table(&scaled_eq_r_dprime)),
                         )],
                     }
-                } else if effective
-                    .iter()
-                    .filter(|&&c| c == F128::ZERO)
-                    .count()
-                    >= SPARSE_ZERO_THRESHOLD
+                } else if boolean_coordinate_count(effective) >= SPARSE_BOOLEAN_THRESHOLD
                 {
                     let support = build_eq_sparse(effective);
                     let mut entries =
@@ -3864,6 +3914,89 @@ mod tests {
             // Support size = 2^live_count.
             let live_count = n_coords - zero_pos.len();
             assert_eq!(sparse_eq.len(), 1usize << live_count);
+        }
+    }
+
+    #[test]
+    fn sparse_boolean_support_matches_dense_folds() {
+        let mut rng = Rng::new(0xB001_EA11);
+        for n in [0, 1, 4, 8, 12] {
+            for pattern in 0..7 {
+                let coords: Vec<F128> = (0..n).map(|i| match pattern {
+                    1 => F128::ZERO,
+                    2 => F128::ONE,
+                    3 => if i % 2 == 0 { F128::ZERO } else { F128::ONE },
+                    4 if i % 3 == 0 => F128::ZERO,
+                    5 if i % 3 == 0 => F128::ONE,
+                    6 if i % 3 == 0 => F128::ZERO,
+                    6 if i % 3 == 1 => F128::ONE,
+                    _ => rng.f128(),
+                }).collect();
+                let dense = build_eq(&coords);
+                let sparse = build_eq_sparse(&coords);
+                let entries = sparse.materialize();
+                assert_eq!(sparse.len(), 1 << (n - boolean_coordinate_count(&coords)));
+                assert!(entries.windows(2).all(|w| w[0].0 < w[1].0));
+                let mut restored = vec![F128::ZERO; dense.len()];
+                for (index, value) in entries {
+                    assert_ne!(value, F128::ZERO);
+                    restored[index] = value;
+                }
+                assert_eq!(restored, dense, "n={n}, pattern={pattern}");
+                let witness: Vec<F128> = (0..dense.len()).map(|_| rng.f128()).collect();
+                assert_eq!(
+                    fold_1b_rows_sparse(&witness, &sparse),
+                    fold_1b_rows_naive(&witness, &dense),
+                    "witness fold n={n}, pattern={pattern}",
+                );
+                let weights: Vec<F128> = (0..128).map(|_| rng.f128()).collect();
+                assert_eq!(
+                    fold_b128_elems_sparse(dense.len(), &sparse, &weights),
+                    fold_b128_elems(&dense, &weights),
+                    "basis fold n={n}, pattern={pattern}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn boolean_sparse_batch_matches_dense_messages_and_transcript() {
+        use crate::challenger::FsChallenger;
+        let mut rng = Rng::new(0xB001_F5C0);
+        for m in [10, 14, 18] {
+            let z = rng.bits(1 << m);
+            let packed = pack_witness(&z, m);
+            let mut points: Vec<Vec<F128>> = (0..6)
+                .map(|_| (0..m - 6).map(|_| rng.f128()).collect())
+                .collect();
+            for i in [1, 3, 5].into_iter().filter(|&i| i < m - 6) {
+                points[2][i] = F128::ONE;
+            }
+            points[3][1..].fill(F128::ONE);
+            points[4][1..].fill(F128::ZERO);
+            for (i, coord) in points[5][1..].iter_mut().enumerate() {
+                if i % 3 == 0 { *coord = F128::ONE; }
+                if i % 3 == 1 { *coord = F128::ZERO; }
+            }
+            let mut reference = FsChallenger::new(b"boolean-sparse-batch");
+            let expected: Vec<_> = points.iter()
+                .map(|point| prove(&packed, point, &mut reference)).collect();
+            let gammas: Vec<F128> = (0..points.len()).map(|_| reference.sample_f128()).collect();
+            let refs: Vec<&[F128]> = points.iter().map(Vec::as_slice).collect();
+            let mut challenger = FsChallenger::new(b"boolean-sparse-batch");
+            let (actual, actual_gammas) = prove_batched(&packed, &refs, &mut challenger);
+            assert_eq!(gammas, actual_gammas);
+            assert_eq!(reference.sample_f128(), challenger.sample_f128());
+            let precomputed = s_hat_v_multi_padded(&packed, &refs, &PaddingSpec::dense(m));
+            for (i, ((proof, output), (want_proof, want_output))) in
+                actual.iter().zip(&expected).enumerate()
+            {
+                assert_eq!(proof, want_proof);
+                assert_eq!(precomputed[i], want_proof.s_hat_v);
+                assert_eq!(output.sumcheck_claim, want_output.sumcheck_claim);
+                assert_eq!(output.rs_eq_ind.to_dense(), want_output.rs_eq_ind.iter()
+                    .map(|&value| gammas[i] * value).collect::<Vec<_>>());
+            }
         }
     }
 

@@ -34,6 +34,8 @@ use super::hash_to_point_slots::{SLOTS, SlotSetup};
 const SLOT_VARS: usize = slots::SLOT_VARS;
 const COUNTER_BITS: usize = slots::COUNTER_BITS;
 
+mod compact_scatter;
+
 /// Convert one MSB-first `m`-variable opening point into flock's claim
 /// shape: the seven low-address-bit coordinates plus the `x_outer` vector
 /// (`[bit-6 coordinate, word suffix in flock's LSB-first order]`).
@@ -58,6 +60,15 @@ pub fn flock_claim_shape(point_msb: &[F128]) -> ([F128; 7], Vec<F128>) {
 /// (see `hash_to_point_sponge::gather_eval_many`; same exactness
 /// argument, direct bool reads).
 pub fn bit_mle_many(bits: &[bool], points: &[Vec<F128>]) -> Vec<F128> {
+    if cfg!(feature = "reference-gather") {
+        bit_mle_many_reference(bits, points)
+    } else {
+        super::packed_mle::evaluate_bits(bits, points)
+    }
+}
+
+/// Previous bool evaluator, retained as an exact differential oracle.
+pub fn bit_mle_many_reference(bits: &[bool], points: &[Vec<F128>]) -> Vec<F128> {
     use rayon::prelude::*;
     let vars = points.first().map_or(0, Vec::len);
     let mut split: Vec<(usize, Vec<(usize, F128)>)> = Vec::with_capacity(points.len());
@@ -443,10 +454,10 @@ fn frobenius(base: F128, bits: usize) -> Vec<F128> {
 
 /// Per-slot value bits from the committed wires: `a_c = x_c ^ M_c ^ b_c`
 /// with `M` from the quotient wires and `b` the borrow prefix parity.
-fn slot_residue_bits(z: &[bool], base: usize, slot: usize) -> [bool; 14] {
-    let word = |i: usize| z[base + slots::word_position(slot, i)];
-    let quotient = |i: usize| z[base + slots::quotient_position(slot, i)];
-    let borrow_product = |i: usize| z[base + slots::borrow_position(slot, i)];
+fn slot_residue_bits(bit_at: &impl Fn(usize) -> bool, base: usize, slot: usize) -> [bool; 14] {
+    let word = |i: usize| bit_at(base + slots::word_position(slot, i));
+    let quotient = |i: usize| bit_at(base + slots::quotient_position(slot, i));
+    let borrow_product = |i: usize| bit_at(base + slots::borrow_position(slot, i));
     let mut bits = [false; 14];
     let mut borrow = false;
     for (c, bit) in bits.iter_mut().enumerate() {
@@ -467,7 +478,7 @@ fn slot_residue_bits(z: &[bool], base: usize, slot: usize) -> [bool; 14] {
 /// counter factors (per-record prefix parity of the accept flags), and
 /// the gamma-combined value.
 fn record_factor_tables(
-    z: &[bool],
+    bit_at: impl Fn(usize) -> bool,
     record_vars: usize,
     beta: F128,
     gamma: F128,
@@ -508,21 +519,21 @@ fn record_factor_tables(
                 // tables ARE the verifier's opening reconstruction. The
                 // beta^(-1) shift moves to the binding identity.
                 for (bit, factor) in counter_factors.iter_mut().enumerate() {
-                    if z[base + slots::counter_position(slot, bit)] {
+                    if bit_at(base + slots::counter_position(slot, bit)) {
                         factor[index] = beta_powers[bit];
                     }
                 }
-                if z[base + slots::gate_position(slot)] {
+                if bit_at(base + slots::gate_position(slot)) {
                     gate[index] = F128::ONE;
                 }
-                let bits = slot_residue_bits(z, base, slot);
+                let bits = slot_residue_bits(&bit_at, base, slot);
                 let mut val = F128::ZERO;
                 for (c, &bit) in bits.iter().enumerate() {
                     if bit {
                         val += gamma_powers[c];
                     }
                 }
-                if z[base + slots::centering_position(slot)] {
+                if bit_at(base + slots::centering_position(slot)) {
                     val += gamma_powers[14];
                 }
                 value[index] = val;
@@ -607,8 +618,10 @@ pub struct RecordProof {
     pub opening_values: Vec<F128>,
     /// The spec-7.3 claim closure, when the opening was made with
     /// [`OpenMode::Closure`]: every multilinear claim collapses into
-    /// ONE opened claim. `None` on the default fused per-claim path.
+    /// ONE opened claim. `None` for both per-claim and complete-face modes.
     pub closure: Option<super::claim_closure::ClosureProof>,
+    /// Complete-face reduction, mutually exclusive with the dense closure.
+    pub face_closure: bool,
     /// `MLE_K(Z_H, r)` over the packed leaves at the fingerprint point:
     /// the theta-weighted sum of the fifteen fingerprint openings. The
     /// aerie tag equation consumes this.
@@ -821,10 +834,8 @@ pub fn prove_record_core<Ch: Challenger>(
 }
 
 /// The record lane's witness bundle, built before any transcript
-/// interaction: the bit witness (kept for the gather evaluators) and
-/// its packed form.
+/// interaction. The full-domain byte-per-bit copy is not retained.
 pub struct RecordWitness {
-    pub z: Vec<bool>,
     pub z_packed: Vec<F128>,
 }
 
@@ -836,9 +847,8 @@ pub fn record_witness(
     blocks: &[[u16; SLOTS]],
     masks: &[[bool; 128]; slots::MASK_REPS],
 ) -> RecordWitness {
-    let z = setup.generate_witness_with_masks(blocks, masks);
-    let z_packed = pcs::pack_witness(&z, setup.r1cs.m);
-    RecordWitness { z, z_packed }
+    let z_packed = setup.generate_packed_witness_with_masks(blocks, masks);
+    RecordWitness { z_packed }
 }
 
 /// [`prove_record_core`] with the consistency masks written into the
@@ -863,11 +873,8 @@ pub fn prove_record_core_with_masks<Ch: Challenger>(
     };
     // Witgen is block-parallel; the Z_H planes are written inside each
     // block's builder, so they are part of this lap by construction.
-    let z = setup.generate_witness_with_masks(blocks, masks);
-    lap("witgen (incl. Z_H planes)");
-    let z_packed = pcs::pack_witness(&z, setup.r1cs.m);
-    lap("pack witness");
-    let wit = RecordWitness { z, z_packed };
+    let wit = record_witness(setup, blocks, masks);
+    lap("packed witgen (incl. Z_H planes)");
     let (commitment, prover_data) = pcs::commit(&wit.z_packed, &setup.pcs_params);
     lap("commit");
     prove_record_core_bound(setup, wit, commitment, Some(prover_data), challenger)
@@ -900,7 +907,7 @@ pub fn prove_record_core_bound<Ch: Challenger>(
         }
         *stage = std::time::Instant::now();
     };
-    let RecordWitness { z, z_packed } = wit;
+    let RecordWitness { z_packed } = wit;
 
     bind_statement(challenger, r1cs, &commitment);
     lap("bind", &mut stage);
@@ -959,9 +966,13 @@ pub fn prove_record_core_bound<Ch: Challenger>(
     challenger.observe_label(b"aerie-record-fingerprint-v0");
     let r_fp = challenger.sample_f128_vec(record_vars + 9);
 
-    let factors = record_factor_tables(&z, record_vars, beta, gamma, delta);
+    let factors = compact_scatter::Factors::new(|address| {
+        let word = z_packed[address / 128];
+        let limb = if address % 128 < 64 { word.lo } else { word.hi };
+        limb >> (address % 64) & 1 != 0
+    }, record_vars, beta, gamma, delta);
     lap("factor tables", &mut stage);
-    let (scatter_proof, rs) = scatter::prove(factors, challenger);
+    let (scatter_proof, rs) = factors.prove(challenger);
     lap("scatter sumcheck", &mut stage);
 
     let points = multilinear_points(record_vars, &rs, &r_fp, beta, gamma, delta)
@@ -971,9 +982,16 @@ pub fn prove_record_core_bound<Ch: Challenger>(
     // candidates) — lapped separately so the S5 dividend is measurable.
     // The fingerprint points share the r_fp family, so splitting the
     // call keeps every intra-family tensor share.
-    let mut opening_values = bit_mle_many(&z, &points[..44]);
+    let evaluate = |points: &[Vec<F128>]| {
+        if cfg!(feature = "reference-gather") {
+            super::hash_to_point_sponge::gather_eval_many_reference(&z_packed, points)
+        } else {
+            super::packed_mle::evaluate_packed(&z_packed, points)
+        }
+    };
+    let mut opening_values = evaluate(&points[..44]);
     lap("opening values (scatter/discharge/Z_H)", &mut stage);
-    opening_values.extend(bit_mle_many(&z, &points[44..]));
+    opening_values.extend(evaluate(&points[44..]));
     lap("opening values (fingerprint)", &mut stage);
     let mut fingerprint_value = F128::ZERO;
     for c in 0..15 {
@@ -1005,9 +1023,10 @@ pub fn prove_record_core_bound<Ch: Challenger>(
 /// How the record lane binds its multilinear claims to the PCS.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OpenMode {
-    /// The DEFAULT: the fused per-claim ring-switch path. Host A/B
-    /// (2026-09-04): fastest prover at every measured size.
+    /// Reference path with one ring-switch instance per claim.
     Fused,
+    /// Merge complete Boolean faces without a witness-wide sumcheck.
+    Faces,
     /// The spec-7.3 claim closure: one opened claim, smaller wire
     /// (-25%) and faster verify (-45%), but the closure sumcheck's
     /// dense rounds cost more prover time than the fused folds save
@@ -1025,7 +1044,8 @@ pub fn open_record<Ch: Challenger>(
     extra_values: &[F128],
     challenger: &mut Ch,
 ) -> (RecordProof, pcs::ProverData) {
-    open_record_with(setup, core, extra_points, extra_values, OpenMode::Fused, challenger)
+    let mode = if cfg!(feature = "face-batching") { OpenMode::Faces } else { OpenMode::Fused };
+    open_record_with(setup, core, extra_points, extra_values, mode, challenger)
 }
 
 pub fn open_record_with<Ch: Challenger>(
@@ -1084,6 +1104,17 @@ pub fn open_record_with<Ch: Challenger>(
             x_fulls.push(x_outer);
             precomputed.push(None);
         }
+        OpenMode::Faces => {
+            let all_points: Vec<_> = core.points.iter().cloned().chain(extra_points.iter().cloned()).collect();
+            let all_values: Vec<_> = core.opening_values.iter().copied().chain(extra_values.iter().copied()).collect();
+            let closed = super::face_closure::close_faces(&all_points, &all_values, challenger).expect("valid face claims");
+            if trace { eprintln!("  [prove_record] face claims: {} -> {}", all_points.len(), closed.len()); }
+            for claim in &closed {
+                let (_, x_outer) = flock_claim_shape(&claim.point);
+                x_fulls.push(x_outer);
+                precomputed.push(None);
+            }
+        }
         OpenMode::Fused => {
             for p in core.points.iter().chain(extra_points) {
                 let (_low, x_outer) = flock_claim_shape(p);
@@ -1122,6 +1153,7 @@ pub fn open_record_with<Ch: Challenger>(
             scatter: core.scatter_proof,
             opening_values: core.opening_values,
             closure,
+            face_closure: mode == OpenMode::Faces,
             fingerprint_value: core.fingerprint_value,
             pcs_open,
         },
@@ -1291,6 +1323,9 @@ pub fn verify_record_open<Ch: Challenger>(
             v
         },
     ];
+    if proof.face_closure && proof.closure.is_some() {
+        return Err("conflicting record closure modes");
+    }
     if let Some(closure) = &proof.closure {
         // Spec-7.3 closure: verify the merge, open ONLY the closed claim.
         let all_points: Vec<Vec<F128>> = points
@@ -1311,8 +1346,17 @@ pub fn verify_record_open<Ch: Challenger>(
         let (x_low, x_outer) = flock_claim_shape(&closed_point);
         bindings.push(LowBinding::Multilinear { x_low });
         x_fulls.push(x_outer);
+    } else if proof.face_closure {
+        let all_points: Vec<_> = points.iter().cloned().chain(extra_points.iter().cloned()).collect();
+        let all_values: Vec<_> = proof.opening_values.iter().copied().chain(extra_values.iter().copied()).collect();
+        for claim in super::face_closure::close_faces(&all_points, &all_values, challenger)? {
+            claim_values.push(claim.value);
+            let (x_low, x_outer) = flock_claim_shape(&claim.point);
+            bindings.push(LowBinding::Multilinear { x_low });
+            x_fulls.push(x_outer);
+        }
     } else {
-        // The default fused per-claim path.
+        // The reference per-claim path.
         claim_values.extend_from_slice(&proof.opening_values);
         claim_values.extend_from_slice(extra_values);
         for p in points.iter().chain(extra_points) {
@@ -1326,6 +1370,9 @@ pub fn verify_record_open<Ch: Challenger>(
         .pcs_params
         .ligerito_verifier_config()
         .expect("verifier config");
+    if proof.pcs_open.ring_switches.len() != claim_values.len() {
+        return Err("opening shape does not match the selected reduction mode");
+    }
     pcs::verify_opening_batch_ligerito_mixed_bound(
         &proof.commitment,
         &claim_values,

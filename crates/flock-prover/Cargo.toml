@@ -7,9 +7,16 @@ authors.workspace = true
 description = "Apple-silicon-optimized end-to-end prover for Flock (R1CS over GF(2))."
 
 [features]
+# Complete-face opening reduction; use --no-default-features for the reference opening path.
+default = ["face-batching"]
 # Forwarded to flock-core. See that crate's manifest for semantics.
 hash-count = ["flock-core/hash-count"]
 unsound-challenger = ["flock-core/unsound-challenger"]
+# Differential/performance oracle for the exact packed gather optimization.
+# This changes only prover arithmetic, never the statement or proof format.
+reference-gather = []
+# Prover default only; verification always supports both opening modes.
+face-batching = []
 
 [dependencies]
 flock-core = { path = "../flock-core" }

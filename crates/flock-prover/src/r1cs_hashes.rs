@@ -15,6 +15,9 @@ pub mod blake3;
 pub mod chain_common;
 pub mod claim_closure;
 pub mod common;
+/// Exact packed bit-MLE evaluations, shared by the private-salt lanes.
+pub mod packed_mle;
+pub mod face_closure;
 /// The cross-lane word linkage plus the complete HashToPoint driver.
 pub mod hash_to_point_link;
 /// Record assembly for the aerie private-salt lane: real commitments and
@@ -34,6 +37,7 @@ pub mod keccak;
 /// for tighter PCS utilization (~97% vs the single encoder's ~65%).
 pub mod keccak3;
 pub mod keccak_gkr;
+pub mod carry_gate;
 /// Generic Merkle-path glue ([`MerkleLayout`]-parameterized prove/verify),
 /// analogous to [`chain_common`] but with a per-row bit selector.
 ///

@@ -256,7 +256,7 @@ fn interpolate(evals: &[F128], r: F128) -> F128 {
 /// Prove `claim = sum_s prod_f factors[f][s]` over a power-of-two domain,
 /// for any number of multilinear factors (round degree = factor count).
 pub fn prove<Ch: Challenger>(
-    mut factors: Vec<Vec<F128>>,
+    factors: Vec<Vec<F128>>,
     challenger: &mut Ch,
 ) -> (ScatterProof, Vec<F128>) {
     use rayon::prelude::*;
@@ -269,11 +269,44 @@ pub fn prove<Ch: Challenger>(
     challenger.observe_label(b"aerie-scatter-v0");
     challenger.observe_f128(claim);
 
-    let points: Vec<F128> = (0..=degree as u64).map(small).collect();
     let vars = factors[0].len().trailing_zeros() as usize;
     let mut rounds = Vec::with_capacity(vars);
     let mut point = Vec::with_capacity(vars);
-    let mut first_round = factors[0].len() > 1;
+    prove_remaining(factors, challenger, true, &mut rounds, &mut point);
+    (ScatterProof { claim, rounds }, point)
+}
+
+/// Evaluate an affine line at the field encodings of consecutive integers.
+/// Multiplication distributes over their binary basis, so only the non-unit
+/// basis nodes need field multiplications. The other nodes are XOR gathers.
+#[inline]
+fn affine_nodes(low: F128, high: F128, out: &mut [F128]) {
+    debug_assert!(!out.is_empty() && out.len() <= 32);
+    out[0] = low;
+    let diff = low + high;
+    let mut power = 1;
+    while power < out.len() {
+        let shift = if power == 1 { diff } else { diff * small(power as u64) };
+        for j in 0..power.min(out.len() - power) {
+            out[power + j] = out[j] + shift;
+        }
+        power *= 2;
+    }
+}
+
+/// Continue the identical round transcript after a caller's exact compact
+/// prefix. No new claim or protocol label is absorbed here.
+pub(crate) fn prove_remaining<Ch: Challenger>(
+    mut factors: Vec<Vec<F128>>,
+    challenger: &mut Ch,
+    mut first_round: bool,
+    rounds: &mut Vec<Vec<F128>>,
+    point: &mut Vec<F128>,
+) {
+    use rayon::prelude::*;
+    let degree = factors.len();
+    assert!(degree < 32);
+    let points: Vec<F128> = (0..=degree as u64).map(small).collect();
     while factors[0].len() > 1 {
         let half = factors[0].len() / 2;
         if first_round {
@@ -373,11 +406,20 @@ pub fn prove<Ch: Challenger>(
                 |mut acc, i| {
                     let mut terms = [F128::ONE; 32];
                     let terms = &mut terms[..degree + 1];
+                    let mut values = [F128::ZERO; 32];
+                    let values = &mut values[..degree + 1];
                     for factor in &factors {
                         let low = factor[i];
-                        let diff = low + factor[half + i];
-                        for (t, term) in terms.iter_mut().enumerate() {
-                            *term *= low + points[t] * diff;
+                        let high = factor[half + i];
+                        // A zero affine factor annihilates this pair at
+                        // every node. Padding gates stay zero through all
+                        // record-coordinate rounds, including dense rounds.
+                        if low == F128::ZERO && high == F128::ZERO {
+                            return acc;
+                        }
+                        affine_nodes(low, high, values);
+                        for (term, &value) in terms.iter_mut().zip(values.iter()) {
+                            *term *= value;
                         }
                     }
                     for (t, term) in terms.iter().enumerate() {
@@ -407,7 +449,6 @@ pub fn prove<Ch: Challenger>(
         rounds.push(evals);
         point.push(challenge);
     }
-    (ScatterProof { claim, rounds }, point)
 }
 
 /// Verify the round messages for a `degree`-factor, `vars`-variable
@@ -657,6 +698,20 @@ mod tests {
     use flock_core::challenger::FsChallenger;
 
     use super::super::hash_to_point_slots::build_block_witness;
+    #[test]
+    fn affine_nodes_match_distinct_field_encodings() {
+        for low in [F128::ZERO, F128::ONE, F128 { lo: 0x98765432, hi: 0xabcdef89 }] {
+            for high in [F128::ZERO, F128::ONE, F128 { lo: 0xfedcba98, hi: 0x87654321 }] {
+                for len in 1..=32 {
+                    let mut values = vec![F128::ZERO; len];
+                    affine_nodes(low, high, &mut values);
+                    for (node, value) in values.into_iter().enumerate() {
+                        assert_eq!(value, low + small(node as u64) * (low + high));
+                    }
+                }
+            }
+        }
+    }
     use super::*;
 
     fn record() -> ([u16; SLOTS], Vec<bool>) {

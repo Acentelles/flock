@@ -1,5 +1,7 @@
 use super::super::{F8, F128, InvNttTableByteSingleGf8, N_CHUNKS};
 
+mod nibble;
+
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
 pub(crate) unsafe fn accumulate_convert(
@@ -189,7 +191,7 @@ pub(crate) fn shift_reduce_inner_ab_neon(
     a_col: &mut [F8],
     b_col: &mut [F8],
 ) {
-    use crate::field::gf2_8::neon::{gf8_mul_vec16, gf8_reduce_vec16};
+    use self::nibble::{gf8_mul_vec16, gf8_reduce_vec16};
     use core::arch::aarch64::*;
 
     let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
@@ -338,7 +340,7 @@ unsafe fn fused_apply_one_k<const K: i32>(
     acc3_lo: &mut core::arch::aarch64::uint16x8_t,
     acc3_hi: &mut core::arch::aarch64::uint16x8_t,
 ) {
-    use crate::field::gf2_8::neon::gf8_mul_vec16;
+    use self::nibble::gf8_mul_vec16;
     use core::arch::aarch64::*;
     unsafe {
         // b = 0: identity permutation — plain load of the 4 chunks.
@@ -474,7 +476,7 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon(
     b_med: usize,
     out: &mut [u8; 64],
 ) {
-    use crate::field::gf2_8::neon::gf8_reduce_vec16;
+    use self::nibble::gf8_reduce_vec16;
     use core::arch::aarch64::*;
 
     let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;

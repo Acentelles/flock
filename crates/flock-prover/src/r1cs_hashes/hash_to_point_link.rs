@@ -1099,6 +1099,15 @@ mod tests {
         verify_hash_to_point(&sponge_setup, &slot_setup, &publics, &proof, &mut verifier)
             .expect("the full HashToPoint proof verifies");
 
+        // The opening mode is authenticated by its reduction transcript.
+        for sponge_mode in [true, false] {
+            let mut wrong = proof.clone();
+            if sponge_mode { wrong.sponge.face_closure = !wrong.sponge.face_closure; }
+            else { wrong.record.face_closure = !wrong.record.face_closure; }
+            let mut fresh = FsChallenger::new(b"aerie-hash-to-point");
+            assert!(verify_hash_to_point(&sponge_setup, &slot_setup, &publics, &wrong, &mut fresh).is_err());
+        }
+
         // A tampered linkage value rejects.
         let mut wrong = proof.clone();
         wrong.link.slot_values[3] += F128::ONE;
