@@ -776,6 +776,23 @@ pub fn fold_and_compute_round_pair_optimized(
     (a_new, b_new, m1, mi)
 }
 
+/// Two independent GHASH products in one call. On aarch64 with PMULL this is
+/// the existing two-lane NEON kernel (`ghash_mul_vec2_neon`); elsewhere two
+/// scalar products. Every path computes the same field elements, so the
+/// message bytes are unchanged (V27 paired-products port).
+#[inline(always)]
+fn mul2(a: [F128; 2], b: [F128; 2]) -> [F128; 2] {
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    {
+        // SAFETY: the aes target feature (PMULL) is guaranteed by the cfg gate.
+        unsafe { crate::field::gf2_128::aarch64::ghash_mul_vec2_neon(a, b) }
+    }
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+    {
+        [a[0] * b[0], a[1] * b[1]]
+    }
+}
+
 /// Buffer-reusing variant of [`fold_and_compute_round_pair_optimized`]: writes
 /// the folded `a`/`b` into the caller-provided `a_out`/`b_out` (each length
 /// `a.len() / 2`) instead of allocating. Returns `(r_next[0] · G(1), G(∞))`.
@@ -888,15 +905,14 @@ pub fn fold_and_compute_round_pair_into(
                         let b0_d = b_out[o + 6];
                         let b1_d = b_out[o + 7];
 
-                        // 8 reduced msg muls (g1 = a1·b1, g_inf = (a0+a1)(b0+b1)).
-                        let g1_a = a1_a * b1_a;
-                        let g1_b = a1_b * b1_b;
-                        let g1_c = a1_c * b1_c;
-                        let g1_d = a1_d * b1_d;
-                        let g_inf_a = (a0_a + a1_a) * (b0_a + b1_a);
-                        let g_inf_b = (a0_b + a1_b) * (b0_b + b1_b);
-                        let g_inf_c = (a0_c + a1_c) * (b0_c + b1_c);
-                        let g_inf_d = (a0_d + a1_d) * (b0_d + b1_d);
+                        // 8 reduced msg muls (g1 = a1·b1, g_inf = (a0+a1)(b0+b1)),
+                        // issued as four two-lane products.
+                        let [g1_a, g1_b] = mul2([a1_a, a1_b], [b1_a, b1_b]);
+                        let [g1_c, g1_d] = mul2([a1_c, a1_d], [b1_c, b1_d]);
+                        let [g_inf_a, g_inf_b] =
+                            mul2([a0_a + a1_a, a0_b + a1_b], [b0_a + b1_a, b0_b + b1_b]);
+                        let [g_inf_c, g_inf_d] =
+                            mul2([a0_c + a1_c, a0_d + a1_d], [b0_c + b1_c, b0_d + b1_d]);
                         // Deferred-reduction accumulate: on x86 widen all 8 products
                         // 4 lanes at a time (eq_lo[x_lo_a..x_lo_a+4] is contiguous),
                         // reduced once after the loop; else scalar mul_unreduced.
@@ -953,10 +969,9 @@ pub fn fold_and_compute_round_pair_into(
 
                     let eq_l_a = eq_lo[x_lo_a];
                     let eq_l_b = eq_lo[x_lo_b];
-                    let g1_a = a1_a * b1_a;
-                    let g1_b = a1_b * b1_b;
-                    let g_inf_a = (a0_a + a1_a) * (b0_a + b1_a);
-                    let g_inf_b = (a0_b + a1_b) * (b0_b + b1_b);
+                    let [g1_a, g1_b] = mul2([a1_a, a1_b], [b1_a, b1_b]);
+                    let [g_inf_a, g_inf_b] =
+                        mul2([a0_a + a1_a, a0_b + a1_b], [b0_a + b1_a, b0_b + b1_b]);
                     p1_acc ^= eq_l_a.mul_unreduced(g1_a);
                     p1_acc ^= eq_l_b.mul_unreduced(g1_b);
                     pinf_acc ^= eq_l_a.mul_unreduced(g_inf_a);
