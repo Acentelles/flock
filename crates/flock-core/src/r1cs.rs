@@ -9,6 +9,8 @@
 //! boolean (`k = 2^k_log`). `C_0 = I_k` is implicit (we still carry the
 //! materialized `c_0` matrix for utilities like `satisfies`).
 
+mod word_apply;
+
 /// Sparse boolean matrix. `rows[i]` lists the column indices where the entry is 1.
 #[derive(Clone, Debug)]
 pub struct SparseBinaryMatrix {
@@ -429,6 +431,15 @@ pub fn apply_block_diag_packed(
     let n_outer = 1usize << (m - k_log);
 
     let mut out = vec![F128::ZERO; n_packed];
+
+    // Compile only compressible matrices. This reads public wiring each
+    // time and applies to every witness, including malformed witnesses.
+    if k_log >= 7 {
+        if let Some(program) = word_apply::Program::new(m_0) {
+            program.apply(z_packed, &mut out);
+            return out;
+        }
+    }
 
     if k_log >= 7 {
         // Fast path: flatten the matrix to CSR once (one pass over the
