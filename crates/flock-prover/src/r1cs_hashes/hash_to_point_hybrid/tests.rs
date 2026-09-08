@@ -210,28 +210,74 @@ fn hybrid_optional_stripes_and_inplace_assembly_preserve_witness() {
 
 #[test]
 fn hybrid_inplace_assembly_matches_reference_on_arbitrary_bits() {
-    let setup = Setup::new(8);
-    let mut ch = FsChallenger::new(b"hybrid-arbitrary-relocation-v1");
-    let sp = sponge::SpongeWitness {
-        z_packed: ch.sample_f128_vec(8 * layout::K / 128),
-        a_packed: ch.sample_f128_vec(8 * layout::K / 128),
-        b_packed: ch.sample_f128_vec(8 * layout::K / 128),
-        z_lincheck: vec![5; 64],
-        all_words: vec![],
+    for (records, irregular) in [(8, false), (32, false), (8, true)] {
+        let mut setup = Setup::new(records);
+        if irregular {
+            // Keep the general matrix fallback correct, without relying on an
+            // honest record or an all-one constant wire.
+            setup.slots.r1cs.a_0.rows = (0..slots::K)
+                .map(|row| vec![(row * 40503 + 17) % slots::K])
+                .collect();
+            assert!(flock_core::r1cs::word_apply::Program::new(&setup.slots.r1cs.a_0).is_none());
+        }
+        assert_eq!(
+            flock_core::r1cs::word_apply::Program::new(&setup.slots.r1cs.a_0).is_some()
+                && flock_core::r1cs::word_apply::Program::new(&setup.slots.r1cs.b_0).is_some(),
+            !irregular
+        );
+        let mut ch = FsChallenger::new(b"hybrid-arbitrary-relocation-v1");
+        let sp = sponge::SpongeWitness {
+            z_packed: ch.sample_f128_vec(records * layout::K / 128),
+            a_packed: ch.sample_f128_vec(records * layout::K / 128),
+            b_packed: ch.sample_f128_vec(records * layout::K / 128),
+            z_lincheck: vec![5; 64],
+            all_words: vec![],
+        };
+        let copied = sponge::SpongeWitness {
+            z_packed: sp.z_packed.clone(),
+            a_packed: sp.a_packed.clone(),
+            b_packed: sp.b_packed.clone(),
+            z_lincheck: vec![],
+            all_words: vec![],
+        };
+        let record = ch.sample_f128_vec(records * slots::K / 128);
+        // Arbitrary high and padding bits exercise every copied limb. Word-copy
+        // A rows must still come from SHAKE even when slot input bits disagree.
+        let expected = circuit::assemble_reference(&setup, sp, record.clone());
+        let got = assemble(&setup, copied, record);
+        assert_eq!(got.z, expected.z);
+        assert_eq!(got.a, expected.a);
+        assert_eq!(got.b, expected.b);
+    }
+}
+
+#[test]
+fn hybrid_packed_word_rows_preserve_endianness_boundaries_and_padding() {
+    let mut ch = FsChallenger::new(b"hybrid-packed-copy-rows-v1");
+    let initial = ch.sample_f128_vec(layout::K / 128);
+    let check = |z: &[F128]| {
+        let mut expected = initial.clone();
+        for slot in 0..slots::SLOTS {
+            for bit in 0..16 {
+                layout::set_bit(
+                    &mut expected,
+                    layout::record_position(slots::word_position(slot, bit)).unwrap(),
+                    layout::bit(z, layout::word_source(slot, bit)),
+                );
+            }
+        }
+        let mut actual = initial.clone();
+        circuit::copy_word_rows(z, &mut actual);
+        assert_eq!(actual, expected);
     };
-    let copied = sponge::SpongeWitness {
-        z_packed: sp.z_packed.clone(),
-        a_packed: sp.a_packed.clone(),
-        b_packed: sp.b_packed.clone(),
-        z_lincheck: vec![],
-        all_words: vec![],
-    };
-    let record = ch.sample_f128_vec(8 * slots::K / 128);
-    // Arbitrary high and padding bits exercise every copied limb. Word-copy
-    // A rows must still come from SHAKE even when slot input bits disagree.
-    let expected = circuit::assemble_reference(&setup, sp, record.clone());
-    let got = assemble(&setup, copied, record);
-    assert_eq!(got.z, expected.z);
-    assert_eq!(got.a, expected.a);
-    assert_eq!(got.b, expected.b);
+    check(&ch.sample_f128_vec(layout::K / 128));
+    // Basis bits exercise byte order, packet and rate-block transitions,
+    // compact record segment transitions, and the final four-word packet.
+    for slot in [0, 3, 7, 8, 63, 64, 67, 68, 255, 256, 511, 512, 608, 611] {
+        for bit in 0..16 {
+            let mut z = vec![F128::ZERO; layout::K / 128];
+            layout::set_bit(&mut z, layout::word_source(slot, bit), true);
+            check(&z);
+        }
+    }
 }

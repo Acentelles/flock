@@ -42,12 +42,13 @@ impl Term {
     }
 }
 
-pub(super) struct Program {
+/// Exact packed operations compiled from public sparse matrix wiring.
+pub struct Program {
     rows: Vec<Vec<Term>>,
 }
 
 impl Program {
-    pub(super) fn new(matrix: &SparseBinaryMatrix) -> Option<Self> {
+    pub fn new(matrix: &SparseBinaryMatrix) -> Option<Self> {
         if matrix.num_rows != matrix.num_cols
             || matrix.rows.len() != matrix.num_rows
             || !matrix.num_rows.is_multiple_of(128)
@@ -112,29 +113,30 @@ impl Program {
         Some(Self { rows })
     }
 
-    pub(super) fn apply(&self, input: &[F128], output: &mut [F128]) {
+    /// Overwrite one block without allocating or entering a parallel iterator.
+    /// Callers may reuse worker-local output storage across independent records.
+    pub fn apply_block(&self, input: &[F128], output: &mut [F128]) {
+        assert_eq!(input.len(), self.rows.len());
+        assert_eq!(output.len(), self.rows.len());
+        for (out, terms) in output.iter_mut().zip(&self.rows) {
+            let value = terms
+                .iter()
+                .fold(0u128, |sum, term| sum ^ term.evaluate(input));
+            *out = F128 {
+                lo: value as u64,
+                hi: (value >> 64) as u64,
+            };
+        }
+    }
+
+    pub fn apply(&self, input: &[F128], output: &mut [F128]) {
         assert_eq!(input.len(), output.len());
         let width = self.rows.len();
         assert!(width != 0 && input.len().is_multiple_of(width));
         output
             .par_chunks_mut(width)
             .zip(input.par_chunks(width))
-            .for_each(|(out, input)| {
-                for (out, terms) in out.iter_mut().zip(&self.rows) {
-                    let value = terms
-                        .iter()
-                        .fold(0u128, |sum, term| sum ^ term.evaluate(input));
-                    *out = F128 {
-                        lo: value as u64,
-                        hi: (value >> 64) as u64,
-                    };
-                }
-            });
-    }
-
-    #[cfg(test)]
-    pub(super) fn operations(&self) -> usize {
-        self.rows.iter().map(Vec::len).sum()
+            .for_each(|(out, input)| self.apply_block(input, out));
     }
 }
 
