@@ -802,12 +802,29 @@ pub fn pack_z_lincheck_from_packed(
     // every k-byte stripe exactly once. Saves ~10 ms of sequential
     // zero-fill at m=29 (64 MB byte buffer) on the main thread.
     let mut z_packed: Vec<u8> = crate::alloc_uninit_vec(n_total / 8);
-    // Each stripe (byte_idx) writes a disjoint k-byte chunk — process them in
-    // parallel. Inside one stripe, k independent output bytes.
+    // Each stripe transposes eight records. Reuse the same 8-by-64-bit
+    // kernel as the direct hash witness builders instead of extracting each
+    // bit separately. Record domains of at least 128 bits are word-aligned.
+    // The shared kernel views u64 lanes as little-endian bytes; keep the
+    // scalar path for other endianness and sub-word test domains.
     z_packed
         .par_chunks_mut(k)
         .enumerate()
         .for_each(|(byte_idx, chunk)| {
+            if k_log >= 7 && cfg!(target_endian = "little") {
+                let words_per_record = k / 128;
+                let start = byte_idx * 8 * words_per_record;
+                let rows: [&[F128]; 8] = std::array::from_fn(|r| {
+                    &z_packed_f128[start + r * words_per_record..start + (r + 1) * words_per_record]
+                });
+                for (word, out) in chunk.chunks_exact_mut(128).enumerate() {
+                    let low = std::array::from_fn(|r| rows[r][word].lo);
+                    let high = std::array::from_fn(|r| rows[r][word].hi);
+                    crate::bits::transpose_8_u64s_to_64_bytes(&low, &mut out[..64]);
+                    crate::bits::transpose_8_u64s_to_64_bytes(&high, &mut out[64..]);
+                }
+                return;
+            }
             for i_inner in 0..k {
                 let mut byte = 0u8;
                 for r in 0..8 {
@@ -1544,6 +1561,57 @@ pub fn verify<Ch: Challenger>(
 mod tests {
     use super::*;
     use crate::challenger::FsChallenger;
+
+    #[test]
+    fn packed_stripes_match_boolean_oracle_across_domains() {
+        let mut rng = Rng::new(0x5754_5249_5045);
+        // Sub-word fallback, first full word, several words and the actual
+        // record/hybrid inner dimensions; multiple outer stripe counts.
+        for (k_log, outer_log) in [(0, 7), (3, 4), (6, 3), (7, 3), (8, 5), (17, 4), (19, 3)] {
+            let m = k_log + outer_log;
+            for pattern in 0..4 {
+                let words: Vec<_> = (0..1 << (m - 7))
+                    .map(|i| match pattern {
+                        0 => F128::ZERO,
+                        1 => F128::new(u64::MAX, u64::MAX),
+                        2 => F128::new(0x0123_4567_89ab_cdef ^ i as u64, 1 << (i % 64)),
+                        _ => rng.f128(),
+                    })
+                    .collect();
+                let bits: Vec<_> = (0..1 << m)
+                    .map(|i| {
+                        let word = words[i / 128];
+                        let limb = if i % 128 < 64 { word.lo } else { word.hi };
+                        (limb >> (i % 64)) & 1 != 0
+                    })
+                    .collect();
+                assert_eq!(
+                    pack_z_lincheck_from_packed(&words, m, k_log),
+                    pack_z_lincheck(&bits, m, k_log),
+                    "k_log={k_log}, outer_log={outer_log}, pattern={pattern}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn packed_stripes_preserve_every_basis_bit() {
+        // Exhaust every bit in eight 128-bit records. In particular, catch
+        // swapped u64 halves, byte order, record order and transpose axes.
+        for record in 0..8 {
+            for bit in 0..128 {
+                let mut words = vec![F128::ZERO; 8];
+                if bit < 64 {
+                    words[record].lo = 1 << bit;
+                } else {
+                    words[record].hi = 1 << (bit - 64);
+                }
+                let mut expected = vec![0; 128];
+                expected[bit] = 1 << record;
+                assert_eq!(pack_z_lincheck_from_packed(&words, 10, 7), expected);
+            }
+        }
+    }
 
     /// SplitMix64 PRNG, deterministic.
     struct Rng(u64);

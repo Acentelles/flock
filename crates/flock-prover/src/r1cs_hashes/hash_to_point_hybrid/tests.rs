@@ -135,3 +135,27 @@ fn hybrid_relocation_matches_original_witness() {
         evaluations(&w.z[..layout::K / 128], &flatten(&points, sponge_fragments));
     assert_eq!(relocated, sponge::gather_eval_many(&old_sponge, &points));
 }
+
+#[test]
+fn hybrid_stripe_optimization_preserves_complete_proof() {
+    let inputs = fixtures(32);
+    let setup = Setup::new(inputs.len());
+    let run = |reference| {
+        let prepared = commit(&setup, witness(&setup, &inputs));
+        let mut ch = FsChallenger::new(b"hybrid-stripes-proof-identity-v1");
+        let core = prove_core_with_packer(&setup, prepared, &mut ch, |z, m, k_log| {
+            if reference {
+                // Independent logical Boolean oracle, including every
+                // padding bit. The complete proof and replay state must
+                // remain identical, beyond just the local byte layout.
+                let bits: Vec<_> = (0..1 << m).map(|p| layout::bit(z, p)).collect();
+                lincheck::pack_z_lincheck(&bits, m, k_log)
+            } else {
+                lincheck::pack_z_lincheck_from_packed(z, m, k_log)
+            }
+        });
+        let proof = open(&setup, core, &mut ch);
+        (bincode::serialize(&proof).unwrap(), ch.sample_f128())
+    };
+    assert_eq!(run(false), run(true));
+}

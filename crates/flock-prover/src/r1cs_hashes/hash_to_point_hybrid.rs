@@ -24,6 +24,7 @@ pub struct Prepared {
     pub data: pcs::ProverData,
 }
 pub fn commit(setup: &Setup, witness: Witness) -> Prepared {
+    let _span = tracing::info_span!("hybrid.commit").entered();
     let (commitment, data) = pcs::commit(&witness.z, &setup.params);
     Prepared {
         witness,
@@ -61,6 +62,7 @@ fn flatten(points: &[Vec<F128>], relocate: fn(&[F128]) -> Vec<Fragment>) -> Vec<
 }
 fn evaluations(z: &[F128], groups: &[Vec<Fragment>]) -> (Vec<F128>, Vec<Vec<F128>>, Vec<F128>) {
     let points: Vec<_> = groups.iter().flatten().map(|f| f.point.clone()).collect();
+    let _span = tracing::info_span!("hybrid.fragment_evaluations", claims = points.len()).entered();
     let values = sponge::gather_eval_many(z, &points);
     let mut i = 0;
     let original = groups
@@ -77,13 +79,25 @@ fn evaluations(z: &[F128], groups: &[Vec<Fragment>]) -> (Vec<F128>, Vec<Vec<F128
 }
 
 pub fn prove_core<Ch: Challenger>(setup: &Setup, prepared: Prepared, ch: &mut Ch) -> Core {
+    prove_core_with_packer(setup, prepared, ch, lincheck::pack_z_lincheck_from_packed)
+}
+
+fn prove_core_with_packer<Ch: Challenger>(
+    setup: &Setup,
+    prepared: Prepared,
+    ch: &mut Ch,
+    pack: impl FnOnce(&[F128], usize, usize) -> Vec<u8>,
+) -> Core {
     setup.bind(ch);
     let Prepared {
         witness: Witness { z, a, b },
         commitment,
         data,
     } = prepared;
-    let stripes = lincheck::pack_z_lincheck_from_packed(&z, setup.r1cs.m, layout::K_LOG);
+    let stripe_span = tracing::info_span!("hybrid.lincheck_stripes").entered();
+    let stripes = pack(&z, setup.r1cs.m, layout::K_LOG);
+    drop(stripe_span);
+    let fast_span = tracing::info_span!("hybrid.zerocheck_lincheck").entered();
     let fast = crate::prover::prove_fast_core_bound(
         &setup.r1cs,
         z,
@@ -95,10 +109,14 @@ pub fn prove_core<Ch: Challenger>(setup: &Setup, prepared: Prepared, ch: &mut Ch
         Some(data),
         ch,
     );
+    drop(fast_span);
     let sp = sponge::sponge_relation_points(setup.record_vars(), ch);
+    let sponge_span = tracing::info_span!("hybrid.sponge_relation").entered();
     let (sponge_values, points, values) =
         evaluations(&fast.z_packed, &flatten(&sp, sponge_fragments));
+    drop(sponge_span);
     let claims = std::cell::RefCell::new((points, values));
+    let record_span = tracing::info_span!("hybrid.record_relation").entered();
     let relation = record::prove_record_relation(
         setup.record_vars(),
         |p| {
@@ -119,6 +137,7 @@ pub fn prove_core<Ch: Challenger>(setup: &Setup, prepared: Prepared, ch: &mut Ch
         },
         ch,
     );
+    drop(record_span);
     let (points, values) = claims.into_inner();
     Core {
         fast,
@@ -143,8 +162,12 @@ fn quirky_suffix(claim: &ZClaim) -> Vec<F128> {
 }
 
 pub fn open<Ch: Challenger>(setup: &Setup, core: Core, ch: &mut Ch) -> Proof {
+    let face_span =
+        tracing::info_span!("hybrid.face_closure", claims = core.points.len()).entered();
     let closed = super::face_closure::close_faces(&core.points, &core.values, ch)
         .expect("hybrid face closure");
+    drop(face_span);
+    let _span = tracing::info_span!("hybrid.pcs_open", claims = closed.len() + 2).entered();
     let mut suffix = vec![quirky_suffix(&core.fast.ab), quirky_suffix(&core.fast.c)];
     suffix.extend(closed.iter().map(|c| record::flock_claim_shape(&c.point).1));
     let refs: Vec<_> = suffix.iter().map(Vec::as_slice).collect();

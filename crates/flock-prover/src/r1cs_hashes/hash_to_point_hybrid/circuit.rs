@@ -140,11 +140,15 @@ pub struct Witness {
 /// Move original packed witnesses into one compact domain. A/B are actual
 /// gate products, including the new cross-circuit word-copy rows.
 pub fn assemble(setup: &Setup, sponge: sponge::SpongeWitness, record: Vec<F128>) -> Witness {
+    let _span = tracing::info_span!("hybrid.assemble").entered();
     let records = 1 << setup.record_vars();
     assert_eq!(sponge.z_packed.len(), records * K / 128);
     assert_eq!(record.len(), records * slots::K / 128);
+    let apply_span = tracing::info_span!("hybrid.record_apply_ab").entered();
     let record_a = setup.slots.r1cs.apply_a_packed(&record);
     let record_b = setup.slots.r1cs.apply_b_packed(&record);
+    drop(apply_span);
+    let _span = tracing::info_span!("hybrid.relocate_witness").entered();
     let mut z = vec![F128::ZERO; records * K / 128];
     let mut a = z.clone();
     let mut b = z.clone();
