@@ -26,6 +26,55 @@ fn witness(setup: &Setup, inputs: &[sponge::SpongeRecord]) -> Witness {
     assemble(setup, sp, rp.z_packed)
 }
 
+#[test]
+fn hybrid_content_point_hook_preserves_full_proof_and_transcript() {
+    let inputs = fixtures(32);
+    let setup = Setup::new(32);
+    let publics: Vec<_> = inputs
+        .iter()
+        .map(|r| sponge::SpongePublic {
+            hpk: r.hpk,
+            message: r.message.clone(),
+        })
+        .collect();
+    let mut reference_ch = FsChallenger::new(b"hybrid-content-point-hook");
+    let reference_core = prove_core(
+        &setup,
+        commit(&setup, witness(&setup, &inputs)),
+        &mut reference_ch,
+    );
+    let expected_point = reference_core.r_fp.clone();
+    let reference = open(&setup, reference_core, &mut reference_ch);
+    let reference_bytes = bincode::serialize(&reference).unwrap();
+    let expected_next = reference_ch.sample_f128();
+    for packed_record in [false, true] {
+        let mut ch = FsChallenger::new(b"hybrid-content-point-hook");
+        let mut calls = 0;
+        let mut point_seen = Vec::new();
+        let core = prove_core_with_point_hook(
+            &setup,
+            commit(&setup, witness(&setup, &inputs)),
+            packed_record,
+            Default::default(),
+            &mut ch,
+            |point| {
+                calls += 1;
+                point_seen = point.to_vec();
+            },
+        );
+        assert_eq!(calls, 1);
+        assert_eq!(point_seen, expected_point);
+        assert_eq!(point_seen, core.r_fp);
+        let proof = open(&setup, core, &mut ch);
+        assert_eq!(bincode::serialize(&proof).unwrap(), reference_bytes);
+        assert_eq!(ch.sample_f128(), expected_next);
+        let mut verifier = FsChallenger::new(b"hybrid-content-point-hook");
+        let core = verify_core(&setup, &publics, &proof, &mut verifier).unwrap();
+        verify_open(&setup, &proof, core, &mut verifier).unwrap();
+        assert_eq!(verifier.sample_f128(), expected_next);
+    }
+}
+
 pub(super) fn direct_witness(setup: &Setup, inputs: &[sponge::SpongeRecord]) -> Witness {
     let sp = compact_sponge_witness(setup, inputs);
     let blocks: Vec<[u16; slots::SLOTS]> = sp

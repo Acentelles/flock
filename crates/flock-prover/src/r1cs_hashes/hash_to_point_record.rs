@@ -1496,6 +1496,18 @@ pub fn prove_record_relation<Ch: Challenger>(
     evaluate: impl Fn(&[Vec<F128>]) -> Vec<F128>,
     challenger: &mut Ch,
 ) -> RecordRelation {
+    prove_record_relation_with_point_hook(record_vars, read_bit, evaluate, challenger, |_| {})
+}
+
+/// Expose the already-sampled content point for deterministic preparation.
+/// The hook receives no transcript and runs before constructing scatter factors.
+pub fn prove_record_relation_with_point_hook<Ch: Challenger>(
+    record_vars: usize,
+    read_bit: impl Fn(usize) -> bool + Sync,
+    evaluate: impl Fn(&[Vec<F128>]) -> Vec<F128>,
+    challenger: &mut Ch,
+    on_point: impl FnOnce(&[F128]),
+) -> RecordRelation {
     prove_record_relation_with_factors(
         record_vars,
         |beta, gamma, delta| {
@@ -1503,6 +1515,7 @@ pub fn prove_record_relation<Ch: Challenger>(
         },
         evaluate,
         challenger,
+        on_point,
     )
 }
 
@@ -1514,6 +1527,23 @@ pub fn prove_record_relation_packed<Ch: Challenger>(
     evaluate: impl Fn(&[Vec<F128>]) -> Vec<F128>,
     challenger: &mut Ch,
 ) -> RecordRelation {
+    prove_record_relation_packed_with_point_hook(
+        record_vars,
+        read_word,
+        evaluate,
+        challenger,
+        |_| {},
+    )
+}
+
+/// Packed counterpart of [`prove_record_relation_with_point_hook`].
+pub fn prove_record_relation_packed_with_point_hook<Ch: Challenger>(
+    record_vars: usize,
+    read_word: impl Fn(usize) -> u64 + Sync,
+    evaluate: impl Fn(&[Vec<F128>]) -> Vec<F128>,
+    challenger: &mut Ch,
+    on_point: impl FnOnce(&[F128]),
+) -> RecordRelation {
     prove_record_relation_with_factors(
         record_vars,
         |beta, gamma, delta| {
@@ -1521,6 +1551,7 @@ pub fn prove_record_relation_packed<Ch: Challenger>(
         },
         evaluate,
         challenger,
+        on_point,
     )
 }
 
@@ -1529,6 +1560,7 @@ fn prove_record_relation_with_factors<Ch: Challenger>(
     factors: impl FnOnce(F128, F128, F128) -> compact_scatter::Factors,
     evaluate: impl Fn(&[Vec<F128>]) -> Vec<F128>,
     challenger: &mut Ch,
+    on_point: impl FnOnce(&[F128]),
 ) -> RecordRelation {
     // Scatter challenges, post-commitment and post-R1CS.
     challenger.observe_label(b"aerie-record-scatter-challenges-v0");
@@ -1542,6 +1574,7 @@ fn prove_record_relation_with_factors<Ch: Challenger>(
     challenger.observe_label(b"aerie-record-fingerprint-v0");
     let r_fp = challenger.sample_f128_vec(record_vars + 9);
 
+    on_point(&r_fp);
     let factors = factors(beta, gamma, delta);
     let (scatter_proof, rs) = factors.prove(challenger);
 

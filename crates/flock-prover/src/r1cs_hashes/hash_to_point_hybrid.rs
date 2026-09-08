@@ -126,6 +126,7 @@ fn prove_core_with_packer_and_record<Ch: Challenger>(
         pack,
         packed_record,
         flock_core::zerocheck::ProverOptions::default(),
+        |_| {},
     )
 }
 
@@ -144,6 +145,29 @@ pub fn prove_core_with_zerocheck_options<Ch: Challenger>(
         lincheck::pack_z_lincheck_from_packed,
         packed_record,
         options,
+        |_| {},
+    )
+}
+
+/// Same core and transcript, with a read-only callback at the sampled content point.
+/// Callers may start deterministic preparation; proof challenges still require
+/// the completed core transcript returned through `ch`.
+pub fn prove_core_with_point_hook<Ch: Challenger>(
+    setup: &Setup,
+    prepared: Prepared,
+    packed_record: bool,
+    options: flock_core::zerocheck::ProverOptions,
+    ch: &mut Ch,
+    on_point: impl FnOnce(&[F128]),
+) -> Core {
+    prove_core_with_options(
+        setup,
+        prepared,
+        ch,
+        lincheck::pack_z_lincheck_from_packed,
+        packed_record,
+        options,
+        on_point,
     )
 }
 
@@ -154,6 +178,7 @@ fn prove_core_with_options<Ch: Challenger>(
     pack: impl FnOnce(&[F128], usize, usize) -> Vec<u8>,
     packed_record: bool,
     options: flock_core::zerocheck::ProverOptions,
+    on_point: impl FnOnce(&[F128]),
 ) -> Core {
     setup.bind(ch);
     let Prepared {
@@ -194,7 +219,7 @@ fn prove_core_with_options<Ch: Challenger>(
         values
     };
     let relation = if packed_record {
-        record::prove_record_relation_packed(
+        record::prove_record_relation_packed_with_point_hook(
             setup.record_vars(),
             |p| {
                 debug_assert_eq!(p % 64, 0);
@@ -211,9 +236,10 @@ fn prove_core_with_options<Ch: Challenger>(
             },
             evaluate,
             ch,
+            on_point,
         )
     } else {
-        record::prove_record_relation(
+        record::prove_record_relation_with_point_hook(
             setup.record_vars(),
             |p| {
                 layout::record_position(p % super::hash_to_point_slots::K).is_some_and(|q| {
@@ -225,6 +251,7 @@ fn prove_core_with_options<Ch: Challenger>(
             },
             evaluate,
             ch,
+            on_point,
         )
     };
     drop(record_span);
