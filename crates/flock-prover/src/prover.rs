@@ -368,6 +368,34 @@ pub fn prove_fast_core_bound<Ch: Challenger>(
     prover_data: Option<pcs::ProverData>,
     challenger: &mut Ch,
 ) -> ProveCore {
+    prove_fast_core_bound_with_zerocheck_options(
+        r1cs,
+        z_packed,
+        a_packed_f128,
+        b_packed_f128,
+        z_packed_lincheck,
+        lincheck_circuit,
+        commitment,
+        prover_data,
+        zerocheck::ProverOptions::default(),
+        challenger,
+    )
+}
+
+/// Identical bound proof with selectable zerocheck arithmetic.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_fast_core_bound_with_zerocheck_options<Ch: Challenger>(
+    r1cs: &BlockR1cs,
+    z_packed: Vec<F128>,
+    a_packed_f128: Vec<F128>,
+    b_packed_f128: Vec<F128>,
+    z_packed_lincheck: Vec<u8>,
+    lincheck_circuit: &dyn lincheck::LincheckCircuit,
+    commitment: Commitment,
+    prover_data: Option<pcs::ProverData>,
+    options: zerocheck::ProverOptions,
+    challenger: &mut Ch,
+) -> ProveCore {
     let trace = std::env::var("FLOCK_TRACE").is_ok();
     let mut stage = std::time::Instant::now();
     let mut lap = |label: &str| {
@@ -405,8 +433,8 @@ pub fn prove_fast_core_bound<Ch: Challenger>(
                 z_packed.len() * core::mem::size_of::<F128>(),
             )
         };
-        zerocheck::prove_packed_padded_capture_s_hat_v_c(
-            a_packed, b_packed, c_packed, r1cs.m, &padding, challenger,
+        zerocheck::prove_packed_padded_capture_s_hat_v_c_with_options(
+            a_packed, b_packed, c_packed, r1cs.m, &padding, options, challenger,
         )
     };
     // Nothing downstream reads a/b (zerocheck consumed them in rounds 1–2);

@@ -103,6 +103,66 @@ pub(crate) unsafe fn accumulate_convert_with_s_hat_v(
     }
 }
 
+/// Same bank conversion with unreduced polynomial products accumulated locally.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+pub(crate) unsafe fn accumulate_convert_deferred(
+    chunk_ab_bytes: &[[u8; 64]; 16],
+    chunk_c_bytes: &[[u8; 64]; 16],
+    n_b_med: usize,
+    convert: &[F128],
+    eq_lo_val: F128,
+    partial_ab: &mut [crate::field::F256Unreduced; 64],
+    partial_c_0: &mut [crate::field::F256Unreduced; 64],
+    partial_c_1: &mut [crate::field::F256Unreduced; 64],
+) {
+    use core::arch::aarch64::*;
+
+    // SAFETY: caller guarantees fixed input sizes and aarch64 provides NEON.
+    unsafe {
+        let convert_ptr = convert.as_ptr() as *const u8;
+        for lane in 0..64 {
+            let mut converted_ab = vdupq_n_u8(0);
+            let mut converted_c_0 = vdupq_n_u8(0);
+            let mut converted_c_1 = vdupq_n_u8(0);
+            for b_med in 0..n_b_med {
+                let ab = chunk_ab_bytes[b_med][lane] as usize;
+                let c = chunk_c_bytes[b_med][lane] as usize;
+                converted_ab = veorq_u8(
+                    converted_ab,
+                    vld1q_u8(convert_ptr.add((b_med * 256 + ab) * 16)),
+                );
+                converted_c_0 = veorq_u8(
+                    converted_c_0,
+                    vld1q_u8(convert_ptr.add((b_med * 256 + (c & 0x55)) * 16)),
+                );
+                converted_c_1 = veorq_u8(
+                    converted_c_1,
+                    vld1q_u8(convert_ptr.add((b_med * 256 + (c & 0xaa)) * 16)),
+                );
+            }
+            let ab = vreinterpretq_u64_u8(converted_ab);
+            let c_0 = vreinterpretq_u64_u8(converted_c_0);
+            let c_1 = vreinterpretq_u64_u8(converted_c_1);
+            partial_ab[lane] ^= F128 {
+                lo: vgetq_lane_u64::<0>(ab),
+                hi: vgetq_lane_u64::<1>(ab),
+            }
+            .mul_unreduced(eq_lo_val);
+            partial_c_0[lane] ^= F128 {
+                lo: vgetq_lane_u64::<0>(c_0),
+                hi: vgetq_lane_u64::<1>(c_0),
+            }
+            .mul_unreduced(eq_lo_val);
+            partial_c_1[lane] ^= F128 {
+                lo: vgetq_lane_u64::<0>(c_1),
+                hi: vgetq_lane_u64::<1>(c_1),
+            }
+            .mul_unreduced(eq_lo_val);
+        }
+    }
+}
+
 /// NEON 64-byte bit-transpose. Two-stage:
 ///   1. `vqtbl4q_u8` reorders the 64 input bytes so each 8-byte group within
 ///      the output is one byte-chunk's worth of `x_small=0..8` bytes.

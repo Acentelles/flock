@@ -5,7 +5,7 @@ use flock_core::{
     lincheck::LincheckCircuit,
 };
 
-fn fixtures(n: usize) -> Vec<sponge::SpongeRecord> {
+pub(super) fn fixtures(n: usize) -> Vec<sponge::SpongeRecord> {
     (0..n)
         .map(|i| sponge::SpongeRecord {
             salt: [i as u8; 40],
@@ -26,7 +26,7 @@ fn witness(setup: &Setup, inputs: &[sponge::SpongeRecord]) -> Witness {
     assemble(setup, sp, rp.z_packed)
 }
 
-fn direct_witness(setup: &Setup, inputs: &[sponge::SpongeRecord]) -> Witness {
+pub(super) fn direct_witness(setup: &Setup, inputs: &[sponge::SpongeRecord]) -> Witness {
     let sp = compact_sponge_witness(setup, inputs);
     let blocks: Vec<[u16; slots::SLOTS]> = sp
         .all_words

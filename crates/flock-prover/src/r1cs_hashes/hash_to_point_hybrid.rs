@@ -117,6 +117,42 @@ fn prove_core_with_packer_and_record<Ch: Challenger>(
     pack: impl FnOnce(&[F128], usize, usize) -> Vec<u8>,
     packed_record: bool,
 ) -> Core {
+    prove_core_with_options(
+        setup,
+        prepared,
+        ch,
+        pack,
+        packed_record,
+        flock_core::zerocheck::ProverOptions::default(),
+    )
+}
+
+/// Preserve the complete hybrid proof while selecting zerocheck arithmetic.
+pub fn prove_core_with_zerocheck_options<Ch: Challenger>(
+    setup: &Setup,
+    prepared: Prepared,
+    packed_record: bool,
+    options: flock_core::zerocheck::ProverOptions,
+    ch: &mut Ch,
+) -> Core {
+    prove_core_with_options(
+        setup,
+        prepared,
+        ch,
+        lincheck::pack_z_lincheck_from_packed,
+        packed_record,
+        options,
+    )
+}
+
+fn prove_core_with_options<Ch: Challenger>(
+    setup: &Setup,
+    prepared: Prepared,
+    ch: &mut Ch,
+    pack: impl FnOnce(&[F128], usize, usize) -> Vec<u8>,
+    packed_record: bool,
+    options: flock_core::zerocheck::ProverOptions,
+) -> Core {
     setup.bind(ch);
     let Prepared {
         witness: Witness { z, a, b },
@@ -127,7 +163,7 @@ fn prove_core_with_packer_and_record<Ch: Challenger>(
     let stripes = pack(&z, setup.r1cs.m, layout::K_LOG);
     drop(stripe_span);
     let fast_span = tracing::info_span!("hybrid.zerocheck_lincheck").entered();
-    let fast = crate::prover::prove_fast_core_bound(
+    let fast = crate::prover::prove_fast_core_bound_with_zerocheck_options(
         &setup.r1cs,
         z,
         a,
@@ -136,6 +172,7 @@ fn prove_core_with_packer_and_record<Ch: Challenger>(
         setup,
         commitment,
         Some(data),
+        options,
         ch,
     );
     drop(fast_span);
@@ -370,3 +407,6 @@ mod tests;
 
 #[cfg(test)]
 mod packed_record_tests;
+
+#[cfg(test)]
+mod round1_deferred_tests;

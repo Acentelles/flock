@@ -38,7 +38,9 @@ use crate::ntt::InvNttTableByteSingleGf8;
 use super::PaddingSpec;
 use super::univariate_skip::{SplitEqGhash, ntt_extend_f128_vec_ghash, pack_bits};
 
+mod deferred;
 mod kernels;
+use deferred::PartialAccumulator;
 
 #[cfg(all(test, target_arch = "aarch64"))]
 use kernels::aarch64::{
@@ -464,10 +466,10 @@ fn process_one_x_hi(
 /// Per-worker scratch + local accumulator for the two-bank C variant.
 /// Identical to [`WorkerState`] except `partial_c` and `local_res_c_s` are
 /// split into bank 0 / bank 1.
-struct WorkerStateWithSHatV {
-    partial_ab: [F128; ELL],
-    partial_c_0: [F128; ELL],
-    partial_c_1: [F128; ELL],
+struct WorkerStateWithSHatV<A: PartialAccumulator> {
+    partial_ab: [A; ELL],
+    partial_c_0: [A; ELL],
+    partial_c_1: [A; ELL],
     chunk_ab_bytes: [[u8; 64]; 1 << N_MEDIUM],
     chunk_c_bytes: [[u8; 64]; 1 << N_MEDIUM],
     a_col: [F8; ELL],
@@ -477,12 +479,12 @@ struct WorkerStateWithSHatV {
     local_res_c_s_1: [F128; ELL],
 }
 
-impl WorkerStateWithSHatV {
+impl<A: PartialAccumulator> WorkerStateWithSHatV<A> {
     fn new() -> Self {
         Self {
-            partial_ab: [F128::ZERO; ELL],
-            partial_c_0: [F128::ZERO; ELL],
-            partial_c_1: [F128::ZERO; ELL],
+            partial_ab: [A::ZERO; ELL],
+            partial_c_0: [A::ZERO; ELL],
+            partial_c_1: [A::ZERO; ELL],
             chunk_ab_bytes: [[0u8; 64]; 1 << N_MEDIUM],
             chunk_c_bytes: [[0u8; 64]; 1 << N_MEDIUM],
             a_col: [F8::ZERO; ELL],
@@ -499,7 +501,7 @@ impl WorkerStateWithSHatV {
 /// `cf_c_0` and `cf_c_1` via masked convert-table lookups.
 #[inline]
 #[allow(clippy::too_many_arguments)]
-fn process_one_x_hi_with_s_hat_v(
+fn process_one_x_hi_with_s_hat_v<A: PartialAccumulator>(
     x_hi: usize,
     big_lo_size: usize,
     n_lo_and_inner: usize,
@@ -512,11 +514,11 @@ fn process_one_x_hi_with_s_hat_v(
     eq_lo_scaled: &[F128],
     eq_hi_val: F128,
     convert: &[F128],
-    state: &mut WorkerStateWithSHatV,
+    state: &mut WorkerStateWithSHatV<A>,
 ) {
-    state.partial_ab.iter_mut().for_each(|p| *p = F128::ZERO);
-    state.partial_c_0.iter_mut().for_each(|p| *p = F128::ZERO);
-    state.partial_c_1.iter_mut().for_each(|p| *p = F128::ZERO);
+    state.partial_ab.iter_mut().for_each(|p| *p = A::ZERO);
+    state.partial_c_0.iter_mut().for_each(|p| *p = A::ZERO);
+    state.partial_c_1.iter_mut().for_each(|p| *p = A::ZERO);
 
     let n_lo = n_lo_and_inner - N_INNER;
 
@@ -550,7 +552,7 @@ fn process_one_x_hi_with_s_hat_v(
                 bit_transpose_64bytes(c_in, &mut state.chunk_c_bytes[b_med]);
             }
 
-            kernels::accumulate_convert_with_s_hat_v(
+            A::accumulate(
                 &state.chunk_ab_bytes,
                 &state.chunk_c_bytes,
                 1 << N_MEDIUM,
@@ -579,7 +581,7 @@ fn process_one_x_hi_with_s_hat_v(
                 bit_transpose_64bytes(c_in, &mut state.chunk_c_bytes[b_med]);
             }
 
-            kernels::accumulate_convert_with_s_hat_v(
+            A::accumulate(
                 &state.chunk_ab_bytes,
                 &state.chunk_c_bytes,
                 n_b_med,
@@ -594,9 +596,9 @@ fn process_one_x_hi_with_s_hat_v(
 
     // Outer fold by eq_hi (per bank).
     for lane in 0..ELL {
-        state.local_res_ab[lane] += eq_hi_val * state.partial_ab[lane];
-        state.local_res_c_s_0[lane] += eq_hi_val * state.partial_c_0[lane];
-        state.local_res_c_s_1[lane] += eq_hi_val * state.partial_c_1[lane];
+        state.local_res_ab[lane] += eq_hi_val * state.partial_ab[lane].reduced();
+        state.local_res_c_s_0[lane] += eq_hi_val * state.partial_c_0[lane].reduced();
+        state.local_res_c_s_1[lane] += eq_hi_val * state.partial_c_1[lane].reduced();
     }
 }
 
@@ -773,6 +775,38 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_s_hat_v(
     inv_table: &InvNttTableByteSingleGf8,
     padding: &PaddingSpec,
 ) -> (Vec<F128>, Vec<F128>, Vec<F128>) {
+    round1_with_s_hat_v_inner::<F128>(
+        a_packed, b_packed, c_packed, m, k_skip, r, inv_table, padding,
+    )
+}
+
+/// The identical round-1 output with field reduction deferred within each outer tile.
+pub fn round1_shift_reduce_extract_c_packed_padded_with_s_hat_v_deferred(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    c_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    r: &[F128],
+    inv_table: &InvNttTableByteSingleGf8,
+    padding: &PaddingSpec,
+) -> (Vec<F128>, Vec<F128>, Vec<F128>) {
+    round1_with_s_hat_v_inner::<crate::field::F256Unreduced>(
+        a_packed, b_packed, c_packed, m, k_skip, r, inv_table, padding,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn round1_with_s_hat_v_inner<A: PartialAccumulator>(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    c_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    r: &[F128],
+    inv_table: &InvNttTableByteSingleGf8,
+    padding: &PaddingSpec,
+) -> (Vec<F128>, Vec<F128>, Vec<F128>) {
     use rayon::prelude::*;
 
     assert_eq!(k_skip, K_SKIP, "optimized variant is k_skip=6 only");
@@ -802,7 +836,7 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_s_hat_v(
 
     let (res_ab, res_c_s_0, res_c_s_1) = (0..hi_size)
         .into_par_iter()
-        .fold(WorkerStateWithSHatV::new, |mut state, x_hi| {
+        .fold(WorkerStateWithSHatV::<A>::new, |mut state, x_hi| {
             let eq_hi_val = eq_hi[x_hi];
             process_one_x_hi_with_s_hat_v(
                 x_hi,

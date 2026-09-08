@@ -187,9 +187,32 @@ pub fn prove_packed_padded<C: Challenger>(
     padding: &PaddingSpec,
     challenger: &mut C,
 ) -> (ZerocheckProof, ZerocheckClaim) {
-    let (proof, claim, _) =
-        prove_packed_padded_inner(a_packed, b_packed, c_packed, m, padding, false, challenger);
+    let (proof, claim, _) = prove_packed_padded_inner(
+        a_packed,
+        b_packed,
+        c_packed,
+        m,
+        padding,
+        false,
+        ProverOptions::default(),
+        challenger,
+    );
     (proof, claim)
+}
+
+/// Implementation-only round-1 arithmetic; neither variant changes the transcript.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Round1Mode {
+    #[default]
+    Reduced,
+    Deferred,
+}
+
+/// Independent implementation choices for the same zerocheck proof.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ProverOptions {
+    pub round1: Round1Mode,
+    pub fused_tail: bool,
 }
 
 /// Variant of [`prove_packed_padded`] that ALSO returns the canonical
@@ -207,8 +230,30 @@ pub fn prove_packed_padded_capture_s_hat_v_c<C: Challenger>(
     padding: &PaddingSpec,
     challenger: &mut C,
 ) -> (ZerocheckProof, ZerocheckClaim, Vec<F128>) {
-    let (proof, claim, captured) =
-        prove_packed_padded_inner(a_packed, b_packed, c_packed, m, padding, true, challenger);
+    prove_packed_padded_capture_s_hat_v_c_with_options(
+        a_packed,
+        b_packed,
+        c_packed,
+        m,
+        padding,
+        ProverOptions::default(),
+        challenger,
+    )
+}
+
+/// Select zerocheck arithmetic while preserving every proof and challenge operation.
+pub fn prove_packed_padded_capture_s_hat_v_c_with_options<C: Challenger>(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    c_packed: &[u8],
+    m: usize,
+    padding: &PaddingSpec,
+    options: ProverOptions,
+    challenger: &mut C,
+) -> (ZerocheckProof, ZerocheckClaim, Vec<F128>) {
+    let (proof, claim, captured) = prove_packed_padded_inner(
+        a_packed, b_packed, c_packed, m, padding, true, options, challenger,
+    );
     (
         proof,
         claim,
@@ -224,6 +269,7 @@ fn prove_packed_padded_inner<C: Challenger>(
     m: usize,
     padding: &PaddingSpec,
     capture_s_hat_v_c: bool,
+    options: ProverOptions,
     challenger: &mut C,
 ) -> (ZerocheckProof, ZerocheckClaim, Option<Vec<F128>>) {
     let k_skip = K_SKIP;
@@ -275,17 +321,17 @@ fn prove_packed_padded_inner<C: Challenger>(
     let ntt_l = AdditiveNttGf8::new(k_skip, F8(1u8 << k_skip));
     let inv_table = InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
     let (round1_ab_opt, round1_c_opt, s_hat_v_c) = if capture_s_hat_v_c {
-        let (ab, c, s) =
-            crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_extract_c_packed_padded_with_s_hat_v(
-                a_packed,
-                b_packed,
-                c_packed,
-                m,
-                k_skip,
-                &r,
-                &inv_table,
-                padding,
-            );
+        use univariate_skip_optimized::{
+            round1_shift_reduce_extract_c_packed_padded_with_s_hat_v as reduced,
+            round1_shift_reduce_extract_c_packed_padded_with_s_hat_v_deferred as deferred,
+        };
+        let round1 = match options.round1 {
+            Round1Mode::Reduced => reduced,
+            Round1Mode::Deferred => deferred,
+        };
+        let (ab, c, s) = round1(
+            a_packed, b_packed, c_packed, m, k_skip, &r, &inv_table, padding,
+        );
         (ab, c, Some(s))
     } else {
         let (ab, c) = round1_shift_reduce_extract_c_packed_padded(
@@ -386,7 +432,12 @@ fn prove_packed_padded_inner<C: Challenger>(
 
         let (m1, mi) = if log_n_before >= 10 {
             let half = a_mlv.len() / 2;
-            let (m1, mi) = fold_and_compute_round_pair_into(
+            let fold_and_message = if options.fused_tail {
+                multilinear::fold_and_compute_round_pair_fused_tail_into
+            } else {
+                fold_and_compute_round_pair_into
+            };
+            let (m1, mi) = fold_and_message(
                 &a_mlv,
                 &b_mlv,
                 &mut a_nxt[..half],
