@@ -2,12 +2,14 @@
 //! circuit, one commitment, one zerocheck/lincheck and one Flock opening.
 //! The SHAKE/record word link is enforced by circuit copy rows.
 mod circuit;
+mod direct;
 pub mod layout;
 use super::{
     hash_to_point_record as record, hash_to_point_scatter as scatter,
     hash_to_point_sponge as sponge,
 };
 pub use circuit::{Setup, Witness, assemble};
+pub use direct::{CompactSpongeWitness, assemble_direct, compact_sponge_witness};
 use flock_core::{
     challenger::Challenger,
     field::F128,
@@ -82,11 +84,38 @@ pub fn prove_core<Ch: Challenger>(setup: &Setup, prepared: Prepared, ch: &mut Ch
     prove_core_with_packer(setup, prepared, ch, lincheck::pack_z_lincheck_from_packed)
 }
 
+/// The identical core proof with packed extraction of the record scatter rows.
+/// This only changes witness access; the scalar extraction remains available
+/// through `prove_core` for a runtime-controlled comparison.
+pub fn prove_core_packed_record<Ch: Challenger>(
+    setup: &Setup,
+    prepared: Prepared,
+    ch: &mut Ch,
+) -> Core {
+    prove_core_with_packer_and_record(
+        setup,
+        prepared,
+        ch,
+        lincheck::pack_z_lincheck_from_packed,
+        true,
+    )
+}
+
 fn prove_core_with_packer<Ch: Challenger>(
     setup: &Setup,
     prepared: Prepared,
     ch: &mut Ch,
     pack: impl FnOnce(&[F128], usize, usize) -> Vec<u8>,
+) -> Core {
+    prove_core_with_packer_and_record(setup, prepared, ch, pack, false)
+}
+
+fn prove_core_with_packer_and_record<Ch: Challenger>(
+    setup: &Setup,
+    prepared: Prepared,
+    ch: &mut Ch,
+    pack: impl FnOnce(&[F128], usize, usize) -> Vec<u8>,
+    packed_record: bool,
 ) -> Core {
     setup.bind(ch);
     let Prepared {
@@ -117,26 +146,48 @@ fn prove_core_with_packer<Ch: Challenger>(
     drop(sponge_span);
     let claims = std::cell::RefCell::new((points, values));
     let record_span = tracing::info_span!("hybrid.record_relation").entered();
-    let relation = record::prove_record_relation(
-        setup.record_vars(),
-        |p| {
-            layout::record_position(p % super::hash_to_point_slots::K).is_some_and(|q| {
-                layout::bit(
-                    &fast.z_packed,
-                    (p / super::hash_to_point_slots::K) * layout::K + q,
-                )
-            })
-        },
-        |points| {
-            let (values, new_points, fragments) =
-                evaluations(&fast.z_packed, &flatten(points, record_fragments));
-            let mut claims = claims.borrow_mut();
-            claims.0.extend(new_points);
-            claims.1.extend(fragments);
-            values
-        },
-        ch,
-    );
+    let evaluate = |points: &[Vec<F128>]| {
+        let (values, new_points, fragments) =
+            evaluations(&fast.z_packed, &flatten(points, record_fragments));
+        let mut claims = claims.borrow_mut();
+        claims.0.extend(new_points);
+        claims.1.extend(fragments);
+        values
+    };
+    let relation = if packed_record {
+        record::prove_record_relation_packed(
+            setup.record_vars(),
+            |p| {
+                debug_assert_eq!(p % 64, 0);
+                layout::record_position(p % super::hash_to_point_slots::K).map_or(0, |q| {
+                    debug_assert_eq!(q % 64, 0);
+                    let bit = (p / super::hash_to_point_slots::K) * layout::K + q;
+                    let word = fast.z_packed[bit / 128];
+                    if bit.is_multiple_of(128) {
+                        word.lo
+                    } else {
+                        word.hi
+                    }
+                })
+            },
+            evaluate,
+            ch,
+        )
+    } else {
+        record::prove_record_relation(
+            setup.record_vars(),
+            |p| {
+                layout::record_position(p % super::hash_to_point_slots::K).is_some_and(|q| {
+                    layout::bit(
+                        &fast.z_packed,
+                        (p / super::hash_to_point_slots::K) * layout::K + q,
+                    )
+                })
+            },
+            evaluate,
+            ch,
+        )
+    };
     drop(record_span);
     let (points, values) = claims.into_inner();
     Core {
@@ -316,3 +367,6 @@ pub fn verify_open<Ch: Challenger>(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod packed_record_tests;

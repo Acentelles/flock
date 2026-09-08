@@ -9,7 +9,7 @@ fn fixtures(n: usize) -> Vec<sponge::SpongeRecord> {
     (0..n)
         .map(|i| sponge::SpongeRecord {
             salt: [i as u8; 40],
-            hpk: [i as u8 + 1; 64],
+            hpk: [(i as u8).wrapping_add(1); 64],
             message: vec![i as u8; [31, 32, 165][i % 3]],
         })
         .collect()
@@ -24,6 +24,17 @@ fn witness(setup: &Setup, inputs: &[sponge::SpongeRecord]) -> Witness {
         .collect();
     let rp = record::record_witness(&setup.slots, &blocks, &[[false; 128]; slots::MASK_REPS]);
     assemble(setup, sp, rp.z_packed)
+}
+
+fn direct_witness(setup: &Setup, inputs: &[sponge::SpongeRecord]) -> Witness {
+    let sp = compact_sponge_witness(setup, inputs);
+    let blocks: Vec<[u16; slots::SLOTS]> = sp
+        .all_words
+        .iter()
+        .map(|w| w.as_slice().try_into().unwrap())
+        .collect();
+    let rp = record::record_witness(&setup.slots, &blocks, &[[false; 128]; slots::MASK_REPS]);
+    assemble_direct(setup, sp, rp.z_packed)
 }
 
 #[test]
@@ -141,7 +152,8 @@ fn hybrid_relocation_matches_original_witness() {
 fn hybrid_optimizations_preserve_complete_proof() {
     let inputs = fixtures(32);
     let setup = Setup::new(inputs.len());
-    let run = |reference| {
+    let run = |mode| {
+        let reference = mode == 0;
         let w = if reference {
             let sp = sponge::sponge_witness(&sponge::SpongeSetup::new(inputs.len()), &inputs);
             let blocks: Vec<[u16; slots::SLOTS]> = sp
@@ -152,26 +164,132 @@ fn hybrid_optimizations_preserve_complete_proof() {
             let rp =
                 record::record_witness(&setup.slots, &blocks, &[[false; 128]; slots::MASK_REPS]);
             circuit::assemble_reference(&setup, sp, rp.z_packed)
-        } else {
+        } else if mode == 1 {
             witness(&setup, &inputs)
+        } else {
+            direct_witness(&setup, &inputs)
         };
         let prepared = commit(&setup, w);
         let mut ch = FsChallenger::new(b"hybrid-stripes-proof-identity-v1");
-        let core = prove_core_with_packer(&setup, prepared, &mut ch, |z, m, k_log| {
-            if reference {
-                // Independent logical Boolean oracle, including every
-                // padding bit. The complete proof and replay state must
-                // remain identical, beyond just the local byte layout.
-                let bits: Vec<_> = (0..1 << m).map(|p| layout::bit(z, p)).collect();
-                lincheck::pack_z_lincheck(&bits, m, k_log)
-            } else {
-                lincheck::pack_z_lincheck_from_packed(z, m, k_log)
-            }
-        });
+        let core = prove_core_with_packer_and_record(
+            &setup,
+            prepared,
+            &mut ch,
+            |z, m, k_log| {
+                if reference {
+                    // Independent logical Boolean oracle, including every
+                    // padding bit. The complete proof and replay state must
+                    // remain identical, beyond just the local byte layout.
+                    let bits: Vec<_> = (0..1 << m).map(|p| layout::bit(z, p)).collect();
+                    lincheck::pack_z_lincheck(&bits, m, k_log)
+                } else {
+                    lincheck::pack_z_lincheck_from_packed(z, m, k_log)
+                }
+            },
+            mode == 3,
+        );
         let proof = open(&setup, core, &mut ch);
         (bincode::serialize(&proof).unwrap(), ch.sample_f128())
     };
-    assert_eq!(run(false), run(true));
+    let expected = run(0);
+    assert_eq!(run(1), expected);
+    assert_eq!(run(2), expected);
+    assert_eq!(run(3), expected);
+}
+
+#[test]
+fn hybrid_direct_generation_matches_reference_for_all_message_lengths() {
+    use sha3::digest::{ExtendableOutput, Update, XofReader};
+    let n = 256;
+    let setup = Setup::new(n);
+    let mut inputs = fixtures(n);
+    let mut ch = FsChallenger::new(b"hybrid-direct-sponge-differential-v1");
+    for (i, input) in inputs.iter_mut().enumerate() {
+        let bytes: Vec<_> = ch
+            .sample_f128_vec(18)
+            .iter()
+            .flat_map(|word| {
+                word.lo
+                    .to_le_bytes()
+                    .into_iter()
+                    .chain(word.hi.to_le_bytes())
+            })
+            .collect();
+        input.salt.copy_from_slice(&bytes[..40]);
+        input.hpk.copy_from_slice(&bytes[40..104]);
+        // Cover every permitted length and second-block padding boundary.
+        input.message = bytes[104..104 + 31 + i % 135].to_vec();
+    }
+    let original = sponge::sponge_witness_without_lincheck(&sponge::SpongeSetup::new(n), &inputs);
+    let direct = compact_sponge_witness(&setup, &inputs);
+    assert_eq!(direct.all_words, original.all_words);
+    for (input, words) in inputs.iter().zip(&direct.all_words) {
+        let mut shake = sha3::Shake256::default();
+        shake.update(&input.salt);
+        shake.update(&input.hpk);
+        shake.update(&[0, 0]);
+        shake.update(&input.message);
+        let mut expected = [0u8; slots::SLOTS * 2];
+        shake.finalize_xof().read(&mut expected);
+        let expected: Vec<_> = expected
+            .chunks_exact(2)
+            .map(|w| u16::from_be_bytes([w[0], w[1]]))
+            .collect();
+        assert_eq!(*words, expected);
+    }
+    let blocks: Vec<[u16; slots::SLOTS]> = direct
+        .all_words
+        .iter()
+        .map(|w| w.as_slice().try_into().unwrap())
+        .collect();
+    let rp = record::record_witness(&setup.slots, &blocks, &[[false; 128]; slots::MASK_REPS]);
+    let expected = circuit::assemble_reference(&setup, original, rp.z_packed.clone());
+    let got = assemble_direct(&setup, direct, rp.z_packed);
+    assert_eq!(got.z, expected.z);
+    assert_eq!(got.a, expected.a);
+    assert_eq!(got.b, expected.b);
+}
+
+#[test]
+fn hybrid_direct_record_assembly_preserves_arbitrary_inputs_and_fallback() {
+    for (n, irregular) in [(8, false), (32, false), (8, true)] {
+        let mut setup = Setup::new(n);
+        if irregular {
+            setup.slots.r1cs.a_0.rows = (0..slots::K)
+                .map(|row| vec![(row * 40503 + 17) % slots::K])
+                .collect();
+        }
+        let inputs = fixtures(n);
+        let original =
+            sponge::sponge_witness_without_lincheck(&sponge::SpongeSetup::new(n), &inputs);
+        let direct = compact_sponge_witness(&setup, &inputs);
+        let mut ch = FsChallenger::new(b"hybrid-direct-record-arbitrary-v1");
+        // Include inconsistent SHAKE/record words, non-one constants and
+        // nonzero high/padding bits; do not assume a satisfying record witness.
+        let record = ch.sample_f128_vec(n * slots::K / 128);
+        let expected = circuit::assemble_reference(&setup, original, record.clone());
+        let got = assemble_direct(&setup, direct, record);
+        assert_eq!(got.z, expected.z);
+        assert_eq!(got.a, expected.a);
+        assert_eq!(got.b, expected.b);
+    }
+}
+
+#[test]
+fn hybrid_direct_generation_rejects_invalid_message_lengths() {
+    let setup = Setup::new(8);
+    let sp_setup = sponge::SpongeSetup::new(8);
+    for length in [0, 30, 166] {
+        let mut inputs = fixtures(8);
+        inputs[0].message = vec![0; length];
+        assert!(
+            std::panic::catch_unwind(|| {
+                sponge::sponge_witness_without_lincheck(&sp_setup, &inputs)
+            })
+            .is_err()
+        );
+        assert!(std::panic::catch_unwind(|| compact_sponge_witness(&setup, &inputs)).is_err());
+    }
 }
 
 #[test]

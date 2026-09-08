@@ -384,6 +384,7 @@ pub fn prove_fast_core_bound<Ch: Challenger>(
     lap("commit");
 
     let padding = r1cs.padding_spec();
+    let zerocheck_span = tracing::info_span!("flock.core.zerocheck").entered();
     let (zc_proof, zc_claim, s_hat_v_c) = {
         // Zero-cost &[u8] views of the F128 buffers; c aliases z (C = I).
         let a_packed: &[u8] = unsafe {
@@ -413,8 +414,10 @@ pub fn prove_fast_core_bound<Ch: Challenger>(
     // of carrying them through lincheck and the PCS open.
     flock_core::scratch::give_f128(a_packed_f128);
     flock_core::scratch::give_f128(b_packed_f128);
+    drop(zerocheck_span);
     lap("zerocheck");
 
+    let lincheck_span = tracing::info_span!("flock.core.lincheck").entered();
     let x_ab = r1cs.x_ab_from_mlv(zc_claim.z, &zc_claim.mlv_challenges);
 
     // Capture lincheck's pre-sumcheck z_vec so the PCS open can derive the
@@ -432,7 +435,9 @@ pub fn prove_fast_core_bound<Ch: Challenger>(
     // The lincheck stripe copy of z is dead from here on; free it before the
     // PCS open (2^(m-3) bytes — 64 MB at m = 29).
     drop(z_packed_lincheck);
+    drop(lincheck_span);
     lap("lincheck");
+    let claim_span = tracing::info_span!("flock.core.claim_preparation").entered();
 
     let ab = ZClaim {
         point: r1cs.ab_claim_point(lc_claim.r_inner_skip, &lc_claim.r_inner_rest, &x_ab.x_outer),
@@ -456,6 +461,7 @@ pub fn prove_fast_core_bound<Ch: Challenger>(
         None
     };
 
+    drop(claim_span);
     lap("s_hat_v_ab");
     ProveCore {
         zc_proof,

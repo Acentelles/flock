@@ -1496,6 +1496,40 @@ pub fn prove_record_relation<Ch: Challenger>(
     evaluate: impl Fn(&[Vec<F128>]) -> Vec<F128>,
     challenger: &mut Ch,
 ) -> RecordRelation {
+    prove_record_relation_with_factors(
+        record_vars,
+        |beta, gamma, delta| {
+            compact_scatter::Factors::new(read_bit, record_vars, beta, gamma, delta)
+        },
+        evaluate,
+        challenger,
+    )
+}
+
+/// Same scatter proof from complete 64-slot words of the original logical
+/// record layout. The caller authenticates the same returned opening claims.
+pub fn prove_record_relation_packed<Ch: Challenger>(
+    record_vars: usize,
+    read_word: impl Fn(usize) -> u64 + Sync,
+    evaluate: impl Fn(&[Vec<F128>]) -> Vec<F128>,
+    challenger: &mut Ch,
+) -> RecordRelation {
+    prove_record_relation_with_factors(
+        record_vars,
+        |beta, gamma, delta| {
+            compact_scatter::Factors::new_packed(read_word, record_vars, beta, gamma, delta)
+        },
+        evaluate,
+        challenger,
+    )
+}
+
+fn prove_record_relation_with_factors<Ch: Challenger>(
+    record_vars: usize,
+    factors: impl FnOnce(F128, F128, F128) -> compact_scatter::Factors,
+    evaluate: impl Fn(&[Vec<F128>]) -> Vec<F128>,
+    challenger: &mut Ch,
+) -> RecordRelation {
     // Scatter challenges, post-commitment and post-R1CS.
     challenger.observe_label(b"aerie-record-scatter-challenges-v0");
     let beta = challenger.sample_f128();
@@ -1508,7 +1542,7 @@ pub fn prove_record_relation<Ch: Challenger>(
     challenger.observe_label(b"aerie-record-fingerprint-v0");
     let r_fp = challenger.sample_f128_vec(record_vars + 9);
 
-    let factors = compact_scatter::Factors::new(read_bit, record_vars, beta, gamma, delta);
+    let factors = factors(beta, gamma, delta);
     let (scatter_proof, rs) = factors.prove(challenger);
 
     let points = multilinear_points(record_vars, &rs, &r_fp, beta, gamma, delta)

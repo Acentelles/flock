@@ -14,7 +14,7 @@ mod counter_tail;
 const DEGREE: usize = 3 + COUNTER_BITS;
 const SLOT_COUNT: usize = 1 << SLOT_VARS;
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Row {
     count: u16,
     value: u16,
@@ -46,6 +46,7 @@ impl Factors {
         delta: F128,
     ) -> Self {
         assert!(record_vars >= 2);
+        let _span = tracing::info_span!("record_scatter.scalar_rows").entered();
         let records = 1 << record_vars;
         let mut rows = vec![Row::default(); records * SLOT_COUNT];
         rows.par_chunks_mut(SLOT_COUNT)
@@ -67,6 +68,75 @@ impl Factors {
                     row.gate = bit_at(base + slots::gate_position(slot));
                 }
             });
+        Self::from_rows(rows, record_vars, beta, gamma, delta)
+    }
+
+    /// Read complete 64-slot plane words, preserving arbitrary committed bits.
+    /// The address uses the original record layout and is always 64-bit aligned.
+    pub(super) fn new_packed(
+        word_at: impl Fn(usize) -> u64 + Sync,
+        record_vars: usize,
+        beta: F128,
+        gamma: F128,
+        delta: F128,
+    ) -> Self {
+        assert!(record_vars >= 2);
+        let _span = tracing::info_span!("record_scatter.packed_rows").entered();
+        let records = 1 << record_vars;
+        let mut rows = vec![Row::default(); records * SLOT_COUNT];
+        rows.par_chunks_mut(SLOT_COUNT)
+            .enumerate()
+            .for_each(|(record, rows)| {
+                let base = record << slots::K_LOG;
+                for first in (0..SLOTS).step_by(64) {
+                    let mut counter = [0u64; 16];
+                    for (b, lane) in counter[..COUNTER_BITS].iter_mut().enumerate() {
+                        *lane = word_at(base + slots::counter_position(first, b)).to_le();
+                    }
+                    let quotient: [u64; 3] =
+                        std::array::from_fn(|b| word_at(base + slots::quotient_position(first, b)));
+                    let mut value = [0u64; 16];
+                    let mut borrow = 0u64;
+                    for (b, lane) in value[..14].iter_mut().enumerate() {
+                        let modulus = match b {
+                            0..=2 => quotient[b],
+                            12 => quotient[0],
+                            13 => quotient[0] ^ quotient[1],
+                            _ => 0,
+                        };
+                        *lane = (word_at(base + slots::word_position(first, b)) ^ modulus ^ borrow)
+                            .to_le();
+                        borrow ^= word_at(base + slots::borrow_position(first, b));
+                    }
+                    value[14] = word_at(base + slots::centering_position(first)).to_le();
+                    let gate = word_at(base + slots::gate_position(first));
+                    let transpose = |planes: &[u64; 16]| {
+                        let mut bytes = [[0u8; 64]; 2];
+                        for (out, input) in bytes.iter_mut().zip(planes.chunks_exact(8)) {
+                            flock_core::bits::transpose_8_u64s_to_64_bytes(
+                                input.try_into().unwrap(),
+                                out,
+                            );
+                        }
+                        bytes
+                    };
+                    let counter = transpose(&counter);
+                    let value = transpose(&value);
+                    let live = (SLOTS - first).min(64);
+                    for (slot, row) in rows[first..first + live].iter_mut().enumerate() {
+                        *row = Row {
+                            count: u16::from_le_bytes([counter[0][slot], counter[1][slot]]),
+                            value: u16::from_le_bytes([value[0][slot], value[1][slot]]),
+                            gate: (gate >> slot) & 1 != 0,
+                        };
+                    }
+                }
+            });
+        Self::from_rows(rows, record_vars, beta, gamma, delta)
+    }
+
+    fn from_rows(rows: Vec<Row>, record_vars: usize, beta: F128, gamma: F128, delta: F128) -> Self {
+        let records = 1 << record_vars;
         let mut gamma_lut = vec![F128::ZERO; 1 << 15];
         let mut power = F128::ONE;
         for b in 0..15 {
@@ -167,6 +237,7 @@ impl Factors {
         challenger: &mut Ch,
         compact: bool,
     ) -> (scatter::ScatterProof, Vec<F128>) {
+        let _span = tracing::info_span!("record_scatter.prove").entered();
         let n = self.rows.len();
         let mut rounds = Vec::with_capacity(self.record_vars + SLOT_VARS);
         let mut point = Vec::with_capacity(self.record_vars + SLOT_VARS);
@@ -367,3 +438,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod packed_tests;
