@@ -439,4 +439,7 @@ mod tests;
 mod packed_record_tests;
 
 #[cfg(test)]
+mod sorted_program_tests;
+
+#[cfg(test)]
 mod round1_deferred_tests;

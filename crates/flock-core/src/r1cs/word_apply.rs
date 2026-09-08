@@ -10,7 +10,9 @@ use crate::field::F128;
 use rayon::prelude::*;
 use std::collections::BTreeMap;
 
-#[derive(Debug)]
+mod sorted;
+
+#[derive(Debug, PartialEq, Eq)]
 enum Term {
     Aligned { word: usize, mask: u128 },
     Window { word: isize, shift: u32, mask: u128 },
@@ -43,12 +45,27 @@ impl Term {
 }
 
 /// Exact packed operations compiled from public sparse matrix wiring.
+#[derive(Debug, PartialEq, Eq)]
 pub struct Program {
     rows: Vec<Vec<Term>>,
 }
 
 impl Program {
     pub fn new(matrix: &SparseBinaryMatrix) -> Option<Self> {
+        Self::new_with_sorted_scratch(matrix, cfg!(feature = "sorted-record-program"))
+    }
+
+    /// Explicit compiler selection for exact differential checks. Both modes
+    /// compile the supplied matrix now; neither caches setup or witness state.
+    pub fn new_with_sorted_scratch(matrix: &SparseBinaryMatrix, sorted: bool) -> Option<Self> {
+        if sorted {
+            sorted::compile(matrix)
+        } else {
+            Self::new_with_maps(matrix)
+        }
+    }
+
+    fn new_with_maps(matrix: &SparseBinaryMatrix) -> Option<Self> {
         if matrix.num_rows != matrix.num_cols
             || matrix.rows.len() != matrix.num_rows
             || !matrix.num_rows.is_multiple_of(128)
