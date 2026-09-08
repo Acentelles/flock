@@ -30,7 +30,7 @@ impl Setup {
             merkle_hash: Default::default(),
         };
         let mut h = blake3::Hasher::new();
-        h.update(b"aerie/hybrid-keccak-f1600-24-slot-v1/three-256-slot-segments/trim-state-padding/copy-big-endian-words");
+        h.update(b"aerie/hybrid-keccak-f1600-24-slot-v2/256-256-128-slot-segments/aligned-state-subcubes/copy-big-endian-words");
         h.update(&r1cs.statement_digest());
         h.update(&slots.r1cs.statement_digest());
         for old in 0..slots::K {
@@ -58,7 +58,7 @@ impl Setup {
         self.r1cs.m - K_LOG
     }
     pub fn bind<Ch: flock_core::challenger::Challenger>(&self, ch: &mut Ch) {
-        ch.observe_label(b"aerie-hybrid-compact-circuit-v1");
+        ch.observe_label(b"aerie-hybrid-compact-circuit-v2");
         ch.observe_bytes(&self.descriptor);
     }
 }

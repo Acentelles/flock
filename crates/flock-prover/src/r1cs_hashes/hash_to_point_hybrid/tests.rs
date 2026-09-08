@@ -81,6 +81,17 @@ fn hybrid_complete_relation_and_rejections() {
     let prepared = commit(&setup, w);
     let mut ch = FsChallenger::new(b"hybrid-full-relation-test-v1");
     let core = prove_core(&setup, prepared, &mut ch);
+    assert_eq!(core.sponge_values.len(), 22);
+    let mut closure_ch = FsChallenger::new(b"hybrid-opening-count-v2");
+    let closed =
+        super::super::face_closure::close_faces(&core.points, &core.values, &mut closure_ch)
+            .unwrap();
+    eprintln!(
+        "hybrid aligned claims: fragments={}, PCS={}",
+        core.points.len(),
+        closed.len() + 2
+    );
+    assert!(closed.len() + 2 < 123);
     let r_fp = core.r_fp.clone();
     let proof = open(&setup, core, &mut ch);
     let check = |p: &Proof, publics: &[sponge::SpongePublic]| {
@@ -106,6 +117,114 @@ fn hybrid_complete_relation_and_rejections() {
     let mut bad_publics = publics.clone();
     bad_publics[0].hpk[0] ^= 1;
     assert!(check(&proof, &bad_publics).is_err());
+    let mut incompatible = Setup::new(32);
+    incompatible.descriptor[0] ^= 1;
+    let mut ch = FsChallenger::new(b"hybrid-full-relation-test-v1");
+    assert!(verify_core(&incompatible, &publics, &proof, &mut ch).is_err());
+}
+
+#[test]
+fn hybrid_aligned_layout_retains_live_rows_and_disjoint_columns() {
+    use super::super::keccak3;
+    let setup = Setup::new(8);
+    // An omitted record row must have been exactly 0 * 0 = z_row;
+    // no retained gate may reference an omitted column.
+    for matrix in [&setup.slots.r1cs.a_0, &setup.slots.r1cs.b_0] {
+        for (row, columns) in matrix.rows.iter().enumerate() {
+            if layout::record_position(row).is_none() {
+                assert!(columns.is_empty(), "omitted live row {row}");
+            }
+            for &column in columns {
+                assert!(layout::record_position(column).is_some());
+            }
+        }
+    }
+    let mut occupied = vec![false; layout::K];
+    occupied[layout::CONST] = true;
+    for old in 1..slots::K {
+        if let Some(new) = layout::record_position(old) {
+            assert!(!occupied[new], "record alias at {new}");
+            occupied[new] = true;
+        }
+    }
+    for block in 0..4 {
+        for old in 0..keccak3::K {
+            if old == keccak3::Z_CONST {
+                assert_eq!(layout::sponge_position(block, old), Some(layout::CONST));
+            } else if let Some(new) = layout::sponge_position(block, old) {
+                assert!(!occupied[new], "sponge alias at {new}");
+                occupied[new] = true;
+            }
+        }
+    }
+    // New state padding must be unoccupied by every row and column map.
+    for state in 0..20 {
+        let base = layout::STATES + state * layout::STATE_STRIDE;
+        assert_eq!(base % 2048, 0);
+        assert!(occupied[base..base + 1600].iter().all(|&b| b));
+        assert!(occupied[base + 1600..base + 2048].iter().all(|&b| !b));
+    }
+    assert!(occupied[layout::END..].iter().all(|&b| !b));
+}
+
+#[test]
+fn hybrid_aligned_state_queries_close_to_four_claims() {
+    let mut ch = FsChallenger::new(b"hybrid-aligned-state-faces-v2");
+    let points = sponge::sponge_relation_points(14, &mut ch);
+    let groups = flatten(&points, sponge_fragments);
+    assert_eq!(groups.len(), 22);
+    assert!(groups.iter().all(|group| group.len() == 1));
+    assert!(groups.iter().flatten().all(|f| f.weight == F128::ONE));
+    let points: Vec<_> = groups.iter().flatten().map(|f| f.point.clone()).collect();
+    let closed =
+        super::super::face_closure::close_faces(&points, &vec![F128::ZERO; points.len()], &mut ch)
+            .unwrap();
+    // Two complete faces cover the twenty states, plus two salt subcubes.
+    assert_eq!(closed.len(), 4);
+}
+
+#[test]
+fn hybrid_aligned_fragments_match_arbitrary_retained_values() {
+    let setup = Setup::new(8);
+    let mut ch = FsChallenger::new(b"hybrid-aligned-arbitrary-mle-v2");
+    let mut old_record = ch.sample_f128_vec(8 * slots::K / 128);
+    for record in 0..8 {
+        for old in 0..slots::K {
+            if layout::record_position(old).is_none() || (1..64).contains(&old) {
+                layout::set_bit(&mut old_record, record * slots::K + old, false);
+            }
+        }
+    }
+    let mut old_sponge = ch.sample_f128_vec(8 * layout::K / 128);
+    for record in 0..8 {
+        for block in 0..4 {
+            for slot in 0..6 {
+                for bit in 1600..2048 {
+                    layout::set_bit(
+                        &mut old_sponge,
+                        record * layout::K + block * slots::K + slot * 2048 + bit,
+                        false,
+                    );
+                }
+            }
+        }
+    }
+    let sp = sponge::SpongeWitness {
+        z_packed: old_sponge.clone(),
+        a_packed: vec![F128::ZERO; old_sponge.len()],
+        b_packed: vec![F128::ZERO; old_sponge.len()],
+        z_lincheck: vec![],
+        all_words: vec![],
+    };
+    let w = assemble(&setup, sp, old_record.clone());
+    // Nonzero top target bits and inactive-but-retained slot bits are kept.
+    // Evaluate the full multi-record MLE at independent field coordinates.
+    let points = vec![ch.sample_f128_vec(20), ch.sample_f128_vec(20)];
+    let (relocated, _, _) = evaluations(&w.z, &flatten(&points, record_fragments));
+    assert_eq!(relocated, sponge::gather_eval_many(&old_record, &points));
+    let points = sponge::sponge_relation_points(3, &mut ch);
+    let (relocated, _, _) = evaluations(&w.z, &flatten(&points, sponge_fragments));
+    assert_eq!(relocated, sponge::gather_eval_many(&old_sponge, &points));
 }
 
 #[test]

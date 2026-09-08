@@ -4,11 +4,18 @@ use flock_core::field::F128;
 
 pub const K_LOG: usize = 19;
 pub const K: usize = 1 << K_LOG;
-pub const TARGET: usize = 3 * 32768;
+// Only 612 slots are live. Two 256-slot segments and one 128-slot segment
+// retain every live row/column and reclaim the final 128 zero slots.
+pub const TARGET: usize = 2 * 32768 + 16384;
 pub const CONST: usize = TARGET + 8192;
-pub const KECCAK: usize = CONST + 128;
-pub const PERM: usize = 2 * 1600 + 24 * 1600;
-pub const END: usize = KECCAK + 10 * PERM;
+// State slots are full aligned subcubes, including their constrained-zero
+// padding. The base also aligns the first sixteen slots into a Boolean face.
+pub const STATES: usize = 3 * 32768;
+pub const STATE_STRIDE: usize = 2048;
+pub const T_BASE: usize = STATES + 20 * STATE_STRIDE;
+pub const END: usize = T_BASE + 10 * 24 * 1600;
+const _: () = assert!(slots::SLOTS <= 640);
+const _: () = assert!(CONST + 128 <= STATES);
 const _: () = assert!(END <= K);
 
 pub fn record_position(old: usize) -> Option<usize> {
@@ -16,8 +23,13 @@ pub fn record_position(old: usize) -> Option<usize> {
         return Some(CONST);
     }
     let (plane, slot) = (old / 1024, old % 1024);
-    if plane < 112 && slot < 768 {
-        Some((slot / 256) * 32768 + plane * 256 + slot % 256)
+    if plane < 112 && slot < 640 {
+        let (base, width, offset) = if slot < 512 {
+            ((slot / 256) * 32768, 256, slot % 256)
+        } else {
+            (2 * 32768, 128, slot - 512)
+        };
+        Some(base + plane * width + offset)
     } else if (112..120).contains(&plane) {
         Some(TARGET + (plane - 112) * 1024 + slot)
     } else {
@@ -34,11 +46,11 @@ pub fn sponge_position(block: usize, old: usize) -> Option<usize> {
         let permutation = 4 * (slot / 2) + block;
         let bit = old % 2048;
         (permutation < 10 && bit < 1600)
-            .then_some(KECCAK + permutation * PERM + (slot % 2) * 1600 + bit)
+            .then_some(STATES + (2 * permutation + slot % 2) * STATE_STRIDE + bit)
     } else if (keccak3::T_PACKED_BIT_BASE..keccak3::USEFUL_BITS).contains(&old) {
         let offset = old - keccak3::T_PACKED_BIT_BASE;
         let permutation = 4 * (offset / 38400) + block;
-        (permutation < 10).then_some(KECCAK + permutation * PERM + 3200 + offset % 38400)
+        (permutation < 10).then_some(T_BASE + permutation * 38400 + offset % 38400)
     } else {
         None
     }
@@ -47,7 +59,7 @@ pub fn sponge_position(block: usize, old: usize) -> Option<usize> {
 /// Candidate words are big-endian; state bytes are little-endian lane bytes.
 pub fn word_source(slot: usize, bit: usize) -> usize {
     assert!(slot < slots::SLOTS && bit < 16);
-    KECCAK + (1 + slot / 68) * PERM + 1600 + 16 * (slot % 68) + (bit ^ 8)
+    STATES + (2 * (1 + slot / 68) + 1) * STATE_STRIDE + 16 * (slot % 68) + (bit ^ 8)
 }
 
 pub fn bit(words: &[F128], p: usize) -> bool {
@@ -128,17 +140,18 @@ fn cube(
 pub fn record_fragments(point: &[F128]) -> Vec<Fragment> {
     let mut out = Vec::new();
     for segment in 0..3 {
+        let slot_log = if segment < 2 { 8 } else { 7 };
         for (plane, log) in [(0, 6), (64, 5), (96, 4)] {
-            let axes: Vec<_> = (0..8)
+            let axes: Vec<_> = (0..slot_log)
                 .map(|i| (i, i))
-                .chain((0..log).map(|i| (10 + i, 8 + i)))
+                .chain((0..log).map(|i| (10 + i, slot_log + i)))
                 .collect();
             cube(
                 &mut out,
                 point,
                 17,
                 (plane << 10) + (segment << 8),
-                (segment << 15) + (plane << 8),
+                (segment << 15) + (plane << slot_log),
                 &axes,
             );
         }
@@ -158,30 +171,23 @@ pub fn record_fragments(point: &[F128]) -> Vec<Fragment> {
 }
 
 /// Only state subcubes are queried by the SHAKE framing/chain relation.
-/// Trimmed state padding is constrained zero in the original relation.
+/// Each aligned state includes the 448 zero-padding cells. These have empty
+/// A/B rows in both layouts, so C = I constrains them to zero. Opening the
+/// whole slot reconstructs the original MLE without splitting its live bits.
 pub fn sponge_fragments(point: &[F128]) -> Vec<Fragment> {
     let mut out = Vec::new();
     for permutation in 0..10 {
         for output in 0..2 {
             let old = (permutation % 4) * keccak3::K + (2 * (permutation / 4) + output) * 2048;
-            let new = KECCAK + permutation * PERM + output * 1600;
-            let mut offset = 0usize;
-            while offset < 1600 {
-                let remaining = 1600usize - offset;
-                let mut log = (usize::BITS - 1 - remaining.leading_zeros()) as usize;
-                while (old + offset) % (1 << log) != 0 || (new + offset) % (1 << log) != 0 {
-                    log -= 1;
-                }
-                cube(
-                    &mut out,
-                    point,
-                    19,
-                    old + offset,
-                    new + offset,
-                    &(0..log).map(|i| (i, i)).collect::<Vec<_>>(),
-                );
-                offset += 1 << log;
-            }
+            let new = STATES + (2 * permutation + output) * STATE_STRIDE;
+            cube(
+                &mut out,
+                point,
+                19,
+                old,
+                new,
+                &(0..11).map(|i| (i, i)).collect::<Vec<_>>(),
+            );
         }
     }
     out
