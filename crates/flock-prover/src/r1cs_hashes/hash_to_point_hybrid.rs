@@ -443,3 +443,6 @@ mod sorted_program_tests;
 
 #[cfg(test)]
 mod round1_deferred_tests;
+
+#[cfg(test)]
+mod owned_input_tests;

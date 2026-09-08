@@ -7,6 +7,9 @@ authors.workspace = true
 description = "Protocol library and verifier for the Flock R1CS-over-GF(2) PIOP."
 
 [features]
+# Reuse dead packed A/B owners for the identical zerocheck tail. Default off.
+reuse-zerocheck-inputs = []
+
 # Compile packed binary matrix programs with reusable sorted scratch buffers.
 # Exact term order and matrix acceptance match the map compiler; opt-in only.
 sorted-record-program = []

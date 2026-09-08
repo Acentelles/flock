@@ -21,6 +21,7 @@ use crate::ntt::{AdditiveNttGf8, InvNttTableByteSingleGf8};
 use serde::{Deserialize, Serialize};
 
 pub mod multilinear;
+mod owned_inputs;
 pub mod univariate_skip;
 pub mod univariate_skip_deg4;
 pub mod univariate_skip_deg4_optimized;
@@ -31,6 +32,7 @@ use multilinear::{
     interpolate_at_z_combined, interpolate_at_z_on_lambda, round_pair_naive,
     uni_skip_fold_and_round_pair_optimized_packed_padded,
 };
+use owned_inputs::PackedInputs;
 use univariate_skip_optimized::{
     c_s_f128, medium_challenges_ghash, round1_shift_reduce_extract_c_packed_padded,
     small_challenges_ghash,
@@ -188,8 +190,7 @@ pub fn prove_packed_padded<C: Challenger>(
     challenger: &mut C,
 ) -> (ZerocheckProof, ZerocheckClaim) {
     let (proof, claim, _) = prove_packed_padded_inner(
-        a_packed,
-        b_packed,
+        PackedInputs::Borrowed(a_packed, b_packed),
         c_packed,
         m,
         padding,
@@ -252,7 +253,42 @@ pub fn prove_packed_padded_capture_s_hat_v_c_with_options<C: Challenger>(
     challenger: &mut C,
 ) -> (ZerocheckProof, ZerocheckClaim, Vec<F128>) {
     let (proof, claim, captured) = prove_packed_padded_inner(
-        a_packed, b_packed, c_packed, m, padding, true, options, challenger,
+        PackedInputs::Borrowed(a_packed, b_packed),
+        c_packed,
+        m,
+        padding,
+        true,
+        options,
+        challenger,
+    );
+    (
+        proof,
+        claim,
+        captured.expect("capture=true must produce s_hat_v_c"),
+    )
+}
+
+/// Consume packed A/B buffers and reuse their storage after their last read.
+/// Proof fields, captured C values and transcript operations are identical to
+/// [`prove_packed_padded_capture_s_hat_v_c_with_options`]. C remains borrowed.
+/// All scratch ownership and recycling is completed within this call.
+pub fn prove_packed_padded_capture_s_hat_v_c_owned<C: Challenger>(
+    a_packed: Vec<F128>,
+    b_packed: Vec<F128>,
+    c_packed: &[u8],
+    m: usize,
+    padding: &PaddingSpec,
+    options: ProverOptions,
+    challenger: &mut C,
+) -> (ZerocheckProof, ZerocheckClaim, Vec<F128>) {
+    let (proof, claim, captured) = prove_packed_padded_inner(
+        PackedInputs::Owned(a_packed, b_packed),
+        c_packed,
+        m,
+        padding,
+        true,
+        options,
+        challenger,
     );
     (
         proof,
@@ -263,8 +299,7 @@ pub fn prove_packed_padded_capture_s_hat_v_c_with_options<C: Challenger>(
 
 #[allow(clippy::too_many_arguments)]
 fn prove_packed_padded_inner<C: Challenger>(
-    a_packed: &[u8],
-    b_packed: &[u8],
+    inputs: PackedInputs<'_>,
     c_packed: &[u8],
     m: usize,
     padding: &PaddingSpec,
@@ -272,6 +307,7 @@ fn prove_packed_padded_inner<C: Challenger>(
     options: ProverOptions,
     challenger: &mut C,
 ) -> (ZerocheckProof, ZerocheckClaim, Option<Vec<F128>>) {
+    let (a_packed, b_packed) = inputs.bytes();
     let k_skip = K_SKIP;
     const N_INNER: usize = 7; // 3 small + 4 medium fixed-constant eq dims
     assert!(
@@ -411,14 +447,9 @@ fn prove_packed_padded_inner<C: Challenger>(
     // two persistent buffers. Scratch capacity = N/2 (the largest fused
     // output); only needed when the first round is actually fused.
     let n_in = a_mlv.len();
-    let (mut a_nxt, mut b_nxt) = if n_in >= 1024 {
-        (
-            crate::scratch::take_f128(n_in / 2),
-            crate::scratch::take_f128(n_in / 2),
-        )
-    } else {
-        (Vec::new(), Vec::new())
-    };
+    // Packed A/B are no longer read after round 2. The owned path consumes
+    // them here; the borrowed path retains its original scratch allocation.
+    let (mut a_nxt, mut b_nxt) = inputs.into_tail_scratch(n_in);
 
     for i in 0..(n_mlv - 1) {
         let rho_prev = mlv_rhos[i];

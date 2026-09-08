@@ -480,34 +480,48 @@ pub fn prove_fast_core_reduction_after_statement<Ch: Challenger>(
     let padding = r1cs.padding_spec();
     let zerocheck_span = tracing::info_span!("flock.core.zerocheck").entered();
     let (zc_proof, zc_claim, s_hat_v_c) = {
-        // Zero-cost &[u8] views of the F128 buffers; c aliases z (C = I).
-        let a_packed: &[u8] = unsafe {
-            std::slice::from_raw_parts(
-                a_packed_f128.as_ptr() as *const u8,
-                a_packed_f128.len() * core::mem::size_of::<F128>(),
-            )
-        };
-        let b_packed: &[u8] = unsafe {
-            std::slice::from_raw_parts(
-                b_packed_f128.as_ptr() as *const u8,
-                b_packed_f128.len() * core::mem::size_of::<F128>(),
-            )
-        };
+        // C aliases z and stays borrowed across both implementation paths.
         let c_packed: &[u8] = unsafe {
             std::slice::from_raw_parts(
                 z_packed.as_ptr() as *const u8,
                 core::mem::size_of_val(z_packed),
             )
         };
-        zerocheck::prove_packed_padded_capture_s_hat_v_c_with_options(
-            a_packed, b_packed, c_packed, r1cs.m, &padding, options, challenger,
-        )
+        #[cfg(feature = "reuse-zerocheck-inputs")]
+        {
+            zerocheck::prove_packed_padded_capture_s_hat_v_c_owned(
+                a_packed_f128,
+                b_packed_f128,
+                c_packed,
+                r1cs.m,
+                &padding,
+                options,
+                challenger,
+            )
+        }
+        #[cfg(not(feature = "reuse-zerocheck-inputs"))]
+        {
+            let a_packed: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    a_packed_f128.as_ptr() as *const u8,
+                    a_packed_f128.len() * core::mem::size_of::<F128>(),
+                )
+            };
+            let b_packed: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    b_packed_f128.as_ptr() as *const u8,
+                    b_packed_f128.len() * core::mem::size_of::<F128>(),
+                )
+            };
+            let result = zerocheck::prove_packed_padded_capture_s_hat_v_c_with_options(
+                a_packed, b_packed, c_packed, r1cs.m, &padding, options, challenger,
+            );
+            // Retain the borrowed path's original lifetime and recycling.
+            flock_core::scratch::give_f128(a_packed_f128);
+            flock_core::scratch::give_f128(b_packed_f128);
+            result
+        }
     };
-    // Nothing downstream reads a/b (zerocheck consumed them in rounds 1–2);
-    // recycle the two buffers (2 × 2^(m-3) bytes — 128 MB at m = 29) instead
-    // of carrying them through lincheck and the PCS open.
-    flock_core::scratch::give_f128(a_packed_f128);
-    flock_core::scratch::give_f128(b_packed_f128);
     drop(zerocheck_span);
     lap("zerocheck");
 
