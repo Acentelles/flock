@@ -686,48 +686,107 @@ fn multilinear_points(
     Some(points)
 }
 
-/// The fifteen `Z_H`-region sub-cube points at leaf point `r` (record
-/// coords then nine index coords), one per live coordinate plane. Their
-/// theta-weighted sum (`theta_c = x^c`) is `MLE_K(Z_H, r)` over the
-/// packed leaves of spec Section 5.1. Used for the aerie fingerprint and
-/// for each masked consistency repetition.
+/// The profile's `Z_H` opening points at leaf point `r` (record coords,
+/// then nine index coords). The original profile has fifteen coordinate
+/// claims; `compact-fingerprint` uses a weighted MLE and padding correction.
 pub fn zh_fingerprint_points(record_vars: usize, r: &[F128]) -> Vec<Vec<F128>> {
+    if cfg!(feature = "compact-fingerprint") {
+        let mut weighted = zh_fingerprint_prefix(record_vars, r);
+        let mut padding = weighted.clone();
+        let (tail, _) = fingerprint_tail();
+        weighted.extend(tail);
+        padding.extend([F128::ONE; 4]);
+        return vec![weighted, padding];
+    }
+    zh_fingerprint_reference_points(record_vars, r)
+}
+
+/// Original coordinate claims, retained as the differential reference.
+pub fn zh_fingerprint_reference_points(record_vars: usize, r: &[F128]) -> Vec<Vec<F128>> {
+    let prefix = zh_fingerprint_prefix(record_vars, r);
+    (0..15)
+        .map(|c| {
+            let mut point = prefix.clone();
+            for j in 0..4 {
+                point.push(if (c >> (3 - j)) & 1 == 1 {
+                    F128::ONE
+                } else {
+                    F128::ZERO
+                });
+            }
+            point
+        })
+        .collect()
+}
+
+fn zh_fingerprint_prefix(record_vars: usize, r: &[F128]) -> Vec<F128> {
     assert_eq!(r.len(), record_vars + 9);
     let top = slots::Z_BASE >> 3;
-    let mut points = Vec::with_capacity(15);
-    for c in 0..15 {
-        let mut point = Vec::with_capacity(record_vars + slots::K_LOG);
-        point.extend_from_slice(&r[..record_vars]);
-        for j in 0..4 {
-            point.push(if (top >> (3 - j)) & 1 == 1 {
-                F128::ONE
-            } else {
-                F128::ZERO
-            });
-        }
-        point.extend_from_slice(&r[record_vars..]);
-        for j in 0..4 {
-            point.push(if (c >> (3 - j)) & 1 == 1 {
-                F128::ONE
-            } else {
-                F128::ZERO
-            });
-        }
-        points.push(point);
+    let mut point = Vec::with_capacity(record_vars + slots::K_LOG);
+    point.extend_from_slice(&r[..record_vars]);
+    for j in 0..4 {
+        point.push(if (top >> (3 - j)) & 1 == 1 {
+            F128::ONE
+        } else {
+            F128::ZERO
+        });
     }
-    points
+    point.extend_from_slice(&r[record_vars..]);
+    point
 }
 
 /// Theta-weighted combination of the fifteen values opened at
 /// [`zh_fingerprint_points`]: `MLE_K(Z_H, r)`.
 pub fn zh_fingerprint_value(values: &[F128]) -> F128 {
-    assert_eq!(values.len(), 15);
+    assert_eq!(values.len(), FINGERPRINT_CLAIMS);
+    if cfg!(feature = "compact-fingerprint") {
+        return fingerprint_tail().1 * values[0] + F128 { lo: 1 << 15, hi: 0 } * values[1];
+    }
     let mut acc = F128::ZERO;
     for (c, &value) in values.iter().enumerate() {
         acc += F128 { lo: 1 << c, hi: 0 } * value;
     }
     acc
 }
+
+/// Number of opening claims in the compiled, transcript-bound profile.
+pub const FINGERPRINT_CLAIMS: usize = if cfg!(feature = "compact-fingerprint") {
+    2
+} else {
+    15
+};
+
+/// MSB-first MLE tail whose scaled eq weights are x^i for all sixteen bits.
+/// The sixteenth bit is free input in the slot circuit, so its contribution
+/// must be canceled by a second opening, even though honest witnesses zero it.
+fn fingerprint_tail() -> ([F128; 4], F128) {
+    static TAIL: std::sync::OnceLock<([F128; 4], F128)> = std::sync::OnceLock::new();
+    *TAIL.get_or_init(|| {
+        let mut tail = [F128::ZERO; 4];
+        let mut scale = F128::ONE;
+        for j in 0..4 {
+            let c = F128 {
+                lo: 1 << (1 << j),
+                hi: 0,
+            };
+            let denominator = F128::ONE + c;
+            assert_ne!(denominator, F128::ZERO);
+            tail[3 - j] = c * denominator.inv();
+            scale = scale * denominator;
+        }
+        (tail, scale)
+    })
+}
+
+fn bind_fingerprint_profile<Ch: Challenger>(challenger: &mut Ch) {
+    if cfg!(feature = "compact-fingerprint") {
+        challenger.observe_label(b"aerie-record-fingerprint-two-claims-v1");
+    }
+}
+
+#[cfg(test)]
+#[path = "hash_to_point_record_fingerprint_tests.rs"]
+mod fingerprint_tests;
 
 /// Reconstruct the scatter terminal from the claimed opening values (the
 /// shared verifier/prover-consistency logic). `values` follows
@@ -961,6 +1020,7 @@ pub fn prove_record_core_bound<Ch: Challenger>(
     // The aerie fingerprint leaf point. In production the challenger IS
     // the joint aerie transcript (seeded through observe_bytes), so this
     // sampling happens after C_H and the aerie-side commitments.
+    bind_fingerprint_profile(challenger);
     challenger.observe_label(b"aerie-record-fingerprint-v0");
     let r_fp = challenger.sample_f128_vec(record_vars + 9);
 
@@ -982,8 +1042,8 @@ pub fn prove_record_core_bound<Ch: Challenger>(
     let points = multilinear_points(record_vars, &rs, &r_fp, beta, gamma, delta)
         .expect("derived power coordinates defined");
     // Points 0..44 are the scatter/discharge/Z_H set (survives the S5
-    // restructure); 44..59 are the fingerprint openings (S5-deletion
-    // candidates) — lapped separately so the S5 dividend is measurable.
+    // restructure); the remaining points are the profile's fingerprint
+    // openings, lapped separately to expose their work.
     // The fingerprint points share the r_fp family, so splitting the
     // call keeps every intra-family tensor share.
     let evaluate = |points: &[Vec<F128>]| {
@@ -997,10 +1057,7 @@ pub fn prove_record_core_bound<Ch: Challenger>(
     lap("opening values (scatter/discharge/Z_H)", &mut stage);
     opening_values.extend(evaluate(&points[44..]));
     lap("opening values (fingerprint)", &mut stage);
-    let mut fingerprint_value = F128::ZERO;
-    for c in 0..15 {
-        fingerprint_value += F128 { lo: 1 << c, hi: 0 } * opening_values[44 + c];
-    }
+    let fingerprint_value = zh_fingerprint_value(&opening_values[44..]);
 
     RecordCore {
         z_packed,
@@ -1262,6 +1319,7 @@ pub fn verify_record_core_parts<Ch: Challenger>(
     let beta = challenger.sample_f128();
     let gamma = challenger.sample_f128();
     let delta = challenger.sample_f128();
+    bind_fingerprint_profile(challenger);
     challenger.observe_label(b"aerie-record-fingerprint-v0");
     let r_fp = challenger.sample_f128_vec(record_vars + 9);
 
@@ -1274,14 +1332,11 @@ pub fn verify_record_core_parts<Ch: Challenger>(
     )?;
 
     // Claimed opening values, in the fixed order.
-    if opening_values.len() != 59 {
+    if opening_values.len() != 44 + FINGERPRINT_CLAIMS {
         return Err("wrong opening value count");
     }
     let values = opening_values;
-    let mut fingerprint_value = F128::ZERO;
-    for c in 0..15 {
-        fingerprint_value += F128 { lo: 1 << c, hi: 0 } * values[44 + c];
-    }
+    let fingerprint_value = zh_fingerprint_value(&values[44..]);
     if fingerprint_value != claimed_fingerprint {
         return Err("the fingerprint value does not match its openings");
     }
