@@ -2,7 +2,7 @@
 //! Keccak3 domain or a second simulation to discover permutation input states.
 use super::super::{hash_to_point_slots as slots, hash_to_point_sponge as sponge, keccak};
 use super::circuit::{Setup, Witness, copy_word_rows};
-use super::layout::{CONST, K, KECCAK, PERM, copy64, record_position};
+use super::layout::{CONST, K, copy64, product_position, record_position, state_position};
 use flock_core::{field::F128, r1cs::word_apply::Program};
 use rayon::prelude::*;
 
@@ -28,15 +28,18 @@ fn write64(words: &mut [F128], bit: usize, value: u64) {
 /// its compact addresses. The final lanes feed the next sponge permutation.
 fn fill_permutation(
     lanes: &mut keccak::Lanes,
-    base: usize,
+    permutation: usize,
     z: &mut [F128],
     a: &mut [F128],
     b: &mut [F128],
 ) {
+    let input_base = state_position(permutation, 0);
+    let output_base = state_position(permutation, 1);
+    let product_base = product_position(permutation);
     for (lane, &value) in lanes.iter().enumerate() {
-        write64(z, base + lane * 64, value);
-        write64(a, base + lane * 64, value);
-        write64(b, base + lane * 64, u64::MAX);
+        write64(z, input_base + lane * 64, value);
+        write64(a, input_base + lane * 64, value);
+        write64(b, input_base + lane * 64, u64::MAX);
     }
     for round in 0..24 {
         let mut phi = *lanes;
@@ -48,7 +51,7 @@ fn fill_permutation(
                 let left = !phi[(x + 1) % 5 + 5 * y];
                 let right = phi[(x + 2) % 5 + 5 * y];
                 let product = left & right;
-                let bit = base + 3200 + round * 1600 + lane * 64;
+                let bit = product_base + round * 1600 + lane * 64;
                 write64(z, bit, product);
                 write64(a, bit, left);
                 write64(b, bit, right);
@@ -58,9 +61,9 @@ fn fill_permutation(
         keccak::iota_lanes(lanes, round);
     }
     for (lane, &value) in lanes.iter().enumerate() {
-        write64(z, base + 1600 + lane * 64, value);
-        write64(a, base + 1600 + lane * 64, value);
-        write64(b, base + 1600 + lane * 64, u64::MAX);
+        write64(z, output_base + lane * 64, value);
+        write64(a, output_base + lane * 64, value);
+        write64(b, output_base + lane * 64, u64::MAX);
     }
 }
 
@@ -98,7 +101,7 @@ pub fn compact_sponge_witness(
                         *lane ^= u64::from_le_bytes(bytes.try_into().unwrap());
                     }
                 }
-                fill_permutation(&mut lanes, KECCAK + permutation * PERM, z, a, b);
+                fill_permutation(&mut lanes, permutation, z, a, b);
                 if permutation >= 1 {
                     for &lane in &lanes[..sponge::RATE_BYTES / 8] {
                         for bytes in lane.to_le_bytes().chunks_exact(2) {

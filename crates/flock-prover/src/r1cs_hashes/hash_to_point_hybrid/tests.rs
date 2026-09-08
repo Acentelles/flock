@@ -92,6 +92,14 @@ fn hybrid_complete_relation_and_rejections() {
     let prepared = commit(&setup, w);
     let mut ch = FsChallenger::new(b"hybrid-full-relation-test-v1");
     let core = prove_core(&setup, prepared, &mut ch);
+    #[cfg(all(feature = "aligned-hybrid", feature = "compact-fingerprint"))]
+    {
+        let mut closure_ch = FsChallenger::new(b"hybrid-opening-count-v2");
+        let closed =
+            super::super::face_closure::close_faces(&core.points, &core.values, &mut closure_ch)
+                .unwrap();
+        assert_eq!(closed.len() + 2, 27);
+    }
     let r_fp = core.r_fp.clone();
     let proof = open(&setup, core, &mut ch);
     let check = |p: &Proof, publics: &[sponge::SpongePublic]| {
@@ -117,6 +125,10 @@ fn hybrid_complete_relation_and_rejections() {
     let mut bad_publics = publics.clone();
     bad_publics[0].hpk[0] ^= 1;
     assert!(check(&proof, &bad_publics).is_err());
+    let mut incompatible = Setup::new(32);
+    incompatible.descriptor[0] ^= 1;
+    let mut ch = FsChallenger::new(b"hybrid-full-relation-test-v1");
+    assert!(verify_core(&incompatible, &publics, &proof, &mut ch).is_err());
 }
 
 #[test]

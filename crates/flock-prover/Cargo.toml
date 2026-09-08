@@ -20,6 +20,9 @@ face-batching = []
 # Versioned record fingerprint: a weighted MLE plus an explicit padding correction.
 # With this disabled the original fifteen-claim transcript is unchanged.
 compact-fingerprint = []
+# C50's versioned compact circuit: aligned SHAKE state subcubes and a
+# 256/256/128 record layout. Direct and reference preparation share this layout.
+aligned-hybrid = []
 
 [dependencies]
 flock-core = { path = "../flock-core" }

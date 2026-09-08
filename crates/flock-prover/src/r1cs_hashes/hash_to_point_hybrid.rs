@@ -1,6 +1,8 @@
 //! Experimental complete private-salt HashToPoint relation in one compact
 //! circuit, one commitment, one zerocheck/lincheck and one Flock opening.
 //! The SHAKE/record word link is enforced by circuit copy rows.
+#[cfg(all(test, feature = "aligned-hybrid"))]
+mod aligned_tests;
 mod circuit;
 mod direct;
 pub mod layout;

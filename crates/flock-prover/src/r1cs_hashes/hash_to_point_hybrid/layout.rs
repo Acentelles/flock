@@ -4,20 +4,69 @@ use flock_core::field::F128;
 
 pub const K_LOG: usize = 19;
 pub const K: usize = 1 << K_LOG;
-pub const TARGET: usize = 3 * 32768;
+pub const ALIGNED_STATES: bool = cfg!(feature = "aligned-hybrid");
+pub const PROFILE: &str = if ALIGNED_STATES {
+    "aligned-state-v2"
+} else {
+    "compact-state-v1"
+};
+pub const DESCRIPTOR_DOMAIN: &[u8] = if ALIGNED_STATES {
+    b"aerie/hybrid-keccak-f1600-24-slot-v2/256-256-128-slot-segments/aligned-state-subcubes/copy-big-endian-words"
+} else {
+    b"aerie/hybrid-keccak-f1600-24-slot-v1/three-256-slot-segments/trim-state-padding/copy-big-endian-words"
+};
+pub const TRANSCRIPT_DOMAIN: &[u8] = if ALIGNED_STATES {
+    b"aerie-hybrid-compact-circuit-v2"
+} else {
+    b"aerie-hybrid-compact-circuit-v1"
+};
+pub const TARGET: usize = if ALIGNED_STATES { 81920 } else { 3 * 32768 };
 pub const CONST: usize = TARGET + 8192;
 pub const KECCAK: usize = CONST + 128;
 pub const PERM: usize = 2 * 1600 + 24 * 1600;
-pub const END: usize = KECCAK + 10 * PERM;
+pub const STATES: usize = 3 * 32768;
+pub const STATE_STRIDE: usize = 2048;
+pub const T_BASE: usize = STATES + 20 * STATE_STRIDE;
+pub const END: usize = if ALIGNED_STATES {
+    T_BASE + 10 * 24 * 1600
+} else {
+    KECCAK + 10 * PERM
+};
+const _: () = assert!(!ALIGNED_STATES || slots::SLOTS <= 640);
+const _: () = assert!(!ALIGNED_STATES || CONST + 128 <= STATES);
 const _: () = assert!(END <= K);
+
+#[inline]
+pub fn state_position(permutation: usize, output: usize) -> usize {
+    if ALIGNED_STATES {
+        STATES + (2 * permutation + output) * STATE_STRIDE
+    } else {
+        KECCAK + permutation * PERM + output * 1600
+    }
+}
+
+#[inline]
+pub fn product_position(permutation: usize) -> usize {
+    if ALIGNED_STATES {
+        T_BASE + permutation * 38400
+    } else {
+        KECCAK + permutation * PERM + 3200
+    }
+}
 
 pub fn record_position(old: usize) -> Option<usize> {
     if old == slots::Z_CONST_POS {
         return Some(CONST);
     }
     let (plane, slot) = (old / 1024, old % 1024);
-    if plane < 112 && slot < 768 {
-        Some((slot / 256) * 32768 + plane * 256 + slot % 256)
+    let retained_slots = if ALIGNED_STATES { 640 } else { 768 };
+    if plane < 112 && slot < retained_slots {
+        let (base, width, offset) = if ALIGNED_STATES && slot >= 512 {
+            (2 * 32768, 128, slot - 512)
+        } else {
+            ((slot / 256) * 32768, 256, slot % 256)
+        };
+        Some(base + plane * width + offset)
     } else if (112..120).contains(&plane) {
         Some(TARGET + (plane - 112) * 1024 + slot)
     } else {
@@ -33,12 +82,11 @@ pub fn sponge_position(block: usize, old: usize) -> Option<usize> {
         let slot = old / 2048;
         let permutation = 4 * (slot / 2) + block;
         let bit = old % 2048;
-        (permutation < 10 && bit < 1600)
-            .then_some(KECCAK + permutation * PERM + (slot % 2) * 1600 + bit)
+        (permutation < 10 && bit < 1600).then_some(state_position(permutation, slot % 2) + bit)
     } else if (keccak3::T_PACKED_BIT_BASE..keccak3::USEFUL_BITS).contains(&old) {
         let offset = old - keccak3::T_PACKED_BIT_BASE;
         let permutation = 4 * (offset / 38400) + block;
-        (permutation < 10).then_some(KECCAK + permutation * PERM + 3200 + offset % 38400)
+        (permutation < 10).then_some(product_position(permutation) + offset % 38400)
     } else {
         None
     }
@@ -47,7 +95,7 @@ pub fn sponge_position(block: usize, old: usize) -> Option<usize> {
 /// Candidate words are big-endian; state bytes are little-endian lane bytes.
 pub fn word_source(slot: usize, bit: usize) -> usize {
     assert!(slot < slots::SLOTS && bit < 16);
-    KECCAK + (1 + slot / 68) * PERM + 1600 + 16 * (slot % 68) + (bit ^ 8)
+    state_position(1 + slot / 68, 1) + 16 * (slot % 68) + (bit ^ 8)
 }
 
 pub fn bit(words: &[F128], p: usize) -> bool {
@@ -128,17 +176,18 @@ fn cube(
 pub fn record_fragments(point: &[F128]) -> Vec<Fragment> {
     let mut out = Vec::new();
     for segment in 0..3 {
+        let slot_log = if ALIGNED_STATES && segment == 2 { 7 } else { 8 };
         for (plane, log) in [(0, 6), (64, 5), (96, 4)] {
-            let axes: Vec<_> = (0..8)
+            let axes: Vec<_> = (0..slot_log)
                 .map(|i| (i, i))
-                .chain((0..log).map(|i| (10 + i, 8 + i)))
+                .chain((0..log).map(|i| (10 + i, slot_log + i)))
                 .collect();
             cube(
                 &mut out,
                 point,
                 17,
                 (plane << 10) + (segment << 8),
-                (segment << 15) + (plane << 8),
+                (segment << 15) + (plane << slot_log),
                 &axes,
             );
         }
@@ -158,13 +207,25 @@ pub fn record_fragments(point: &[F128]) -> Vec<Fragment> {
 }
 
 /// Only state subcubes are queried by the SHAKE framing/chain relation.
-/// Trimmed state padding is constrained zero in the original relation.
+/// In the aligned profile the original constrained-zero state padding is
+/// retained, so each full 2048-bit slot is opened as one subcube.
 pub fn sponge_fragments(point: &[F128]) -> Vec<Fragment> {
     let mut out = Vec::new();
     for permutation in 0..10 {
         for output in 0..2 {
             let old = (permutation % 4) * keccak3::K + (2 * (permutation / 4) + output) * 2048;
-            let new = KECCAK + permutation * PERM + output * 1600;
+            let new = state_position(permutation, output);
+            if ALIGNED_STATES {
+                cube(
+                    &mut out,
+                    point,
+                    19,
+                    old,
+                    new,
+                    &(0..11).map(|i| (i, i)).collect::<Vec<_>>(),
+                );
+                continue;
+            }
             let mut offset = 0usize;
             while offset < 1600 {
                 let remaining = 1600usize - offset;
