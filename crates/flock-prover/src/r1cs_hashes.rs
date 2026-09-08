@@ -8,6 +8,7 @@
 //! [`common`].
 
 pub mod blake3;
+pub mod carry_gate;
 /// Generic hash-chain glue ([`ChainLayout`]-parameterized prove/verify) shared
 /// by the per-hash `*_chain` modules.
 ///
@@ -15,8 +16,6 @@ pub mod blake3;
 pub mod chain_common;
 pub mod claim_closure;
 pub mod common;
-/// Exact packed bit-MLE evaluations, shared by the private-salt lanes.
-pub mod packed_mle;
 pub mod face_closure;
 /// The cross-lane word linkage plus the complete HashToPoint driver.
 pub mod hash_to_point_link;
@@ -37,10 +36,14 @@ pub mod keccak;
 /// for tighter PCS utilization (~97% vs the single encoder's ~65%).
 pub mod keccak3;
 pub mod keccak_gkr;
-pub mod carry_gate;
 /// Generic Merkle-path glue ([`MerkleLayout`]-parameterized prove/verify),
 /// analogous to [`chain_common`] but with a per-row bit selector.
 ///
 /// [`MerkleLayout`]: merkle_path_common::MerkleLayout
 pub mod merkle_path_common;
+/// Exact packed bit-MLE evaluations, shared by the private-salt lanes.
+pub mod packed_mle;
 pub mod sha2;
+
+/// Experimental compact complete HashToPoint circuit.
+pub mod hash_to_point_hybrid;

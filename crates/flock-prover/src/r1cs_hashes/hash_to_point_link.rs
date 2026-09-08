@@ -199,7 +199,11 @@ pub fn keccak_link_claims(
             // Slot bits (6, MSB-first): the sub-keccak's state_24 slot.
             let slot = 2 * sub + 1;
             for j in (0..6).rev() {
-                point.push(if (slot >> j) & 1 == 1 { F128::ONE } else { F128::ZERO });
+                point.push(if (slot >> j) & 1 == 1 {
+                    F128::ONE
+                } else {
+                    F128::ZERO
+                });
             }
             // Word bits (offset bits 10..4): fixed high, mu-tensor free.
             for j in (wk..7).rev() {
@@ -262,8 +266,10 @@ pub fn prove_link_claims<Ch: Challenger>(
         keccak_link_claims(keccak_record_vars, delta, nu, mu, gamma).expect("nondegenerate");
     let (slot_values, keccak_values): (Vec<F128>, Vec<F128>) = rayon::join(
         || {
-            let points: Vec<Vec<F128>> =
-                slot_claims.iter().map(|claim| claim.point.clone()).collect();
+            let points: Vec<Vec<F128>> = slot_claims
+                .iter()
+                .map(|claim| claim.point.clone())
+                .collect();
             sponge::gather_eval_many(slot_z_packed, &points)
         },
         || {
@@ -388,11 +394,11 @@ pub fn prove_consistency_with(
     let mut values = Vec::with_capacity(slots::MASK_REPS);
     let mut tags = Vec::with_capacity(slots::MASK_REPS);
     for (rep, (r, gamma)) in challenges.iter().enumerate() {
-        let mut rep_points = record::zh_fingerprint_points(record_vars, r);
+        let mut rep_points = record::zh_fingerprint_reference_points(record_vars, r);
         let (mask_point, mask_scale) = mask_claim_point(record_vars, rep);
         rep_points.push(mask_point);
         let rep_values = sponge::gather_eval_many(z_packed, &rep_points);
-        let v = record::zh_fingerprint_value(&rep_values[..15]);
+        let v = record::zh_fingerprint_reference_value(&rep_values[..15]);
         tags.push(*gamma * v + mask_scale * rep_values[15]);
         points.extend(rep_points);
         values.push(rep_values);
@@ -429,11 +435,11 @@ pub fn verify_consistency_with(
             return Err("wrong consistency claim count");
         }
         let (mask_point, mask_scale) = mask_claim_point(record_vars, rep);
-        let v = record::zh_fingerprint_value(&rep_values[..15]);
+        let v = record::zh_fingerprint_reference_value(&rep_values[..15]);
         if proof.tags[rep] != *gamma * v + mask_scale * rep_values[15] {
             return Err("a consistency tag equation does not hold");
         }
-        points.extend(record::zh_fingerprint_points(record_vars, r));
+        points.extend(record::zh_fingerprint_reference_points(record_vars, r));
         points.push(mask_point);
         flat_values.extend_from_slice(rep_values);
     }
@@ -545,17 +551,21 @@ pub fn prove_hash_to_point<Ch: Challenger>(
     for rep_values in &consistency.values {
         record_extra_values.extend_from_slice(rep_values);
     }
-    let (sponge_proof, _) =
-        sponge::open_sponge(
-            sponge_setup,
-            sponge_core,
-            &keccak_points,
-            &link.keccak_values,
-            challenger,
-        );
+    let (sponge_proof, _) = sponge::open_sponge(
+        sponge_setup,
+        sponge_core,
+        &keccak_points,
+        &link.keccak_values,
+        challenger,
+    );
     lap("sponge open (keccak PCS)");
-    let (record_proof, _) =
-        record::open_record(slot_setup, record_core, &record_extra, &record_extra_values, challenger);
+    let (record_proof, _) = record::open_record(
+        slot_setup,
+        record_core,
+        &record_extra,
+        &record_extra_values,
+        challenger,
+    );
     lap("record open (slot PCS)");
     HashToPointProof {
         sponge: sponge_proof,
@@ -720,16 +730,25 @@ pub fn prove_hash_to_point_single_root<Ch: Challenger>(
     let half_words = 1_usize << (params_h.m - 8);
     let mut z_h = vec![F128::ZERO; 2 * half_words];
     z_h[..sponge_wit.z_packed.len()].copy_from_slice(&sponge_wit.z_packed);
-    z_h[half_words..half_words + record_wit.z_packed.len()]
-        .copy_from_slice(&record_wit.z_packed);
+    z_h[half_words..half_words + record_wit.z_packed.len()].copy_from_slice(&record_wit.z_packed);
     let (commitment, prover_data) = pcs::commit(&z_h, &params_h);
     lap("single-root commit");
 
-    let sponge_core =
-        sponge::prove_sponge_core_bound(sponge_setup, sponge_wit, commitment.clone(), None, challenger);
+    let sponge_core = sponge::prove_sponge_core_bound(
+        sponge_setup,
+        sponge_wit,
+        commitment.clone(),
+        None,
+        challenger,
+    );
     lap("sponge core (keccak lane)");
-    let record_core =
-        record::prove_record_core_bound(slot_setup, record_wit, commitment.clone(), None, challenger);
+    let record_core = record::prove_record_core_bound(
+        slot_setup,
+        record_wit,
+        commitment.clone(),
+        None,
+        challenger,
+    );
     lap("record core (slot lane)");
     let (link, slot_points, keccak_points) = prove_link_claims(
         slot_setup,
@@ -771,12 +790,18 @@ pub fn prove_hash_to_point_single_root<Ch: Challenger>(
         .collect();
     let sponge_pre: Vec<Vec<F128>> = flock_core::pcs::ring_switch::s_hat_v_multi_padded(
         &sponge_core.fast.z_packed,
-        &sponge_x_outers.iter().map(|v| v.as_slice()).collect::<Vec<_>>(),
+        &sponge_x_outers
+            .iter()
+            .map(|v| v.as_slice())
+            .collect::<Vec<_>>(),
         &sponge_setup.keccak.r1cs.padding_spec(),
     );
     let record_pre: Vec<Vec<F128>> = flock_core::pcs::ring_switch::s_hat_v_multi_padded(
         &record_core.z_packed,
-        &record_x_outers.iter().map(|v| v.as_slice()).collect::<Vec<_>>(),
+        &record_x_outers
+            .iter()
+            .map(|v| v.as_slice())
+            .collect::<Vec<_>>(),
         &slot_setup.r1cs.padding_spec(),
     );
     lap("lane-local s_hat_v precomputes");
@@ -1102,10 +1127,16 @@ mod tests {
         // The opening mode is authenticated by its reduction transcript.
         for sponge_mode in [true, false] {
             let mut wrong = proof.clone();
-            if sponge_mode { wrong.sponge.face_closure = !wrong.sponge.face_closure; }
-            else { wrong.record.face_closure = !wrong.record.face_closure; }
+            if sponge_mode {
+                wrong.sponge.face_closure = !wrong.sponge.face_closure;
+            } else {
+                wrong.record.face_closure = !wrong.record.face_closure;
+            }
             let mut fresh = FsChallenger::new(b"aerie-hash-to-point");
-            assert!(verify_hash_to_point(&sponge_setup, &slot_setup, &publics, &wrong, &mut fresh).is_err());
+            assert!(
+                verify_hash_to_point(&sponge_setup, &slot_setup, &publics, &wrong, &mut fresh)
+                    .is_err()
+            );
         }
 
         // A tampered linkage value rejects.

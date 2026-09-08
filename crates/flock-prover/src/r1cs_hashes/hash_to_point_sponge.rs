@@ -431,7 +431,11 @@ pub fn sponge_initial_states(traces: &[[State; LIVE_PERMS]]) -> Vec<State> {
         for blk in 0..BLOCKS_PER_RECORD {
             for sub in 0..keccak3::N_SUB {
                 let e = BLOCKS_PER_RECORD * sub + blk;
-                initial_states.push(if e < LIVE_PERMS { states[e] } else { zero_state });
+                initial_states.push(if e < LIVE_PERMS {
+                    states[e]
+                } else {
+                    zero_state
+                });
             }
         }
     }
@@ -568,14 +572,31 @@ pub fn open_sponge<Ch: Challenger>(
     assert_eq!(extra_points.len(), extra_values.len());
     let face_closure = cfg!(feature = "face-batching");
     let closed = if face_closure {
-        let all_points: Vec<_> = core.points.iter().cloned().chain(extra_points.iter().cloned()).collect();
-        let all_values: Vec<_> = core.opening_values.iter().copied().chain(extra_values.iter().copied()).collect();
-        let closed = super::face_closure::close_faces(&all_points, &all_values, challenger).expect("valid face claims");
+        let all_points: Vec<_> = core
+            .points
+            .iter()
+            .cloned()
+            .chain(extra_points.iter().cloned())
+            .collect();
+        let all_values: Vec<_> = core
+            .opening_values
+            .iter()
+            .copied()
+            .chain(extra_values.iter().copied())
+            .collect();
+        let closed = super::face_closure::close_faces(&all_points, &all_values, challenger)
+            .expect("valid face claims");
         if std::env::var_os("FLOCK_TRACE").is_some() {
-            eprintln!("  [prove_sponge] face claims: {} -> {}", all_points.len(), closed.len());
+            eprintln!(
+                "  [prove_sponge] face claims: {} -> {}",
+                all_points.len(),
+                closed.len()
+            );
         }
         Some(closed)
-    } else { None };
+    } else {
+        None
+    };
     let fast = core.fast;
     let ab = fast.ab.clone();
     let c = fast.c.clone();
@@ -606,10 +627,7 @@ pub fn open_sponge<Ch: Challenger>(
     let pre_ab: Option<&[F128]> = fast.s_hat_v_ab.as_deref();
     let pre_c: Option<&[F128]> = Some(fast.s_hat_v_c.as_slice());
     let mut precomputed: Vec<Option<&[F128]>> = vec![pre_ab, pre_c];
-    precomputed.extend(std::iter::repeat_n(
-        None,
-        x_fulls.len() - 2,
-    ));
+    precomputed.extend(std::iter::repeat_n(None, x_fulls.len() - 2));
     let lig_config = setup
         .keccak
         .pcs_params
@@ -905,8 +923,17 @@ pub fn verify_sponge_open<Ch: Challenger>(
         },
     ];
     if proof.face_closure {
-        let all_points: Vec<_> = points.iter().cloned().chain(extra_points.iter().cloned()).collect();
-        let all_values: Vec<_> = proof.opening_values.iter().copied().chain(extra_values.iter().copied()).collect();
+        let all_points: Vec<_> = points
+            .iter()
+            .cloned()
+            .chain(extra_points.iter().cloned())
+            .collect();
+        let all_values: Vec<_> = proof
+            .opening_values
+            .iter()
+            .copied()
+            .chain(extra_values.iter().copied())
+            .collect();
         for claim in super::face_closure::close_faces(&all_points, &all_values, challenger)? {
             claim_values.push(claim.value);
             let (x_low, x_outer) = flock_claim_shape(&claim.point);
@@ -1032,4 +1059,59 @@ mod tests {
         let mut fresh = FsChallenger::new(b"aerie-sponge-proof");
         assert!(verify_sponge(&setup, &publics, &wrong, &mut fresh).is_err());
     }
+}
+
+/// Relation claims for a circuit that already proves all live permutations.
+pub fn sponge_relation_points<Ch: Challenger>(
+    record_vars: usize,
+    challenger: &mut Ch,
+) -> Vec<Vec<F128>> {
+    challenger.observe_label(b"aerie-sponge-challenges-v0");
+    let delta = challenger.sample_f128();
+    let r = challenger.sample_f128_vec(11);
+    sponge_points(record_vars, delta, &r).expect("nondegenerate sponge coordinates")
+}
+
+/// Replay all private-salt framing, absorption and squeeze-chain checks.
+pub fn verify_sponge_relation<Ch: Challenger>(
+    record_vars: usize,
+    publics: &[SpongePublic],
+    opening_values: &[F128],
+    challenger: &mut Ch,
+) -> Result<Vec<Vec<F128>>, &'static str> {
+    if publics.len() != 1 << record_vars {
+        return Err("sponge public count");
+    }
+    challenger.observe_label(b"aerie-sponge-challenges-v0");
+    let delta = challenger.sample_f128();
+    let r = challenger.sample_f128_vec(11);
+
+    if opening_values.len() != 22 {
+        return Err("wrong opening value count");
+    }
+    let values = opening_values;
+    let scale = record_scale(record_vars, delta).ok_or("degenerate delta")?;
+    let (xor_term, frame_term) = public_terms(publics, record_vars, delta, &r);
+
+    // Interior edges: IN_e == OUT_(e-1) for e in 2..=9.
+    for e in 2..LIVE_PERMS {
+        if values[e] != values[10 + e - 1] {
+            return Err("a sponge chain edge does not hold");
+        }
+    }
+    // The absorption edge: IN_1 == OUT_0 + public second blocks. The
+    // openings carry the derived-coordinate scale; the public term is a
+    // raw delta-power sum, so it is divided by the scale.
+    if scale * values[1] != scale * values[10] + xor_term {
+        return Err("the absorption edge does not hold");
+    }
+    // Record starts: the full slot minus the scaled salt sub-cubes must
+    // equal the public frame.
+    let (s256, s64) = salt_scales(&r);
+    if scale * (values[0] + s256 * values[20] + s64 * values[21]) != frame_term {
+        return Err("a record-start state does not pin to its public frame");
+    }
+
+    let points = sponge_points(record_vars, delta, &r).ok_or("degenerate delta")?;
+    Ok(points)
 }

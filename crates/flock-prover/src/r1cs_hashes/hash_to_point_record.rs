@@ -742,6 +742,12 @@ pub fn zh_fingerprint_value(values: &[F128]) -> F128 {
     if cfg!(feature = "compact-fingerprint") {
         return fingerprint_tail().1 * values[0] + F128 { lo: 1 << 15, hi: 0 } * values[1];
     }
+    zh_fingerprint_reference_value(values)
+}
+
+/// The original fifteen-coordinate sum, also used by masked consistency.
+pub fn zh_fingerprint_reference_value(values: &[F128]) -> F128 {
+    assert_eq!(values.len(), 15);
     let mut acc = F128::ZERO;
     for (c, &value) in values.iter().enumerate() {
         acc += F128 { lo: 1 << c, hi: 0 } * value;
@@ -1472,4 +1478,106 @@ pub fn verify_record_open<Ch: Challenger>(
         challenger,
     )
     .map_err(|_| "batched opening verification failed")
+}
+
+/// Scatter and target relation after a caller has proved the binary circuit.
+/// Values remain obligations for that caller's authenticated opening.
+pub struct RecordRelation {
+    pub scatter: scatter::ScatterProof,
+    pub points: Vec<Vec<F128>>,
+    pub values: Vec<F128>,
+    pub r_fp: Vec<F128>,
+    pub fingerprint: F128,
+}
+
+pub fn prove_record_relation<Ch: Challenger>(
+    record_vars: usize,
+    read_bit: impl Fn(usize) -> bool + Sync,
+    evaluate: impl Fn(&[Vec<F128>]) -> Vec<F128>,
+    challenger: &mut Ch,
+) -> RecordRelation {
+    // Scatter challenges, post-commitment and post-R1CS.
+    challenger.observe_label(b"aerie-record-scatter-challenges-v0");
+    let beta = challenger.sample_f128();
+    let gamma = challenger.sample_f128();
+    let delta = challenger.sample_f128();
+    // The aerie fingerprint leaf point. In production the challenger IS
+    // the joint aerie transcript (seeded through observe_bytes), so this
+    // sampling happens after C_H and the aerie-side commitments.
+    bind_fingerprint_profile(challenger);
+    challenger.observe_label(b"aerie-record-fingerprint-v0");
+    let r_fp = challenger.sample_f128_vec(record_vars + 9);
+
+    let factors = compact_scatter::Factors::new(read_bit, record_vars, beta, gamma, delta);
+    let (scatter_proof, rs) = factors.prove(challenger);
+
+    let points = multilinear_points(record_vars, &rs, &r_fp, beta, gamma, delta)
+        .expect("derived power coordinates defined");
+    // Points 0..44 are the scatter/discharge/Z_H set (survives the S5
+    // restructure); the remaining points are the profile's fingerprint
+    // openings, lapped separately to expose their work.
+    // The fingerprint points share the r_fp family, so splitting the
+    // call keeps every intra-family tensor share.
+    let mut opening_values = evaluate(&points[..44]);
+    opening_values.extend(evaluate(&points[44..]));
+    let fingerprint_value = zh_fingerprint_value(&opening_values[44..]);
+    RecordRelation {
+        scatter: scatter_proof,
+        points,
+        values: opening_values,
+        r_fp,
+        fingerprint: fingerprint_value,
+    }
+}
+
+pub fn verify_record_relation<Ch: Challenger>(
+    record_vars: usize,
+    scatter_proof: &scatter::ScatterProof,
+    opening_values: &[F128],
+    claimed_fingerprint: F128,
+    challenger: &mut Ch,
+) -> Result<(Vec<Vec<F128>>, Vec<F128>), &'static str> {
+    challenger.observe_label(b"aerie-record-scatter-challenges-v0");
+    let beta = challenger.sample_f128();
+    let gamma = challenger.sample_f128();
+    let delta = challenger.sample_f128();
+    bind_fingerprint_profile(challenger);
+    challenger.observe_label(b"aerie-record-fingerprint-v0");
+    let r_fp = challenger.sample_f128_vec(record_vars + 9);
+
+    let factor_count = 3 + COUNTER_BITS;
+    let (rs, terminal) = scatter::verify(
+        scatter_proof,
+        record_vars + SLOT_VARS,
+        factor_count,
+        challenger,
+    )?;
+
+    // Claimed opening values, in the fixed order.
+    if opening_values.len() != 44 + FINGERPRINT_CLAIMS {
+        return Err("wrong opening value count");
+    }
+    let values = opening_values;
+    let fingerprint_value = zh_fingerprint_value(&values[44..]);
+    if fingerprint_value != claimed_fingerprint {
+        return Err("the fingerprint value does not match its openings");
+    }
+
+    // Scatter terminal from the claimed openings.
+    if terminal != reconstruct_terminal(record_vars, &rs, values, beta, gamma, delta) {
+        return Err("scatter terminal does not match the openings");
+    }
+
+    // The Z_H binding identity: the slot side carries beta^(count-after)
+    // = beta * beta^(write index) on gated slots, so the scatter claim
+    // equals beta times the scaled sub-cube opening of the Z region.
+    let (_zh_point, zh_scale) =
+        zh_power_point(record_vars, beta, gamma, delta).ok_or("degenerate power point")?;
+    if scatter_proof.claim != beta * zh_scale * values[43] {
+        return Err("the Z_H power sum does not match the scatter claim");
+    }
+
+    let points = multilinear_points(record_vars, &rs, &r_fp, beta, gamma, delta)
+        .ok_or("degenerate power point")?;
+    Ok((points, r_fp))
 }

@@ -74,3 +74,21 @@ fn compact_profile_is_bound_before_fingerprint_challenges() {
     let original = original.sample_f128();
     assert_eq!(selected == original, !cfg!(feature = "compact-fingerprint"));
 }
+
+#[test]
+fn compact_profile_preserves_masked_consistency_claim_shape() {
+    use super::super::hash_to_point_link as link;
+    use super::super::hash_to_point_slots as slots;
+    use flock_core::challenger::FsChallenger;
+    let setup = slots::SlotSetup::new(8);
+    let blocks = vec![[12345; slots::SLOTS]; 8];
+    let packed = record_witness(&setup, &blocks, &[[false; 128]; slots::MASK_REPS]).z_packed;
+    let mut ch = FsChallenger::new(b"masked-consistency-under-compact-profile");
+    let challenges = link::consistency_challenges(3, &mut ch);
+    let (mut proof, points) = link::prove_consistency_with(3, &packed, &challenges);
+    assert!(proof.values.iter().all(|v| v.len() == 16));
+    let (checked, _) = link::verify_consistency_with(3, &proof, &challenges).unwrap();
+    assert_eq!(points, checked);
+    proof.tags[0] += F128::ONE;
+    assert!(link::verify_consistency_with(3, &proof, &challenges).is_err());
+}
