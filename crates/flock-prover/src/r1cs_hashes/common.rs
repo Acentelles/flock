@@ -219,6 +219,28 @@ pub(crate) fn drive_witness_packed_and_lincheck<S: Sync, F>(
 where
     F: Fn(&S, &mut [u64], &mut [u64], &mut [u64]) + Sync,
 {
+    drive_witness_packed_optional_lincheck(
+        initial_states,
+        padding,
+        n_blocks_log,
+        k_log,
+        true,
+        per_block,
+    )
+}
+
+/// Same packed witness; optionally omit the byte-stripe allocation and transpose.
+pub(crate) fn drive_witness_packed_optional_lincheck<S: Sync, F>(
+    initial_states: &[S],
+    padding: Option<&S>,
+    n_blocks_log: usize,
+    k_log: usize,
+    retain_lincheck: bool,
+    per_block: F,
+) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>)
+where
+    F: Fn(&S, &mut [u64], &mut [u64], &mut [u64]) + Sync,
+{
     use rayon::prelude::*;
 
     let k = 1usize << k_log;
@@ -245,81 +267,91 @@ where
     let mut z = flock_core::scratch::take_f128(total_f128);
     let mut a = flock_core::scratch::take_f128(total_f128);
     let mut b = flock_core::scratch::take_f128(total_f128);
-    let mut z_lincheck = vec![0u8; (n_total / 8) * k];
+    let mut z_lincheck = if retain_lincheck {
+        vec![0u8; (n_total / 8) * k]
+    } else {
+        Vec::new()
+    };
 
-    z.par_chunks_mut(8 * f128_per_block)
-        .zip(a.par_chunks_mut(8 * f128_per_block))
-        .zip(b.par_chunks_mut(8 * f128_per_block))
-        .zip(z_lincheck.par_chunks_mut(k))
-        .enumerate()
-        .for_each(|(g, (((z_grp, a_grp), b_grp), stripe))| {
-            // Zero this group's z/a/b up front (parallel memset — the buffers
-            // were uninit-allocated). The per-block builder ORs 1-bits into
-            // pre-zeroed words; any slot left unbuilt (no padding block) stays
-            // zero, which the lincheck transpose below reads correctly.
-            // SAFETY: F128 is `Copy` (no Drop) and the all-zero bit pattern is
-            // the valid `F128::ZERO`, so a byte memset is a correct init.
-            unsafe {
-                std::ptr::write_bytes(z_grp.as_mut_ptr(), 0, z_grp.len());
-                std::ptr::write_bytes(a_grp.as_mut_ptr(), 0, a_grp.len());
-                std::ptr::write_bytes(b_grp.as_mut_ptr(), 0, b_grp.len());
-            }
-            for k_in in 0..8 {
-                let global_idx = 8 * g + k_in;
-                let init: &S = if global_idx < n_blocks {
-                    &initial_states[global_idx]
-                } else if let Some(p) = padding {
-                    // Fill the padding slot with a real block so its constant
-                    // wire is set (see `padding` docs above).
-                    p
-                } else {
-                    // No padding block — leave this slot zero.
-                    continue;
-                };
-                let z_chunk = &mut z_grp[k_in * f128_per_block..(k_in + 1) * f128_per_block];
-                let a_chunk = &mut a_grp[k_in * f128_per_block..(k_in + 1) * f128_per_block];
-                let b_chunk = &mut b_grp[k_in * f128_per_block..(k_in + 1) * f128_per_block];
-                // SAFETY: F128 is `repr(C, align(16))` with two `u64` fields in
-                // LE order — same byte layout as a u64 pair.
-                let z_u64: &mut [u64] = unsafe {
-                    std::slice::from_raw_parts_mut(
-                        z_chunk.as_mut_ptr() as *mut u64,
-                        z_chunk.len() * 2,
-                    )
-                };
-                let a_u64: &mut [u64] = unsafe {
-                    std::slice::from_raw_parts_mut(
-                        a_chunk.as_mut_ptr() as *mut u64,
-                        a_chunk.len() * 2,
-                    )
-                };
-                let b_u64: &mut [u64] = unsafe {
-                    std::slice::from_raw_parts_mut(
-                        b_chunk.as_mut_ptr() as *mut u64,
-                        b_chunk.len() * 2,
-                    )
-                };
-                per_block(init, z_u64, a_u64, b_u64);
-            }
-
-            // Bit-transpose 8 z chunks into the lincheck stripe.
-            let z_u64_all: &[u64] = unsafe {
-                std::slice::from_raw_parts(z_grp.as_ptr() as *const u64, z_grp.len() * 2)
+    let build = |g: usize,
+                 z_grp: &mut [F128],
+                 a_grp: &mut [F128],
+                 b_grp: &mut [F128],
+                 stripe: Option<&mut [u8]>| {
+        // Zero this group's z/a/b up front (parallel memset — the buffers
+        // were uninit-allocated). The per-block builder ORs 1-bits into
+        // pre-zeroed words; any slot left unbuilt (no padding block) stays
+        // zero, which the lincheck transpose below reads correctly.
+        // SAFETY: F128 is `Copy` (no Drop) and the all-zero bit pattern is
+        // the valid `F128::ZERO`, so a byte memset is a correct init.
+        unsafe {
+            std::ptr::write_bytes(z_grp.as_mut_ptr(), 0, z_grp.len());
+            std::ptr::write_bytes(a_grp.as_mut_ptr(), 0, a_grp.len());
+            std::ptr::write_bytes(b_grp.as_mut_ptr(), 0, b_grp.len());
+        }
+        for k_in in 0..8 {
+            let global_idx = 8 * g + k_in;
+            let init: &S = if global_idx < n_blocks {
+                &initial_states[global_idx]
+            } else if let Some(p) = padding {
+                // Fill the padding slot with a real block so its constant
+                // wire is set (see `padding` docs above).
+                p
+            } else {
+                // No padding block — leave this slot zero.
+                continue;
             };
-            for i in 0..u64_per_block {
-                let lanes: [u64; 8] = [
-                    z_u64_all[0 * u64_per_block + i],
-                    z_u64_all[u64_per_block + i],
-                    z_u64_all[2 * u64_per_block + i],
-                    z_u64_all[3 * u64_per_block + i],
-                    z_u64_all[4 * u64_per_block + i],
-                    z_u64_all[5 * u64_per_block + i],
-                    z_u64_all[6 * u64_per_block + i],
-                    z_u64_all[7 * u64_per_block + i],
-                ];
-                transpose_8_u64s_to_64_bytes(&lanes, &mut stripe[i * 64..i * 64 + 64]);
-            }
-        });
+            let z_chunk = &mut z_grp[k_in * f128_per_block..(k_in + 1) * f128_per_block];
+            let a_chunk = &mut a_grp[k_in * f128_per_block..(k_in + 1) * f128_per_block];
+            let b_chunk = &mut b_grp[k_in * f128_per_block..(k_in + 1) * f128_per_block];
+            // SAFETY: F128 is `repr(C, align(16))` with two `u64` fields in
+            // LE order — same byte layout as a u64 pair.
+            let z_u64: &mut [u64] = unsafe {
+                std::slice::from_raw_parts_mut(z_chunk.as_mut_ptr() as *mut u64, z_chunk.len() * 2)
+            };
+            let a_u64: &mut [u64] = unsafe {
+                std::slice::from_raw_parts_mut(a_chunk.as_mut_ptr() as *mut u64, a_chunk.len() * 2)
+            };
+            let b_u64: &mut [u64] = unsafe {
+                std::slice::from_raw_parts_mut(b_chunk.as_mut_ptr() as *mut u64, b_chunk.len() * 2)
+            };
+            per_block(init, z_u64, a_u64, b_u64);
+        }
+
+        let Some(stripe) = stripe else {
+            return;
+        };
+        // Bit-transpose 8 z chunks into the lincheck stripe.
+        let z_u64_all: &[u64] =
+            unsafe { std::slice::from_raw_parts(z_grp.as_ptr() as *const u64, z_grp.len() * 2) };
+        for i in 0..u64_per_block {
+            let lanes: [u64; 8] = [
+                z_u64_all[0 * u64_per_block + i],
+                z_u64_all[u64_per_block + i],
+                z_u64_all[2 * u64_per_block + i],
+                z_u64_all[3 * u64_per_block + i],
+                z_u64_all[4 * u64_per_block + i],
+                z_u64_all[5 * u64_per_block + i],
+                z_u64_all[6 * u64_per_block + i],
+                z_u64_all[7 * u64_per_block + i],
+            ];
+            transpose_8_u64s_to_64_bytes(&lanes, &mut stripe[i * 64..i * 64 + 64]);
+        }
+    };
+    let groups = z
+        .par_chunks_mut(8 * f128_per_block)
+        .zip(a.par_chunks_mut(8 * f128_per_block))
+        .zip(b.par_chunks_mut(8 * f128_per_block));
+    if retain_lincheck {
+        groups
+            .zip(z_lincheck.par_chunks_mut(k))
+            .enumerate()
+            .for_each(|(g, (((z, a), b), stripe))| build(g, z, a, b, Some(stripe)));
+    } else {
+        groups
+            .enumerate()
+            .for_each(|(g, ((z, a), b))| build(g, z, a, b, None));
+    }
 
     (z, a, b, z_lincheck)
 }

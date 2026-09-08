@@ -458,6 +458,23 @@ pub struct SpongeWitness {
 /// concatenation of this witness with the record lane's before either
 /// lane's PIOP runs.
 pub fn sponge_witness(setup: &SpongeSetup, records: &[SpongeRecord]) -> SpongeWitness {
+    sponge_witness_optional_lincheck(setup, records, true)
+}
+
+/// Exact sponge z/a/b and candidate words without unused sponge stripes.
+/// Only for compositions that build and open a different lincheck domain.
+pub fn sponge_witness_without_lincheck(
+    setup: &SpongeSetup,
+    records: &[SpongeRecord],
+) -> SpongeWitness {
+    sponge_witness_optional_lincheck(setup, records, false)
+}
+
+fn sponge_witness_optional_lincheck(
+    setup: &SpongeSetup,
+    records: &[SpongeRecord],
+    retain_lincheck: bool,
+) -> SpongeWitness {
     use rayon::prelude::*;
     assert_eq!(records.len(), setup.records);
     let traces: Vec<([State; LIVE_PERMS], Vec<u16>)> =
@@ -471,11 +488,11 @@ pub fn sponge_witness(setup: &SpongeSetup, records: &[SpongeRecord]) -> SpongeWi
     // Blocks past the live records are the witness builder's all-zero
     // padding triples.
     let initial_states = sponge_initial_states(&state_lists);
-    let (z_packed, a_packed, b_packed, z_lincheck) =
-        keccak3::generate_witness_with_ab_packed_and_lincheck(
-            &initial_states,
-            setup.keccak.n_blocks_log(),
-        );
+    let (z_packed, a_packed, b_packed, z_lincheck) = keccak3::generate_witness_optional_lincheck(
+        &initial_states,
+        setup.keccak.n_blocks_log(),
+        retain_lincheck,
+    );
     SpongeWitness {
         z_packed,
         a_packed,

@@ -141,6 +141,100 @@ pub struct Witness {
 /// gate products, including the new cross-circuit word-copy rows.
 pub fn assemble(setup: &Setup, sponge: sponge::SpongeWitness, record: Vec<F128>) -> Witness {
     let _span = tracing::info_span!("hybrid.assemble").entered();
+    let sponge::SpongeWitness {
+        z_packed: mut z,
+        a_packed: mut a,
+        b_packed: mut b,
+        z_lincheck,
+        all_words,
+    } = sponge;
+    let records = 1 << setup.record_vars();
+    assert_eq!(z.len(), records * K / 128);
+    assert_eq!(a.len(), z.len());
+    assert_eq!(b.len(), z.len());
+    assert_eq!(record.len(), records * slots::K / 128);
+    // Hybrid callers can omit these at construction. Other callers retain
+    // the same API, with their unused input buffers explicitly released here.
+    {
+        let _span = tracing::info_span!("hybrid.release_unused_sponge_buffers").entered();
+        drop(z_lincheck);
+        drop(all_words);
+    }
+    let apply_span = tracing::info_span!("hybrid.record_apply_ab").entered();
+    let record_a = setup.slots.r1cs.apply_a_packed(&record);
+    let record_b = setup.slots.r1cs.apply_b_packed(&record);
+    drop(apply_span);
+    let relocate_span = tracing::info_span!("hybrid.relocate_witness").entered();
+    // Source and destination use the same record stride. Relocate one whole
+    // record into local scratch before overwriting its source, retaining the
+    // existing large allocations. No source from another record is needed.
+    z.par_chunks_mut(K / 128)
+        .zip(a.par_chunks_mut(K / 128))
+        .zip(b.par_chunks_mut(K / 128))
+        .enumerate()
+        .with_min_len(8)
+        .for_each_init(
+            || {
+                (
+                    vec![F128::ZERO; K / 128],
+                    vec![F128::ZERO; K / 128],
+                    vec![F128::ZERO; K / 128],
+                )
+            },
+            |(temp_z, temp_a, temp_b), (rec, ((z, a), b))| {
+                temp_z.fill(F128::ZERO);
+                temp_a.fill(F128::ZERO);
+                temp_b.fill(F128::ZERO);
+                for block in 0..4 {
+                    for old in (0..keccak3::K).step_by(64) {
+                        if let Some(new) = sponge_position(block, old) {
+                            let src = block * keccak3::K + old;
+                            copy64(z, src, temp_z, new);
+                            copy64(a, src, temp_a, new);
+                            copy64(b, src, temp_b, new);
+                        }
+                    }
+                }
+                for old in (0..slots::K).step_by(64) {
+                    if let Some(new) = record_position(old) {
+                        let src = rec * slots::K + old;
+                        copy64(&record, src, temp_z, new);
+                        copy64(&record_a, src, temp_a, new);
+                        copy64(&record_b, src, temp_b, new);
+                    }
+                }
+                for slot in 0..slots::SLOTS {
+                    for bit_index in 0..16 {
+                        set_bit(
+                            temp_a,
+                            record_position(slots::word_position(slot, bit_index)).unwrap(),
+                            bit(temp_z, word_source(slot, bit_index)),
+                        );
+                    }
+                }
+                z.copy_from_slice(temp_z);
+                a.copy_from_slice(temp_a);
+                b.copy_from_slice(temp_b);
+            },
+        );
+    drop(relocate_span);
+    {
+        let _span = tracing::info_span!("hybrid.release_record_buffers").entered();
+        drop(record);
+        drop(record_a);
+        drop(record_b);
+    }
+    Witness { z, a, b }
+}
+
+/// Original out-of-place relocation, retained only as a differential oracle.
+#[cfg(test)]
+pub(super) fn assemble_reference(
+    setup: &Setup,
+    sponge: sponge::SpongeWitness,
+    record: Vec<F128>,
+) -> Witness {
+    let _span = tracing::info_span!("hybrid.assemble").entered();
     let records = 1 << setup.record_vars();
     assert_eq!(sponge.z_packed.len(), records * K / 128);
     assert_eq!(record.len(), records * slots::K / 128);

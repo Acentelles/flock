@@ -255,6 +255,16 @@ pub fn generate_witness_with_ab_packed_and_lincheck(
     initial_states: &[State],
     n_blocks_log: usize,
 ) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>) {
+    generate_witness_optional_lincheck(initial_states, n_blocks_log, true)
+}
+
+/// Packed witness for a caller that constructs its own lincheck domain.
+/// The returned z/a/b include all the ordinary padding and constant pins.
+pub(crate) fn generate_witness_optional_lincheck(
+    initial_states: &[State],
+    n_blocks_log: usize,
+    retain_lincheck: bool,
+) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>) {
     let n_blocks = initial_states.len().div_ceil(N_SUB);
     let zero: State = [false; STATE_BITS];
     let triples: Vec<[State; N_SUB]> = (0..n_blocks)
@@ -277,11 +287,12 @@ pub fn generate_witness_with_ab_packed_and_lincheck(
     // already pads its missing sub-keccaks.
     let padding: [State; N_SUB] = [zero; N_SUB];
 
-    super::common::drive_witness_packed_and_lincheck(
+    super::common::drive_witness_packed_optional_lincheck(
         &triples,
         Some(&padding),
         n_blocks_log,
         K_LOG,
+        retain_lincheck,
         build_block_witness_into,
     )
 }

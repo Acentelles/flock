@@ -15,7 +15,8 @@ fn fixtures(n: usize) -> Vec<sponge::SpongeRecord> {
         .collect()
 }
 fn witness(setup: &Setup, inputs: &[sponge::SpongeRecord]) -> Witness {
-    let sp = sponge::sponge_witness(&sponge::SpongeSetup::new(inputs.len()), inputs);
+    let sp =
+        sponge::sponge_witness_without_lincheck(&sponge::SpongeSetup::new(inputs.len()), inputs);
     let blocks: Vec<[u16; slots::SLOTS]> = sp
         .all_words
         .iter()
@@ -137,11 +138,24 @@ fn hybrid_relocation_matches_original_witness() {
 }
 
 #[test]
-fn hybrid_stripe_optimization_preserves_complete_proof() {
+fn hybrid_optimizations_preserve_complete_proof() {
     let inputs = fixtures(32);
     let setup = Setup::new(inputs.len());
     let run = |reference| {
-        let prepared = commit(&setup, witness(&setup, &inputs));
+        let w = if reference {
+            let sp = sponge::sponge_witness(&sponge::SpongeSetup::new(inputs.len()), &inputs);
+            let blocks: Vec<[u16; slots::SLOTS]> = sp
+                .all_words
+                .iter()
+                .map(|w| w.as_slice().try_into().unwrap())
+                .collect();
+            let rp =
+                record::record_witness(&setup.slots, &blocks, &[[false; 128]; slots::MASK_REPS]);
+            circuit::assemble_reference(&setup, sp, rp.z_packed)
+        } else {
+            witness(&setup, &inputs)
+        };
+        let prepared = commit(&setup, w);
         let mut ch = FsChallenger::new(b"hybrid-stripes-proof-identity-v1");
         let core = prove_core_with_packer(&setup, prepared, &mut ch, |z, m, k_log| {
             if reference {
@@ -158,4 +172,66 @@ fn hybrid_stripe_optimization_preserves_complete_proof() {
         (bincode::serialize(&proof).unwrap(), ch.sample_f128())
     };
     assert_eq!(run(false), run(true));
+}
+
+#[test]
+fn hybrid_optional_stripes_and_inplace_assembly_preserve_witness() {
+    for n in [8, 32] {
+        let inputs = fixtures(n);
+        let setup = Setup::new(n);
+        let sp_setup = sponge::SpongeSetup::new(n);
+        let original = sponge::sponge_witness(&sp_setup, &inputs);
+        let compact = sponge::sponge_witness_without_lincheck(&sp_setup, &inputs);
+        assert!(!original.z_lincheck.is_empty());
+        assert!(compact.z_lincheck.is_empty());
+        assert_eq!(compact.z_packed, original.z_packed);
+        assert_eq!(compact.a_packed, original.a_packed);
+        assert_eq!(compact.b_packed, original.b_packed);
+        assert_eq!(compact.all_words, original.all_words);
+        let addresses = (
+            compact.z_packed.as_ptr(),
+            compact.a_packed.as_ptr(),
+            compact.b_packed.as_ptr(),
+        );
+        let blocks: Vec<[u16; slots::SLOTS]> = original
+            .all_words
+            .iter()
+            .map(|w| w.as_slice().try_into().unwrap())
+            .collect();
+        let rp = record::record_witness(&setup.slots, &blocks, &[[false; 128]; slots::MASK_REPS]);
+        let expected = circuit::assemble_reference(&setup, original, rp.z_packed.clone());
+        let got = assemble(&setup, compact, rp.z_packed);
+        assert_eq!((got.z.as_ptr(), got.a.as_ptr(), got.b.as_ptr()), addresses);
+        assert_eq!(got.z, expected.z);
+        assert_eq!(got.a, expected.a);
+        assert_eq!(got.b, expected.b);
+    }
+}
+
+#[test]
+fn hybrid_inplace_assembly_matches_reference_on_arbitrary_bits() {
+    let setup = Setup::new(8);
+    let mut ch = FsChallenger::new(b"hybrid-arbitrary-relocation-v1");
+    let sp = sponge::SpongeWitness {
+        z_packed: ch.sample_f128_vec(8 * layout::K / 128),
+        a_packed: ch.sample_f128_vec(8 * layout::K / 128),
+        b_packed: ch.sample_f128_vec(8 * layout::K / 128),
+        z_lincheck: vec![5; 64],
+        all_words: vec![],
+    };
+    let copied = sponge::SpongeWitness {
+        z_packed: sp.z_packed.clone(),
+        a_packed: sp.a_packed.clone(),
+        b_packed: sp.b_packed.clone(),
+        z_lincheck: vec![],
+        all_words: vec![],
+    };
+    let record = ch.sample_f128_vec(8 * slots::K / 128);
+    // Arbitrary high and padding bits exercise every copied limb. Word-copy
+    // A rows must still come from SHAKE even when slot input bits disagree.
+    let expected = circuit::assemble_reference(&setup, sp, record.clone());
+    let got = assemble(&setup, copied, record);
+    assert_eq!(got.z, expected.z);
+    assert_eq!(got.a, expected.a);
+    assert_eq!(got.b, expected.b);
 }
