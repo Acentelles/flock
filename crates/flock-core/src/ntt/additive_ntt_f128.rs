@@ -282,6 +282,25 @@ impl AdditiveNttF128 {
         num_ntts: usize,
         start_layer: usize,
     ) {
+        self.forward_transform_interleaved_parallel_from_layer_impl(
+            data,
+            num_ntts,
+            start_layer,
+            cfg!(feature = "fused-deep-ntt"),
+        );
+    }
+
+    #[cfg(any(
+        all(target_arch = "aarch64", target_feature = "aes"),
+        all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+    ))]
+    fn forward_transform_interleaved_parallel_from_layer_impl(
+        &self,
+        data: &mut [F128],
+        num_ntts: usize,
+        start_layer: usize,
+        fused_deep: bool,
+    ) {
         use rayon::prelude::*;
         let n_total = data.len();
         let log_d = log2_pow2(n_total / num_ntts);
@@ -416,20 +435,37 @@ impl AdditiveNttF128 {
         data.par_chunks_mut(sub_bytes)
             .enumerate()
             .for_each(|(sub_idx, sub_data)| {
-                for layer in n_top.max(start_layer)..log_d {
+                let mut layer = n_top.max(start_layer);
+                while layer < log_d {
                     let layer_in_sub = layer - n_top;
                     let num_blocks_in_sub = 1usize << layer_in_sub;
                     let block_size = 1usize << (log_d - layer);
                     let block_size_half = block_size >> 1;
                     let block_bytes = block_size * num_ntts;
+                    let fuse_pair = fused_deep && layer + 1 < log_d;
 
                     for block_in_sub in 0..num_blocks_in_sub {
                         let global_block = sub_idx * num_blocks_in_sub + block_in_sub;
                         let twiddle = self.twiddle(layer, global_block);
                         let block_start = block_in_sub * block_bytes;
                         let block = &mut sub_data[block_start..block_start + block_bytes];
-                        butterfly_interleaved_block(block, twiddle, block_size_half, num_ntts);
+                        if fuse_pair {
+                            // The next layer splits this same block in two.
+                            // Keep the original global twiddle indices, while
+                            // reading and writing each field element only once.
+                            // Each outer Rayon task owns a complete cache block;
+                            // the fused helper stays sequential inside it.
+                            butterfly_interleaved_fused_2layer(
+                                block,
+                                twiddle,
+                                self.twiddle(layer + 1, 2 * global_block),
+                                self.twiddle(layer + 1, 2 * global_block + 1),
+                            );
+                        } else {
+                            butterfly_interleaved_block(block, twiddle, block_size_half, num_ntts);
+                        }
                     }
+                    layer += if fuse_pair { 2 } else { 1 };
                 }
             });
     }
@@ -786,6 +822,29 @@ fn butterfly_interleaved_fused_2layer_par_rows(
     }
 }
 
+/// Sequential counterpart for one cache-resident block. Flattening each
+/// quarter across rows and interleaved lanes is exact: every position in a
+/// quarter uses the same three twiddles. The final odd layer stays unfused.
+#[cfg(any(
+    test,
+    all(target_arch = "aarch64", target_feature = "aes"),
+    all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+))]
+#[inline]
+fn butterfly_interleaved_fused_2layer(
+    block: &mut [F128],
+    t_outer: F128,
+    t_inner_a: F128,
+    t_inner_b: F128,
+) {
+    debug_assert!(block.len().is_multiple_of(4));
+    let stride = block.len() / 4;
+    let (top, bottom) = block.split_at_mut(2 * stride);
+    let (a, b) = top.split_at_mut(stride);
+    let (c, d) = bottom.split_at_mut(stride);
+    kernels::butterfly_fused_2layer(a, b, c, d, t_outer, t_inner_a, t_inner_b);
+}
+
 /// Butterfly one block of an interleaved (SoA) buffer with shared twiddle.
 ///
 /// `block` has length `(2 * block_size_half) * num_ntts` and is laid out as
@@ -863,6 +922,8 @@ fn log2_pow2(n: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod deep_fusion;
 
     struct Rng(u64);
     impl Rng {

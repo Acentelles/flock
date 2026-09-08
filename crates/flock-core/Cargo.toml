@@ -7,6 +7,11 @@ authors.workspace = true
 description = "Protocol library and verifier for the Flock R1CS-over-GF(2) PIOP."
 
 [features]
+# Fuse pairs of cache-resident interleaved NTT layers using the existing exact
+# butterfly. This changes computation only; field values and PCS wires agree.
+# Off by default while the native performance comparison is pending.
+fused-deep-ntt = []
+
 # Count hash invocations (Merkle leaf/pair compressions, FS transcript
 # absorption and squeezes, PoW evaluations) via global relaxed atomics. Counts
 # whichever hash each component is configured with — see `hash::HashKind`. Off
