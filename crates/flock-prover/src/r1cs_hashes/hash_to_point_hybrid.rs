@@ -6,6 +6,7 @@ mod aligned_tests;
 mod circuit;
 mod direct;
 pub mod layout;
+pub mod reductions;
 use super::{
     hash_to_point_record as record, hash_to_point_scatter as scatter,
     hash_to_point_sponge as sponge,

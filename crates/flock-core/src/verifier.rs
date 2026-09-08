@@ -148,6 +148,30 @@ pub fn verify_core<Ch: Challenger>(
             commitment,
             lincheck_circuit,
             challenger,
+            true,
+        )
+    })
+}
+
+/// Replay only circuit reduction after the caller has already bound the
+/// statement. The returned claims remain pending the PCS opening.
+pub fn verify_core_after_statement<Ch: Challenger>(
+    r1cs: &BlockR1cs,
+    zerocheck_proof: &zerocheck::ZerocheckProof,
+    lincheck_proof: &lincheck::LincheckProof,
+    commitment: &Commitment,
+    lincheck_circuit: &dyn lincheck::LincheckCircuit,
+    challenger: &mut Ch,
+) -> Result<(ZClaim, ZClaim), VerifyError> {
+    verifier_pool().install(move || {
+        verify_core_inner(
+            r1cs,
+            zerocheck_proof,
+            lincheck_proof,
+            commitment,
+            lincheck_circuit,
+            challenger,
+            false,
         )
     })
 }
@@ -159,6 +183,7 @@ fn verify_core_inner<Ch: Challenger>(
     commitment: &Commitment,
     lincheck_circuit: &dyn lincheck::LincheckCircuit,
     challenger: &mut Ch,
+    bind: bool,
 ) -> Result<(ZClaim, ZClaim), VerifyError> {
     let trace = std::env::var("VERIFY_TRACE").is_ok();
     let fmt = |s: f64| -> String {
@@ -172,7 +197,9 @@ fn verify_core_inner<Ch: Challenger>(
 
     // ---- Bind FS transcript to the statement (mirrors prover::prove).
     let t = std::time::Instant::now();
-    crate::proof::bind_statement(challenger, r1cs, commitment);
+    if bind {
+        crate::proof::bind_statement(challenger, r1cs, commitment);
+    }
     if trace {
         eprintln!(
             "      [vco] bind_statement: {}",

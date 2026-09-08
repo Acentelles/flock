@@ -292,6 +292,40 @@ pub struct ProveCore {
     pub s_hat_v_c: Vec<F128>,
 }
 
+/// Pending circuit claims and point-specific opening caches, without owning z.
+/// These are not authenticated until the caller discharges the PCS opening.
+pub struct ProveCoreReduction {
+    pub zc_proof: zerocheck::ZerocheckProof,
+    pub lc_proof: lincheck::LincheckProof,
+    pub ab: ZClaim,
+    pub c: ZClaim,
+    pub s_hat_v_ab: Option<Vec<F128>>,
+    pub s_hat_v_c: Vec<F128>,
+}
+
+impl ProveCoreReduction {
+    /// Restore the existing owning opening seam. The witness and commitment
+    /// must be the same ones used to derive these claims and s_hat caches.
+    pub fn with_witness(
+        self,
+        z_packed: Vec<F128>,
+        commitment: Commitment,
+        prover_data: Option<pcs::ProverData>,
+    ) -> ProveCore {
+        ProveCore {
+            zc_proof: self.zc_proof,
+            lc_proof: self.lc_proof,
+            ab: self.ab,
+            c: self.c,
+            commitment,
+            prover_data,
+            z_packed,
+            s_hat_v_ab: self.s_hat_v_ab,
+            s_hat_v_c: self.s_hat_v_c,
+        }
+    }
+}
+
 /// Run commit → bind → zerocheck → lincheck and build the base claims, stopping
 /// just before the PCS open. See [`ProveCore`].
 pub fn prove_fast_core<Ch: Challenger>(
@@ -396,6 +430,41 @@ pub fn prove_fast_core_bound_with_zerocheck_options<Ch: Challenger>(
     options: zerocheck::ProverOptions,
     challenger: &mut Ch,
 ) -> ProveCore {
+    let commit_started = std::time::Instant::now();
+    bind_statement(challenger, r1cs, &commitment);
+    if std::env::var("FLOCK_TRACE").is_ok() {
+        eprintln!(
+            "  [prove_core m={}] commit: {:7.1} ms",
+            r1cs.m,
+            commit_started.elapsed().as_secs_f64() * 1e3,
+        );
+    }
+    prove_fast_core_reduction_after_statement(
+        r1cs,
+        &z_packed,
+        a_packed_f128,
+        b_packed_f128,
+        z_packed_lincheck,
+        lincheck_circuit,
+        options,
+        challenger,
+    )
+    .with_witness(z_packed, commitment, prover_data)
+}
+
+/// Reduce the circuit against a borrowed committed witness, after the caller
+/// has bound its statement with [`bind_statement`]. No root binding, fork or
+/// PCS acceptance is performed here. a/b and stripes retain their old drops.
+pub fn prove_fast_core_reduction_after_statement<Ch: Challenger>(
+    r1cs: &BlockR1cs,
+    z_packed: &[F128],
+    a_packed_f128: Vec<F128>,
+    b_packed_f128: Vec<F128>,
+    z_packed_lincheck: Vec<u8>,
+    lincheck_circuit: &dyn lincheck::LincheckCircuit,
+    options: zerocheck::ProverOptions,
+    challenger: &mut Ch,
+) -> ProveCoreReduction {
     let trace = std::env::var("FLOCK_TRACE").is_ok();
     let mut stage = std::time::Instant::now();
     let mut lap = |label: &str| {
@@ -408,9 +477,6 @@ pub fn prove_fast_core_bound_with_zerocheck_options<Ch: Challenger>(
         }
         stage = std::time::Instant::now();
     };
-    bind_statement(challenger, r1cs, &commitment);
-    lap("commit");
-
     let padding = r1cs.padding_spec();
     let zerocheck_span = tracing::info_span!("flock.core.zerocheck").entered();
     let (zc_proof, zc_claim, s_hat_v_c) = {
@@ -430,7 +496,7 @@ pub fn prove_fast_core_bound_with_zerocheck_options<Ch: Challenger>(
         let c_packed: &[u8] = unsafe {
             std::slice::from_raw_parts(
                 z_packed.as_ptr() as *const u8,
-                z_packed.len() * core::mem::size_of::<F128>(),
+                core::mem::size_of_val(z_packed),
             )
         };
         zerocheck::prove_packed_padded_capture_s_hat_v_c_with_options(
@@ -491,14 +557,11 @@ pub fn prove_fast_core_bound_with_zerocheck_options<Ch: Challenger>(
 
     drop(claim_span);
     lap("s_hat_v_ab");
-    ProveCore {
+    ProveCoreReduction {
         zc_proof,
         lc_proof,
         ab,
         c,
-        commitment,
-        prover_data,
-        z_packed,
         s_hat_v_ab,
         s_hat_v_c,
     }
