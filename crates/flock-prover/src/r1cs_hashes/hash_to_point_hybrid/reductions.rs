@@ -164,6 +164,7 @@ fn absorb_params<Ch: Challenger>(ch: &mut Ch, params: &PcsParams) {
         pcs::ligerito::LigeritoProfile::Fast => b"fast",
         pcs::ligerito::LigeritoProfile::Slim => b"slim",
         pcs::ligerito::LigeritoProfile::Secure => b"secure",
+        pcs::ligerito::LigeritoProfile::Grind => b"grind",
     });
     ch.observe_bytes(params.merkle_hash.as_str().as_bytes());
 }

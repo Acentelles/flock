@@ -66,13 +66,18 @@ pub enum LigeritoProfile {
     Fast,
     Slim,
     Secure,
+    /// `Fast` (rate 1/2, 100-bit rounds) with 20 bits of post-commit
+    /// proof-of-work grinding at every level, which the query counts
+    /// credit (`expected_eps_query_bits >= 100 - 20`): about a fifth fewer
+    /// queries per level for a few million hashes of prover work.
+    Grind,
 }
 
 impl LigeritoProfile {
     /// L0 code rate index for this profile (`rho_0 = 2^-log_inv_rate`).
     pub fn log_inv_rate(self) -> usize {
         match self {
-            Self::Fast | Self::Secure => 1,
+            Self::Fast | Self::Secure | Self::Grind => 1,
             Self::Slim => 2,
         }
     }
@@ -81,7 +86,7 @@ impl LigeritoProfile {
     /// min over rounds, per the Fiat-Shamir / `soundcalc` convention).
     pub fn security_bits(self) -> usize {
         match self {
-            Self::Fast | Self::Slim => 100,
+            Self::Fast | Self::Slim | Self::Grind => 100,
             Self::Secure => 120,
         }
     }
@@ -90,6 +95,7 @@ impl LigeritoProfile {
             Self::Fast => "fast",
             Self::Slim => "slim",
             Self::Secure => "secure",
+            Self::Grind => "grind",
         }
     }
     pub fn parse(s: &str) -> Option<Self> {
@@ -97,6 +103,7 @@ impl LigeritoProfile {
             "fast" => Some(Self::Fast),
             "slim" => Some(Self::Slim),
             "secure" => Some(Self::Secure),
+            "grind" => Some(Self::Grind),
             _ => None,
         }
     }
@@ -347,6 +354,8 @@ macro_rules! profile_configs {
                  include_str!(concat!("../../configs/ligerito/m", $m, "_slim.toml"))),
                 (($m, LigeritoProfile::Secure),
                  include_str!(concat!("../../configs/ligerito/m", $m, "_secure.toml"))),
+                (($m, LigeritoProfile::Grind),
+                 include_str!(concat!("../../configs/ligerito/m", $m, "_grind.toml"))),
             )+
         ]
     };
@@ -1237,6 +1246,7 @@ impl LigeritoSecurityConfig {
         let log_inv_rate = profile.log_inv_rate();
         let query_grind: usize = match profile {
             LigeritoProfile::Slim => 16,
+            LigeritoProfile::Grind => 20,
             LigeritoProfile::Fast | LigeritoProfile::Secure => 0,
         };
         let log_n = m
@@ -1251,7 +1261,7 @@ impl LigeritoSecurityConfig {
         let per_query_bits_feas = |rate: usize| -> f64 {
             match profile {
                 LigeritoProfile::Secure => udr_per_query_bits_asymptotic(rate),
-                LigeritoProfile::Fast | LigeritoProfile::Slim => {
+                LigeritoProfile::Fast | LigeritoProfile::Slim | LigeritoProfile::Grind => {
                     paper_per_query_bits(rate, JOHNSON_ETA)
                 }
             }
@@ -1289,7 +1299,7 @@ impl LigeritoSecurityConfig {
             // UDR, length-agnostic Johnson otherwise.
             let per_q = match profile {
                 LigeritoProfile::Secure => udr_per_query_bits(rate, cols, UDR_PROXIMITY_LOSS),
-                LigeritoProfile::Fast | LigeritoProfile::Slim => {
+                LigeritoProfile::Fast | LigeritoProfile::Slim | LigeritoProfile::Grind => {
                     paper_per_query_bits(rate, JOHNSON_ETA)
                 }
             };
@@ -1318,7 +1328,7 @@ impl LigeritoSecurityConfig {
                         None,
                     )
                 }
-                LigeritoProfile::Fast | LigeritoProfile::Slim => {
+                LigeritoProfile::Fast | LigeritoProfile::Slim | LigeritoProfile::Grind => {
                     let eps_pg = ANALYSIS_LOG_Q - paper_johnson_log_a(rate, JOHNSON_ETA, cols, ilv);
                     let mu = cols + ilv;
                     let ood_samples = if i == 0 {
@@ -1364,7 +1374,7 @@ impl LigeritoSecurityConfig {
 
         let analysis_version = match profile {
             LigeritoProfile::Secure => "no_row_union_over_ben_sasson_2025_cor_1_4",
-            LigeritoProfile::Fast | LigeritoProfile::Slim => {
+            LigeritoProfile::Fast | LigeritoProfile::Slim | LigeritoProfile::Grind => {
                 "johnson_ood_row_union_over_bchks25_thm_4_6"
             }
         };
