@@ -90,3 +90,19 @@ Gate before M1: isolate the Flock commit and Ligerito open specifically
 If it does not, GKR alone will not reach three seconds and the strategy must
 also attack the zerocheck sumcheck and/or the Akita open. Do not build the
 batched layer reduction until commit+open is shown to be worth it.
+
+## Measured head-to-head (2026-09-13): GKR is 83x slower per permutation
+
+Single-thread, per Keccak-f[1600] permutation, this fork at ed0c252:
+- R1CS `keccak3` 3-wide (commit+zerocheck+lincheck+open), K=24,576: 0.183 ms/perm
+  (5,461 keccaks/s), 41,667 committed bits/perm.
+- GKR `keccak_gkr` prototype (24-layer prove only, no boundary commit/open):
+  15.2 ms/perm, 3,200 boundary bits/perm.
+
+GKR commits 13x fewer bits but proves ~83x slower, comparing GKR prove-only
+against R1CS full. Cause: R1CS bit-packs the zerocheck's first round (XOR/AND
+over machine words); the GKR prototype lifts every state bit to F128 and does
+field multiplies per bit per layer. Verdict: do NOT wire in GKR until its layer
+kernel is re-expressed in packed-bit arithmetic (a hard open problem); the
+sub-three-second effort belongs on the Akita opening and the bridge. See the
+aerie report `specs/techniques/private-salt-sub-three-second-report-2026-09-13.md`.
