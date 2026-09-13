@@ -61,3 +61,32 @@ requires. This is the "roughly 20x kernel" bar from the earlier route-C hand-off
   record fingerprint / bridge linkage.
 - No composed soundness claim until the verifier and Fiat-Shamir are complete
   and the extraction argument covers the GKR chain.
+
+## Span-split finding (2026-09-13) — reassess before M1
+
+FLOCK_TRACE at 16,384 (traced run ~20x inflated; ratios only):
+
+| Stage | traced ms | Lane | T1 removes it? |
+|---|---:|---|---|
+| Flock zerocheck | 13,437 | Flock core | NO (GKR replaces with layer sumchecks of comparable cost) |
+| Akita batched open | 12,820 | bridge/shared PCS | no (aerie side) |
+| Bridge fold + decoder | 9,372 | bridge | no |
+| Flock lincheck | 1,024 | Flock core | no |
+| Booleanity + merges | 532 | bridge | no |
+| Flock commit | in prepare | Flock | YES (sponge part) |
+| Flock Ligerito open | not traced | Flock | YES (sponge part) |
+
+Consequence: the dominant Flock cost is the zerocheck sumcheck, which GKR does
+NOT remove; it only removes the commit and opening of the sponge intermediate
+rounds. The trace does not isolate the Flock Ligerito open, and the commit is
+folded into prepare, so T1's actual win (commit+open of the sponge) is not yet
+quantified and may be well below the ~2,816 ms CPU-work the P0 census requires.
+The Akita batched open (12,820) is a comparably large lever but is aerie-side,
+outside T1.
+
+Gate before M1: isolate the Flock commit and Ligerito open specifically
+(`cargo bench --bench pcs_commit`, and the `hybrid.pcs_open` span via a
+`--profile` run), and confirm commit+open of the sponge alone clears the target.
+If it does not, GKR alone will not reach three seconds and the strategy must
+also attack the zerocheck sumcheck and/or the Akita open. Do not build the
+batched layer reduction until commit+open is shown to be worth it.
